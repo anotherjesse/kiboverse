@@ -1,31 +1,46 @@
-//! Push-to-talk prototype driven by a joystick (/dev/input/jsN).
+//! Push-to-talk voice companion driven by a joystick (/dev/input/jsN).
 //!
-//! Hold the record button to record a clip; release to save it. Press the
-//! AI button for "the AI's turn to answer" — for now simulated by playing
-//! back every clip since the last reply, then logging the reply.
+//! Hold the record button to record a clip; release to save it. Each clip is
+//! transcribed (Gemini). Press the AI button for "the AI's turn to answer":
+//! the transcripts since the last reply become one user turn, gemini-3.5-flash
+//! writes a reply (conversation memory lives server-side via
+//! previous_interaction_id), and the reply is spoken through the speaker
+//! (Gemini TTS). Starting a recording pauses playback; when the clip is
+//! saved, playback resumes rewound ~1s. Pressing the AI button while kibo is
+//! speaking skips the rest of the speech.
 //!
 //! Durability rules (see voiceflow.md — NEVER LOSE USER DATA): the clip is
-//! finalized on disk (atomic rename to a timestamped name) and logged in
-//! turns.jsonl before anything else happens to it. Clips are never deleted
-//! by an AI turn; the reply is just another line in the log.
+//! finalized on disk and logged in turns.jsonl before anything else happens
+//! to it; transcripts, reply text, and errors are all durable records, and
+//! reply text is saved before speech synthesis begins. On startup, clips
+//! without transcripts are picked up again.
 //!
-//! arecord/aplay are kept as thin device shims, but audio flows through us:
-//! arecord emits raw PCM on stdout, we meter it and write the WAV ourselves.
+//! arecord/aplay/curl are kept as thin shims so the Mac→Pi cross-compile
+//! stays pure Rust; audio and JSON flow through us.
 
 use base64::Engine;
-use recplay::{chime, run};
+use recplay::{audio_dev, chime};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const RECORD_BTN: u8 = 0; // X on the DragonRise pad
 const AI_BTN: u8 = 1; // A
 const MIN_CLIP: Duration = Duration::from_millis(500);
+
 const GEMINI_MODEL: &str = "gemini-3.5-flash";
+const TTS_MODEL: &str = "gemini-3.1-flash-tts-preview";
+const TTS_VOICE: &str = "Kore";
+const TTS_RATE: u32 = 24_000;
+const REWIND_SAMPLES: usize = TTS_RATE as usize; // ~1s, voiceflow-style
+const PERSONA: &str = "You are kibo, a small robot voice companion. You hear \
+transcribed voice notes and reply out loud through a speaker. Keep replies \
+short and conversational - one to three sentences, easy to listen to.";
 
 struct Recording {
     arecord: Child,
@@ -42,6 +57,9 @@ fn main() -> std::io::Result<()> {
     println!("joystick: {}", js.display());
     println!("data dir: {}", dir.display());
     println!("hold button {RECORD_BTN} to record, press button {AI_BTN} for the AI's turn");
+
+    let player = Arc::new(Player::new());
+    let ai_busy = Arc::new(AtomicBool::new(false));
 
     // Processing is replayable: transcribe anything that was recorded but
     // never transcribed (crash, network outage, pre-transcription clips).
@@ -72,6 +90,7 @@ fn main() -> std::io::Result<()> {
         }
         match (number, value, &rec) {
             (RECORD_BTN, 1, None) => {
+                player.pause(); // stop speech before the mic opens
                 chime(&[660.0, 880.0])?;
                 rec = Some(start_recording(&dir)?);
                 println!("recording...");
@@ -101,19 +120,34 @@ fn main() -> std::io::Result<()> {
                         ),
                     )?;
                     println!("saved {file} ({}ms, peak {peak_pct}%)", elapsed.as_millis());
-                    if peak_pct == 0 {
-                        println!("WARNING: clip is silent — check mic / USB bandwidth");
-                    }
                     chime(&[880.0, 660.0])?;
                     if peak_pct == 0 {
+                        println!("WARNING: clip is silent — check mic / USB bandwidth");
                         skip_silent_clip(&dir, &id);
                     } else {
                         let (dir, id) = (dir.clone(), id.clone());
                         std::thread::spawn(move || transcribe_and_log(&dir, &id, &file));
                     }
                 }
+                player.resume(); // continue any paused speech, rewound
             }
-            (AI_BTN, 1, None) => ai_turn(&dir)?,
+            (AI_BTN, 1, None) => {
+                if player.speaking() {
+                    println!("skipping the rest of the speech");
+                    player.skip();
+                } else if ai_busy.swap(true, SeqCst) {
+                    println!("already thinking...");
+                } else {
+                    let (dir, player, ai_busy) = (dir.clone(), player.clone(), ai_busy.clone());
+                    std::thread::spawn(move || {
+                        if let Err(e) = ai_turn(&dir, &player) {
+                            println!("AI turn FAILED: {e}");
+                            let _ = chime(&[220.0, 180.0]);
+                        }
+                        ai_busy.store(false, SeqCst);
+                    });
+                }
+            }
             (AI_BTN, 1, Some(_)) => println!("still recording — release first"),
             (n, 1, _) => println!("button {n} (unmapped)"),
             _ => {}
@@ -121,11 +155,305 @@ fn main() -> std::io::Result<()> {
     }
 }
 
+// ---------------- the AI turn: transcripts -> reply -> speech ----------------
+
+fn ai_turn(dir: &Path, player: &Arc<Player>) -> std::io::Result<()> {
+    let pending = pending_clips(dir);
+    if pending.is_empty() {
+        println!("nothing new to answer");
+        chime(&[330.0, 220.0])?;
+        return Ok(());
+    }
+    chime(&[523.0, 659.0, 784.0])?;
+
+    let ids: Vec<String> = pending.iter().map(|(id, _)| id.clone()).collect();
+    let transcripts = wait_for_transcripts(dir, &ids, Duration::from_secs(25));
+    let heard: Vec<String> = transcripts
+        .iter()
+        .filter(|(_, t)| !t.is_empty() && t != "[silent]" && t != "[no speech]")
+        .map(|(_, t)| t.clone())
+        .collect();
+
+    if heard.is_empty() {
+        println!("no intelligible speech in {} clip(s)", pending.len());
+        append_turn(
+            dir,
+            &serde_json::json!({
+                "kind":"reply","answers":ids,"text":"[nothing to answer]","at":epoch()
+            })
+            .to_string(),
+        )?;
+        chime(&[330.0, 220.0])?;
+        return Ok(());
+    }
+
+    let user_text = heard.join("\n");
+    println!("user turn ({} clip(s)): {user_text}", heard.len());
+
+    let prev = last_interaction_id(dir);
+    let (reply, interaction_id) = match chat(&user_text, prev.as_deref()) {
+        Ok(r) => r,
+        Err(e) if prev.is_some() => {
+            // Server-side history can expire; retry as a fresh conversation.
+            println!("chat with history failed ({e}); retrying fresh");
+            chat(&user_text, None)?
+        }
+        Err(e) => return Err(e),
+    };
+
+    // Reply text is durable BEFORE speech synthesis: a TTS failure must
+    // never destroy the answer.
+    append_turn(
+        dir,
+        &serde_json::json!({
+            "kind":"reply","answers":ids,"text":reply,
+            "interaction_id":interaction_id,"at":epoch()
+        })
+        .to_string(),
+    )?;
+    println!("kibo: {reply}");
+
+    match tts(&reply) {
+        Ok(samples) => {
+            let name = format!("tts-{}.wav", chrono::Local::now().format("%Y%m%d-%H%M%S"));
+            save_wav(&dir.join(name), &samples, TTS_RATE)?;
+            player.play(samples);
+        }
+        Err(e) => {
+            println!("TTS FAILED (reply text is safe): {e}");
+            append_turn(
+                dir,
+                &serde_json::json!({"kind":"tts_error","error":e.to_string(),"at":epoch()})
+                    .to_string(),
+            )?;
+            chime(&[220.0, 180.0])?;
+        }
+    }
+    Ok(())
+}
+
+/// Ask gemini for a reply. Returns (reply text, interaction id).
+fn chat(user_text: &str, prev: Option<&str>) -> std::io::Result<(String, String)> {
+    let input = match prev {
+        Some(_) => user_text.to_string(),
+        None => format!("{PERSONA}\n\n{user_text}"),
+    };
+    let mut body = serde_json::json!({"model": GEMINI_MODEL, "input": input});
+    if let Some(p) = prev {
+        body["previous_interaction_id"] = p.into();
+    }
+    let resp = gemini(&body)?;
+    let id = resp["id"].as_str().unwrap_or_default().to_string();
+    let text = model_output(&resp)
+        .and_then(|c| c["text"].as_str())
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| std::io::Error::other(format!("no reply text in: {}", excerpt(&resp))))?;
+    Ok((text, id))
+}
+
+/// Synthesize speech. Returns mono PCM samples at TTS_RATE (little-endian
+/// on the wire despite the audio/l16 label — verified empirically).
+fn tts(text: &str) -> std::io::Result<Vec<i16>> {
+    let body = serde_json::json!({
+        "model": TTS_MODEL,
+        "input": text,
+        "response_format": {"type": "audio"},
+        "generation_config": {"speech_config": [{"voice": TTS_VOICE}]}
+    });
+    let resp = gemini(&body)?;
+    let content = model_output(&resp)
+        .filter(|c| c["type"] == "audio")
+        .ok_or_else(|| std::io::Error::other(format!("no audio in: {}", excerpt(&resp))))?;
+    let data = content["data"]
+        .as_str()
+        .ok_or_else(|| std::io::Error::other("audio content has no data"))?;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|e| std::io::Error::other(format!("bad base64 audio: {e}")))?;
+    Ok(raw
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect())
+}
+
+/// POST one interactions-API request via curl (our HTTP shim).
+fn gemini(body: &serde_json::Value) -> std::io::Result<serde_json::Value> {
+    let key = std::env::var("GEMINI_API_KEY")
+        .map_err(|_| std::io::Error::other("GEMINI_API_KEY not set"))?;
+    let mut curl = Command::new("curl")
+        .args([
+            "-s",
+            "--max-time",
+            "120",
+            "-X",
+            "POST",
+            "https://generativelanguage.googleapis.com/v1beta/interactions",
+            "-H",
+            &format!("x-goog-api-key: {key}"),
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            "@-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    curl.stdin.take().unwrap().write_all(body.to_string().as_bytes())?;
+    let out = curl.wait_with_output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::other(format!("curl exited {}", out.status)));
+    }
+    serde_json::from_slice(&out.stdout)
+        .map_err(|e| std::io::Error::other(format!("bad JSON from API: {e}")))
+}
+
+/// The first content block of the model_output step, if any.
+fn model_output(resp: &serde_json::Value) -> Option<&serde_json::Value> {
+    resp["steps"]
+        .as_array()?
+        .iter()
+        .find(|s| s["type"] == "model_output")
+        .map(|s| &s["content"][0])
+}
+
+fn excerpt(resp: &serde_json::Value) -> String {
+    resp.to_string().chars().take(300).collect()
+}
+
+// ---------------- speech playback with pause / rewind / skip ----------------
+
+/// Plays TTS samples through aplay, pausing (and rewinding on resume)
+/// around recordings, per the voiceflow interaction model.
+struct Player {
+    mic_active: AtomicBool,
+    skip_flag: AtomicBool,
+    speaking: AtomicBool,
+    current: Mutex<Option<Child>>,
+}
+
+impl Player {
+    fn new() -> Self {
+        Player {
+            mic_active: AtomicBool::new(false),
+            skip_flag: AtomicBool::new(false),
+            speaking: AtomicBool::new(false),
+            current: Mutex::new(None),
+        }
+    }
+
+    fn speaking(&self) -> bool {
+        self.speaking.load(SeqCst)
+    }
+
+    /// Called when the mic is about to open: silences playback immediately.
+    fn pause(&self) {
+        self.mic_active.store(true, SeqCst);
+        self.kill_current();
+    }
+
+    fn resume(&self) {
+        self.mic_active.store(false, SeqCst);
+    }
+
+    fn skip(&self) {
+        self.skip_flag.store(true, SeqCst);
+        self.kill_current();
+    }
+
+    fn kill_current(&self) {
+        if let Some(mut c) = self.current.lock().unwrap().take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+
+    fn play(self: &Arc<Self>, samples: Vec<i16>) {
+        let st = self.clone();
+        st.speaking.store(true, SeqCst);
+        st.skip_flag.store(false, SeqCst);
+        std::thread::spawn(move || {
+            st.playback_loop(&samples);
+            st.speaking.store(false, SeqCst);
+        });
+    }
+
+    fn playback_loop(&self, samples: &[i16]) {
+        const CHUNK: usize = 4800; // 200ms at 24k
+        let rate = TTS_RATE as usize;
+        let mut pos = 0usize;
+        while pos < samples.len() {
+            // paused (or queued behind an active recording)
+            while self.mic_active.load(SeqCst) {
+                if self.skip_flag.swap(false, SeqCst) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if self.skip_flag.swap(false, SeqCst) {
+                return;
+            }
+            let mut child = match Command::new("aplay")
+                .args(["-q", "-D", &audio_dev()])
+                .args(["-t", "raw", "-f", "S16_LE", "-c", "1"])
+                .args(["-r", &TTS_RATE.to_string(), "-"])
+                .stdin(Stdio::piped())
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    println!("playback failed: {e}");
+                    return;
+                }
+            };
+            let mut stdin = child.stdin.take().unwrap();
+            *self.current.lock().unwrap() = Some(child);
+            let seg_start = Instant::now();
+            let seg_base = pos;
+            let mut interrupted = false;
+            while pos < samples.len() {
+                if self.mic_active.load(SeqCst) || self.skip_flag.load(SeqCst) {
+                    interrupted = true;
+                    break;
+                }
+                // Pace writes so `pos` tracks what has actually played
+                // (~600ms ahead at most) — the rewind stays meaningful.
+                let audio_ms = (pos - seg_base) * 1000 / rate;
+                let elapsed = seg_start.elapsed().as_millis() as usize;
+                if audio_ms > elapsed + 600 {
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue; // re-check flags while throttled
+                }
+                let end = (pos + CHUNK).min(samples.len());
+                let bytes: Vec<u8> =
+                    samples[pos..end].iter().flat_map(|s| s.to_le_bytes()).collect();
+                if stdin.write_all(&bytes).is_err() {
+                    interrupted = true; // aplay was killed under us
+                    break;
+                }
+                pos = end;
+            }
+            drop(stdin);
+            if interrupted {
+                self.kill_current();
+                if self.skip_flag.swap(false, SeqCst) {
+                    return;
+                }
+                pos = pos.saturating_sub(REWIND_SAMPLES);
+            } else if let Some(mut c) = self.current.lock().unwrap().take() {
+                let _ = c.wait(); // natural end: let aplay drain
+            }
+        }
+    }
+}
+
+// ---------------- recording ----------------
+
 /// Spawn arecord emitting raw PCM and a thread that streams it into a WAV.
 fn start_recording(dir: &Path) -> std::io::Result<Recording> {
     let work = dir.join("current-recording.wav");
     let mut arecord = Command::new("arecord")
-        .args(["-q", "-D", &recplay::audio_dev()])
+        .args(["-q", "-D", &audio_dev()])
         .args(["-t", "raw", "-f", "S16_LE", "-r", "44100", "-c", "1", "-"])
         .stdout(Stdio::piped())
         .spawn()?;
@@ -182,38 +510,7 @@ fn stream_to_wav(
     Ok(peak)
 }
 
-/// Play back every clip since the last reply, then log the reply.
-fn ai_turn(dir: &Path) -> std::io::Result<()> {
-    let log = fs::read_to_string(dir.join("turns.jsonl")).unwrap_or_default();
-    let mut pending: Vec<(String, String)> = Vec::new();
-    for line in log.lines() {
-        if line.contains(r#""kind":"reply""#) {
-            pending.clear();
-        } else if line.contains(r#""kind":"clip""#) {
-            if let (Some(id), Some(file)) = (field(line, "id"), field(line, "file")) {
-                pending.push((id, file));
-            }
-        }
-    }
-    if pending.is_empty() {
-        println!("nothing new to answer");
-        chime(&[330.0, 220.0])?;
-        return Ok(());
-    }
-    println!("AI turn: answering {} clip(s)", pending.len());
-    chime(&[523.0, 659.0, 784.0])?;
-    let dev = recplay::audio_dev();
-    for (_, file) in &pending {
-        run("aplay", &["-q", "-D", &dev, dir.join(file).to_str().unwrap()])?;
-    }
-    let ids: Vec<String> = pending.iter().map(|(id, _)| format!("\"{id}\"")).collect();
-    append_turn(
-        dir,
-        &format!(r#"{{"kind":"reply","answers":[{}],"at":{}}}"#, ids.join(","), epoch()),
-    )?;
-    chime(&[784.0, 1046.0])?;
-    Ok(())
-}
+// ---------------- transcription ----------------
 
 /// Silent clips never go to the API: Gemini hallucinates plausible speech
 /// from pure silence. Log a durable [silent] transcript instead.
@@ -245,11 +542,8 @@ fn transcribe_and_log(dir: &Path, id: &str, file: &str) {
     }
 }
 
-/// Send a WAV to Gemini and return the transcript. curl is our HTTP shim,
-/// same philosophy as arecord/aplay (keeps the cross-compile pure Rust).
+/// Send a WAV to Gemini and return the transcript.
 fn transcribe(wav: &Path) -> std::io::Result<String> {
-    let key = std::env::var("GEMINI_API_KEY")
-        .map_err(|_| std::io::Error::other("GEMINI_API_KEY not set"))?;
     let audio = fs::read(wav)?;
     let body = serde_json::json!({
         "model": GEMINI_MODEL,
@@ -261,63 +555,111 @@ fn transcribe(wav: &Path) -> std::io::Result<String> {
              "mime_type": "audio/wav"}
         ]
     });
-    let mut curl = Command::new("curl")
-        .args([
-            "-s",
-            "--max-time",
-            "60",
-            "-X",
-            "POST",
-            "https://generativelanguage.googleapis.com/v1beta/interactions",
-            "-H",
-            &format!("x-goog-api-key: {key}"),
-            "-H",
-            "Content-Type: application/json",
-            "-d",
-            "@-",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()?;
-    curl.stdin.take().unwrap().write_all(body.to_string().as_bytes())?;
-    let out = curl.wait_with_output()?;
-    if !out.status.success() {
-        return Err(std::io::Error::other(format!("curl exited {}", out.status)));
-    }
-    let resp: serde_json::Value = serde_json::from_slice(&out.stdout)
-        .map_err(|e| std::io::Error::other(format!("bad JSON from API: {e}")))?;
-    resp["steps"]
-        .as_array()
-        .and_then(|steps| steps.iter().find(|s| s["type"] == "model_output"))
-        .and_then(|s| s["content"][0]["text"].as_str())
+    let resp = gemini(&body)?;
+    model_output(&resp)
+        .and_then(|c| c["text"].as_str())
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
-        .ok_or_else(|| {
-            let excerpt: String = String::from_utf8_lossy(&out.stdout).chars().take(300).collect();
-            std::io::Error::other(format!("no transcript in response: {excerpt}"))
-        })
+        .ok_or_else(|| std::io::Error::other(format!("no transcript in: {}", excerpt(&resp))))
+}
+
+// ---------------- turns.jsonl ----------------
+
+fn log_records(dir: &Path) -> Vec<serde_json::Value> {
+    fs::read_to_string(dir.join("turns.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+/// Clips recorded since the last reply, oldest first.
+fn pending_clips(dir: &Path) -> Vec<(String, String)> {
+    let mut pending = Vec::new();
+    for v in log_records(dir) {
+        match v["kind"].as_str() {
+            Some("reply") => pending.clear(),
+            Some("clip") => {
+                if let (Some(id), Some(file)) = (v["id"].as_str(), v["file"].as_str()) {
+                    pending.push((id.to_string(), file.to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+    pending
 }
 
 /// Clips that have no transcript record yet, oldest first, with a flag for
 /// clips known to be silent (recorded with peak 0).
 fn untranscribed_clips(dir: &Path) -> Vec<(String, String, bool)> {
-    let log = fs::read_to_string(dir.join("turns.jsonl")).unwrap_or_default();
     let mut clips = Vec::new();
     let mut done = std::collections::HashSet::new();
-    for line in log.lines() {
-        if line.contains(r#""kind":"clip""#) {
-            if let (Some(id), Some(file)) = (field(line, "id"), field(line, "file")) {
-                clips.push((id, file, line.contains(r#""peak":0,"#)));
+    for v in log_records(dir) {
+        match v["kind"].as_str() {
+            Some("clip") => {
+                if let (Some(id), Some(file)) = (v["id"].as_str(), v["file"].as_str()) {
+                    clips.push((id.to_string(), file.to_string(), v["peak"] == 0));
+                }
             }
-        } else if line.contains(r#""kind":"transcript""#) {
-            if let Some(id) = field(line, "clip") {
-                done.insert(id);
+            Some("transcript") => {
+                if let Some(id) = v["clip"].as_str() {
+                    done.insert(id.to_string());
+                }
             }
+            _ => {}
         }
     }
     clips.retain(|(id, _, _)| !done.contains(id));
     clips
 }
+
+/// Transcript texts for the given clip ids, waiting for in-flight
+/// transcriptions up to the timeout.
+fn wait_for_transcripts(dir: &Path, ids: &[String], timeout: Duration) -> Vec<(String, String)> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut found = Vec::new();
+        for v in log_records(dir) {
+            if v["kind"] == "transcript" {
+                if let Some(clip) = v["clip"].as_str() {
+                    if ids.iter().any(|i| i == clip) {
+                        let text = v["text"].as_str().unwrap_or("").to_string();
+                        found.push((clip.to_string(), text));
+                    }
+                }
+            }
+        }
+        if found.len() >= ids.len() || Instant::now() >= deadline {
+            if found.len() < ids.len() {
+                println!("proceeding with {}/{} transcripts", found.len(), ids.len());
+            }
+            return found;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// The most recent interaction id — continues the server-side conversation.
+fn last_interaction_id(dir: &Path) -> Option<String> {
+    log_records(dir)
+        .iter()
+        .rev()
+        .find_map(|v| v["interaction_id"].as_str().map(str::to_string))
+}
+
+fn append_turn(dir: &Path, line: &str) -> std::io::Result<()> {
+    static LOG_LOCK: Mutex<()> = Mutex::new(()); // appends come from several threads
+    let _guard = LOG_LOCK.lock().unwrap();
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("turns.jsonl"))?;
+    writeln!(f, "{line}")?;
+    f.sync_all()
+}
+
+// ---------------- plumbing ----------------
 
 fn find_js(frag: &str) -> Option<PathBuf> {
     (0..8).find_map(|i| {
@@ -335,23 +677,18 @@ fn data_dir() -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
-fn append_turn(dir: &Path, line: &str) -> std::io::Result<()> {
-    static LOG_LOCK: Mutex<()> = Mutex::new(()); // appends come from several threads
-    let _guard = LOG_LOCK.lock().unwrap();
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("turns.jsonl"))?;
-    writeln!(f, "{line}")?;
-    f.sync_all()
-}
-
-/// Pull a string field out of one of our own turns.jsonl lines.
-fn field(line: &str, key: &str) -> Option<String> {
-    let tag = format!("\"{key}\":\"");
-    let start = line.find(&tag)? + tag.len();
-    let end = line[start..].find('"')? + start;
-    Some(line[start..end].to_string())
+fn save_wav(path: &Path, samples: &[i16], rate: u32) -> std::io::Result<()> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut w = hound::WavWriter::create(path, spec).map_err(io_err)?;
+    for &s in samples {
+        w.write_sample(s).map_err(io_err)?;
+    }
+    w.finalize().map_err(io_err)
 }
 
 /// Timestamped clip id/filename; suffixed if the name is somehow taken so an

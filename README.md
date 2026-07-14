@@ -107,8 +107,17 @@ between kibo and an AI:
    (peak-0) clips are never sent — Gemini hallucinates speech from silence.
    Needs `GEMINI_API_KEY` in `.env` (gitignored; deploy.sh pushes it to the
    Pi, systemd loads it).
-4. **Respond** — feed transcripts to an LLM and speak the reply back through
-   the USB speaker (TTS).
+4. **Respond** — ✓ done. Press the AI button and all transcripts since the
+   last reply become one user turn; `gemini-3.5-flash` writes the reply
+   (conversation memory is server-side via `previous_interaction_id`, with
+   fresh-conversation fallback if the chain expires), the reply text is
+   durable in `turns.jsonl` *before* TTS runs, then
+   `gemini-3.1-flash-tts-preview` (voice Kore, 24kHz PCM — little-endian
+   despite the `audio/l16` label) speaks it. Voiceflow-style playback:
+   holding record pauses speech instantly and resumes ~1s rewound after the
+   clip saves; pressing the AI button while kibo talks skips the speech.
+   Future: streaming TTS (`"stream": true`, `step.delta` events) for lower
+   latency on long replies.
 
 Later / maybe: face animation on the display and servo motion synced to the
 conversation, depending on where the embodiment lands after the re-print.

@@ -213,3 +213,84 @@ iPhone↔server, measured against the HTTP path before adopting.
    store the single source of truth and the provider swappable?
 5. **Watch ambition:** phone-proxy companion (cheap, designed already) or
    standalone-capable over public HTTPS (auth + hosting work)?
+   → *Answered same day: companion app (see addendum).*
+
+---
+
+# Addendum (2026-07-14): two proposals, Watch as companion
+
+Follow-up after Jesse's push-back. Two decisions reframe the analysis:
+
+**Decision 1 — the Watch is a companion app.** The iPhone does the
+streaming/sending/receiving on the Watch's behalf over WatchConnectivity.
+This was verified to be forced anyway: Tailscale has no watchOS client
+([platforms](https://tailscale.com/kb/1020/install-ios) cover macOS/iOS/tvOS
+only), and Watch traffic proxied through the paired iPhone does **not**
+traverse the phone's VPN tunnel (a known gap — e.g.
+[plappa #276](https://github.com/LeoKlaus/plappa/issues/276) hits exactly
+this with a tailnet media server). So no design gets a tailnet Watch;
+standalone Watch would require a public HTTPS endpoint (Tailscale Funnel or
+VPS) regardless of transport.
+
+**Consequence:** watchOS coverage stops being an argument against iroh — the
+platform iroh can't reach was never reachable directly anyway. The remaining
+iroh costs are real but smaller: iroh-ffi maturity on iOS (shipping in Delta
+Chat, so viable) and hand-rolling blob/event patterns over raw streams.
+
+Both proposals share everything from §1: the same idempotent turn protocol,
+the same storage layout, the same durability invariants, the same thin
+clients, and an identical Phase 1 (split kibod out of ptt.rs over localhost).
+The choice is *transport and reachability only*, and it can be deferred until
+the end of Phase 1.
+
+## Proposal A — tailnet-first (boring core)
+
+- kibod serves HTTP/1.1 + WS on the tailnet. Pi, iPhone, iPad, Mac join the
+  tailnet and speak plain HTTPS/URLSession — zero exotic dependencies.
+- Watch companion: the iPhone app proxies — forwards Watch clips up
+  (WatchConnectivity `transferFile`, which is queued/durable, never
+  `sendMessage`), pushes transcripts/replies down, and can hand the Watch
+  short TTS audio files for local playback.
+- Optional later: Tailscale Funnel exposes kibod as public HTTPS with a
+  device bearer token → standalone-Watch and share-with-friends both become
+  possible without a VPS.
+- Cost: Tailscale required on every non-Watch device. Risk: near zero.
+
+## Proposal B — iroh-first with an HTTP gateway sidecar
+
+- kibod's core is transport-agnostic; it mounts **two front doors in one
+  process**: an iroh endpoint (one versioned ALPN; each protocol message /
+  audio stream maps to an `open_bi` stream) and a thin axum HTTP gateway
+  exposing the identical §1 endpoints.
+- Pi client and iPhone/iPad (iroh-ffi Swift) dial kibod by EndpointId — no
+  VPN anywhere, ~90% direct hole-punched connections, e2e encrypted, works
+  from any network.
+- The HTTP gateway serves everything iroh can't: the Watch path (via the
+  iPhone companion — which may itself choose either transport), curl/browser
+  debugging, and any future client without iroh bindings. Bound to
+  localhost/tailnet initially; Funnel-able later.
+- Cost: two front doors to keep in sync (mitigated: both are thin adapters
+  over one core because the protocol is transport-agnostic — codex's risk #3
+  says build the shared protocol test suite first, which applies doubly
+  here), iroh-ffi Swift on iOS as a load-bearing dependency, heavier Pi
+  binary (verify zigbuild × iroh's crypto stack early).
+- Buys: no Tailscale on phones/iPads, dial-by-key identity, and the iroh
+  itch scratched properly rather than as a bolt-on.
+
+## Choosing
+
+| | A: tailnet | B: iroh + gateway |
+|---|---|---|
+| New moving parts | ~0 | iroh endpoint + FFI + gateway |
+| VPN required | every device but Watch | none |
+| Works off-tailnet (friend's house, LTE) | only via Funnel | yes, natively |
+| Watch story | identical (companion) | identical (companion) |
+| Risk if iroh ecosystem shifts | none | contained to adapters |
+| Phase 1 | identical | identical |
+
+Recommendation: still start with A's shape — but B is now a legitimate
+endgame rather than a consolation phase-4 experiment. Concretely: Phase 1
+unchanged; build the protocol test suite against the HTTP front door; decide
+A-vs-B at Phase 2 by answering one question — *"do I actually mind installing
+Tailscale on the phones?"* If yes, B; if no, A and keep B's adapter as the
+someday-option. Either way the Watch companion work (Phase 4) is unaffected.

@@ -100,8 +100,13 @@ between kibo and an AI:
    press (via `evdev`/`/dev/input`) starts and stops recording.
 2. **Record** — capture mic audio through the default ALSA device
    (`arecord` or `pyaudio`/`sounddevice`) into a WAV per press.
-3. **Transcribe** — ship each recording to a speech-to-text API and log the
-   transcript.
+3. **Transcribe** — ✓ done. Each saved clip goes to Gemini
+   (`gemini-3.5-flash` via the interactions API, curl as HTTP shim) and the
+   transcript lands in `turns.jsonl` as a durable record; failures are
+   durable `transcript_error` records and retry on next startup. Silent
+   (peak-0) clips are never sent — Gemini hallucinates speech from silence.
+   Needs `GEMINI_API_KEY` in `.env` (gitignored; deploy.sh pushes it to the
+   Pi, systemd loads it).
 4. **Respond** — feed transcripts to an LLM and speak the reply back through
    the USB speaker (TTS).
 

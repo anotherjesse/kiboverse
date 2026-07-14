@@ -12,17 +12,20 @@
 //! arecord/aplay are kept as thin device shims, but audio flows through us:
 //! arecord emits raw PCM on stdout, we meter it and write the WAV ourselves.
 
+use base64::Engine;
 use recplay::{chime, run};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const RECORD_BTN: u8 = 0;
-const AI_BTN: u8 = 1;
+const RECORD_BTN: u8 = 0; // X on the DragonRise pad
+const AI_BTN: u8 = 1; // A
 const MIN_CLIP: Duration = Duration::from_millis(500);
+const GEMINI_MODEL: &str = "gemini-3.5-flash";
 
 struct Recording {
     arecord: Child,
@@ -39,6 +42,21 @@ fn main() -> std::io::Result<()> {
     println!("joystick: {}", js.display());
     println!("data dir: {}", dir.display());
     println!("hold button {RECORD_BTN} to record, press button {AI_BTN} for the AI's turn");
+
+    // Processing is replayable: transcribe anything that was recorded but
+    // never transcribed (crash, network outage, pre-transcription clips).
+    {
+        let dir = dir.clone();
+        std::thread::spawn(move || {
+            for (id, file, silent) in untranscribed_clips(&dir) {
+                if silent {
+                    skip_silent_clip(&dir, &id);
+                } else {
+                    transcribe_and_log(&dir, &id, &file);
+                }
+            }
+        });
+    }
 
     let mut dev = File::open(&js)?;
     let mut buf = [0u8; 8]; // struct js_event: u32 time, i16 value, u8 type, u8 number
@@ -87,6 +105,12 @@ fn main() -> std::io::Result<()> {
                         println!("WARNING: clip is silent — check mic / USB bandwidth");
                     }
                     chime(&[880.0, 660.0])?;
+                    if peak_pct == 0 {
+                        skip_silent_clip(&dir, &id);
+                    } else {
+                        let (dir, id) = (dir.clone(), id.clone());
+                        std::thread::spawn(move || transcribe_and_log(&dir, &id, &file));
+                    }
                 }
             }
             (AI_BTN, 1, None) => ai_turn(&dir)?,
@@ -191,6 +215,110 @@ fn ai_turn(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Silent clips never go to the API: Gemini hallucinates plausible speech
+/// from pure silence. Log a durable [silent] transcript instead.
+fn skip_silent_clip(dir: &Path, id: &str) {
+    println!("clip {id} is silent — skipping transcription");
+    let record =
+        serde_json::json!({"kind":"transcript","clip":id,"text":"[silent]","at":epoch()});
+    if let Err(e) = append_turn(dir, &record.to_string()) {
+        eprintln!("FAILED to log silent marker for {id}: {e}");
+    }
+}
+
+/// Transcribe one clip and append the result (or the failure — errors are
+/// durable states too) to turns.jsonl.
+fn transcribe_and_log(dir: &Path, id: &str, file: &str) {
+    println!("transcribing {id}...");
+    let record = match transcribe(&dir.join(file)) {
+        Ok(text) => {
+            println!("transcript {id}: {text}");
+            serde_json::json!({"kind":"transcript","clip":id,"text":text,"at":epoch()})
+        }
+        Err(e) => {
+            println!("transcription FAILED {id}: {e}");
+            serde_json::json!({"kind":"transcript_error","clip":id,"error":e.to_string(),"at":epoch()})
+        }
+    };
+    if let Err(e) = append_turn(dir, &record.to_string()) {
+        eprintln!("FAILED to log transcript for {id}: {e}");
+    }
+}
+
+/// Send a WAV to Gemini and return the transcript. curl is our HTTP shim,
+/// same philosophy as arecord/aplay (keeps the cross-compile pure Rust).
+fn transcribe(wav: &Path) -> std::io::Result<String> {
+    let key = std::env::var("GEMINI_API_KEY")
+        .map_err(|_| std::io::Error::other("GEMINI_API_KEY not set"))?;
+    let audio = fs::read(wav)?;
+    let body = serde_json::json!({
+        "model": GEMINI_MODEL,
+        "input": [
+            {"type": "text", "text": "Generate a transcript of the speech. \
+              Return only the transcript text. If there is no speech, return [no speech]."},
+            {"type": "audio",
+             "data": base64::engine::general_purpose::STANDARD.encode(&audio),
+             "mime_type": "audio/wav"}
+        ]
+    });
+    let mut curl = Command::new("curl")
+        .args([
+            "-s",
+            "--max-time",
+            "60",
+            "-X",
+            "POST",
+            "https://generativelanguage.googleapis.com/v1beta/interactions",
+            "-H",
+            &format!("x-goog-api-key: {key}"),
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            "@-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    curl.stdin.take().unwrap().write_all(body.to_string().as_bytes())?;
+    let out = curl.wait_with_output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::other(format!("curl exited {}", out.status)));
+    }
+    let resp: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| std::io::Error::other(format!("bad JSON from API: {e}")))?;
+    resp["steps"]
+        .as_array()
+        .and_then(|steps| steps.iter().find(|s| s["type"] == "model_output"))
+        .and_then(|s| s["content"][0]["text"].as_str())
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| {
+            let excerpt: String = String::from_utf8_lossy(&out.stdout).chars().take(300).collect();
+            std::io::Error::other(format!("no transcript in response: {excerpt}"))
+        })
+}
+
+/// Clips that have no transcript record yet, oldest first, with a flag for
+/// clips known to be silent (recorded with peak 0).
+fn untranscribed_clips(dir: &Path) -> Vec<(String, String, bool)> {
+    let log = fs::read_to_string(dir.join("turns.jsonl")).unwrap_or_default();
+    let mut clips = Vec::new();
+    let mut done = std::collections::HashSet::new();
+    for line in log.lines() {
+        if line.contains(r#""kind":"clip""#) {
+            if let (Some(id), Some(file)) = (field(line, "id"), field(line, "file")) {
+                clips.push((id, file, line.contains(r#""peak":0,"#)));
+            }
+        } else if line.contains(r#""kind":"transcript""#) {
+            if let Some(id) = field(line, "clip") {
+                done.insert(id);
+            }
+        }
+    }
+    clips.retain(|(id, _, _)| !done.contains(id));
+    clips
+}
+
 fn find_js(frag: &str) -> Option<PathBuf> {
     (0..8).find_map(|i| {
         let name = fs::read_to_string(format!("/sys/class/input/js{i}/device/name")).ok()?;
@@ -208,6 +336,8 @@ fn data_dir() -> std::io::Result<PathBuf> {
 }
 
 fn append_turn(dir: &Path, line: &str) -> std::io::Result<()> {
+    static LOG_LOCK: Mutex<()> = Mutex::new(()); // appends come from several threads
+    let _guard = LOG_LOCK.lock().unwrap();
     let mut f = OpenOptions::new()
         .create(true)
         .append(true)

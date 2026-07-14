@@ -10,6 +10,7 @@ scp recplay/target/aarch64-unknown-linux-gnu/release/ptt kibo.local:ptt.new
 ssh kibo.local 'mkdir -p .config/wireplumber/main.lua.d'
 scp pi-config/wireplumber/51-disable-airhug.lua kibo.local:.config/wireplumber/main.lua.d/
 scp pi-config/systemd/ptt.service kibo.local:/tmp/ptt.service
+[ -f .env ] && scp .env kibo.local:.env
 
 ssh kibo.local '
   sudo -n systemctl stop ptt 2>/dev/null || true

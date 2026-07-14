@@ -7,6 +7,8 @@ After=sound.target
 [Service]
 User=jesse
 Environment=HOME=/home/jesse
+# GEMINI_API_KEY lives here; deploy.sh pushes it from the repo's .env
+EnvironmentFile=-/home/jesse/.env
 WorkingDirectory=/home/jesse
 ExecStart=/home/jesse/ptt
 # Also covers the joystick being unplugged at boot: keep retrying until

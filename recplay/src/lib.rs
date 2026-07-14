@@ -3,6 +3,13 @@ use std::process::{Command, Stdio};
 
 pub const RATE: u32 = 44_100;
 
+/// ALSA device all audio goes through. Explicit on purpose: the system
+/// "default" on Pi OS is owned by pulse/pipewire, which can silently
+/// reroute it (we lost hours to default-capture recording pure zeros).
+pub fn audio_dev() -> String {
+    std::env::var("KIBO_AUDIO_DEV").unwrap_or_else(|_| "plughw:A01,0".into())
+}
+
 /// One sine note with a soft attack and exponential decay (no clicks).
 pub fn note(freq: f32, secs: f32) -> Vec<i16> {
     let n = (RATE as f32 * secs) as usize;
@@ -28,7 +35,8 @@ pub fn chime(freqs: &[f32]) -> std::io::Result<()> {
         samples.extend(note(f, 0.11));
     }
     let mut child = Command::new("aplay")
-        .args(["-q", "-t", "raw", "-f", "S16_LE", "-r", "44100", "-c", "1", "-"])
+        .args(["-q", "-D", &audio_dev()])
+        .args(["-t", "raw", "-f", "S16_LE", "-r", "44100", "-c", "1", "-"])
         .stdin(Stdio::piped())
         .spawn()?;
     let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();

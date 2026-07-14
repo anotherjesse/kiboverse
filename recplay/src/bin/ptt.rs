@@ -101,7 +101,8 @@ fn main() -> std::io::Result<()> {
 fn start_recording(dir: &Path) -> std::io::Result<Recording> {
     let work = dir.join("current-recording.wav");
     let mut arecord = Command::new("arecord")
-        .args(["-q", "-t", "raw", "-f", "S16_LE", "-r", "44100", "-c", "1", "-"])
+        .args(["-q", "-D", &recplay::audio_dev()])
+        .args(["-t", "raw", "-f", "S16_LE", "-r", "44100", "-c", "1", "-"])
         .stdout(Stdio::piped())
         .spawn()?;
     let stdout = arecord.stdout.take().unwrap();
@@ -177,8 +178,9 @@ fn ai_turn(dir: &Path) -> std::io::Result<()> {
     }
     println!("AI turn: answering {} clip(s)", pending.len());
     chime(&[523.0, 659.0, 784.0])?;
+    let dev = recplay::audio_dev();
     for (_, file) in &pending {
-        run("aplay", &["-q", dir.join(file).to_str().unwrap()])?;
+        run("aplay", &["-q", "-D", &dev, dir.join(file).to_str().unwrap()])?;
     }
     let ids: Vec<String> = pending.iter().map(|(id, _)| format!("\"{id}\"")).collect();
     append_turn(

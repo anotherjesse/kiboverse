@@ -21,37 +21,42 @@ The Pi is reachable on the local network as `kibo.local` (ssh).
   scripts yet
 - Happy Hacking Keyboard Lite2 plugged in for local console use
 
-## Audio setup (done 2026-07-14)
+## Audio setup (done 2026-07-14, the hard way)
 
-The USB speaker/mic is the **default ALSA device** via `~/.asoundrc` on the Pi.
-The card is referenced by name (`A01`) rather than number so it survives
-reboot renumbering. `defaults.pcm.card "A01"` fails on this alsa-lib
-("card is not a string"), so the config uses an explicit default:
+Our code addresses the USB speaker/mic **explicitly** as `plughw:A01,0`
+(override with `KIBO_AUDIO_DEV`). By name, not card number, so it survives
+reboot renumbering; `plughw` gives automatic rate/format conversion (the
+device is natively 48 kHz stereo only).
 
-```
-pcm.!default {
-    type asym
-    playback.pcm "plughw:A01,0"
-    capture.pcm "plughw:A01,0"
-}
-ctl.!default {
-    type hw
-    card A01
-}
-```
+**Never use the ALSA `default` device on this box.** Pi OS routes `default`
+through the pulse plugin into PipeWire, which ignores `~/.asoundrc` in
+practice and can silently record pure zeros while returning success. We lost
+an afternoon to this — always verify recordings by content (peak/rms),
+never by exit code. ptt logs a peak% per clip for exactly this reason.
 
-`plughw` gives automatic sample-rate/format conversion. The built-in headphone
-jack (`bcm2835 Headphones`, card 0) is still available if addressed explicitly.
+PipeWire is told to leave the card alone via
+`~/.config/wireplumber/main.lua.d/51-disable-airhug.lua` (device.disabled).
+Without it, the desktop holds the playback stream open permanently, and on
+this full-speed USB device the idle reservation starves the mic: capture
+wants 512 bytes/frame — the single biggest reservation on the Pi 4's shared
+internal USB2 hub — so capture is always what fails when bandwidth runs out
+(`dmesg`: "Not enough bandwidth for altsetting"). Keep low-speed devices
+like the DragonRise joystick off the bus or behind another hub if the mic
+goes silent, and note the errors are rate-limited: absence from dmesg
+proves nothing.
 
-Quick tests:
+Quick tests (music playing or speaking near the puck):
 
 ```sh
-aplay test.wav                                    # speaker (default device)
-arecord -d 4 -f S16_LE -r 44100 /tmp/t.wav        # mic, 4 seconds
-aplay /tmp/t.wav                                  # play it back
+aplay -D plughw:A01,0 test.wav
+arecord -D plughw:A01,0 -d 4 -f S16_LE -r 44100 /tmp/t.wav
+python3 - <<'EOF'   # verify content, not exit code
+import wave, audioop
+w = wave.open("/tmp/t.wav"); f = w.readframes(w.getnframes())
+print("peak:", audioop.max(f, 2), "rms:", audioop.rms(f, 2))
+EOF
+aplay -D plughw:A01,0 /tmp/t.wav
 ```
-
-Both directions verified working.
 
 ## Repo layout
 

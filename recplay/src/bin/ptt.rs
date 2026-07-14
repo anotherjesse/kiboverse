@@ -21,11 +21,11 @@
 use base64::Engine;
 use recplay::{audio_dev, chime};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -91,7 +91,7 @@ fn main() -> std::io::Result<()> {
         match (number, value, &rec) {
             (RECORD_BTN, 1, None) => {
                 player.pause(); // stop speech before the mic opens
-                chime(&[660.0, 880.0])?;
+                let _ = chime(&[660.0, 880.0]); // never fatal: a beep must not kill the robot
                 rec = Some(start_recording(&dir)?);
                 println!("recording...");
             }
@@ -106,7 +106,7 @@ fn main() -> std::io::Result<()> {
                 if elapsed < MIN_CLIP {
                     let _ = fs::remove_file(&work);
                     println!("discarded accidental tap ({}ms)", elapsed.as_millis());
-                    chime(&[220.0])?;
+                    let _ = chime(&[220.0]); // never fatal: a beep must not kill the robot
                 } else {
                     let (id, file) = clip_name(&dir);
                     fs::rename(&work, dir.join(&file))?;
@@ -120,7 +120,7 @@ fn main() -> std::io::Result<()> {
                         ),
                     )?;
                     println!("saved {file} ({}ms, peak {peak_pct}%)", elapsed.as_millis());
-                    chime(&[880.0, 660.0])?;
+                    let _ = chime(&[880.0, 660.0]); // never fatal: a beep must not kill the robot
                     if peak_pct == 0 {
                         println!("WARNING: clip is silent — check mic / USB bandwidth");
                         skip_silent_clip(&dir, &id);
@@ -162,10 +162,10 @@ fn ai_turn(dir: &Path, player: &Arc<Player>) -> std::io::Result<()> {
     let pending = pending_clips(dir);
     if pending.is_empty() {
         println!("nothing new to answer");
-        chime(&[330.0, 220.0])?;
+        let _ = chime(&[330.0, 220.0]); // never fatal: a beep must not kill the robot
         return Ok(());
     }
-    chime(&[523.0, 659.0, 784.0])?;
+    let _ = chime(&[523.0, 659.0, 784.0]); // never fatal: a beep must not kill the robot
 
     let ids: Vec<String> = pending.iter().map(|(id, _)| id.clone()).collect();
     let transcripts = wait_for_transcripts(dir, &ids, Duration::from_secs(25));
@@ -184,7 +184,7 @@ fn ai_turn(dir: &Path, player: &Arc<Player>) -> std::io::Result<()> {
             })
             .to_string(),
         )?;
-        chime(&[330.0, 220.0])?;
+        let _ = chime(&[330.0, 220.0]); // never fatal: a beep must not kill the robot
         return Ok(());
     }
 
@@ -203,23 +203,21 @@ fn ai_turn(dir: &Path, player: &Arc<Player>) -> std::io::Result<()> {
     };
 
     // Reply text is durable BEFORE speech synthesis: a TTS failure must
-    // never destroy the answer.
+    // never destroy the answer. The audio filename is chosen now so the
+    // reply record and the WAV cross-link (blob+metadata rule).
+    let name = format!("tts-{}.wav", chrono::Local::now().format("%Y%m%d-%H%M%S"));
     append_turn(
         dir,
         &serde_json::json!({
-            "kind":"reply","answers":ids,"text":reply,
+            "kind":"reply","answers":ids,"text":reply,"audio":name,
             "interaction_id":interaction_id,"at":epoch()
         })
         .to_string(),
     )?;
     println!("kibo: {reply}");
 
-    match tts(&reply) {
-        Ok(samples) => {
-            let name = format!("tts-{}.wav", chrono::Local::now().format("%Y%m%d-%H%M%S"));
-            save_wav(&dir.join(name), &samples, TTS_RATE)?;
-            player.play(samples);
-        }
+    match tts_stream(&reply, dir.join(&name)) {
+        Ok(stream) => player.play(stream),
         Err(e) => {
             println!("TTS FAILED (reply text is safe): {e}");
             append_turn(
@@ -227,7 +225,7 @@ fn ai_turn(dir: &Path, player: &Arc<Player>) -> std::io::Result<()> {
                 &serde_json::json!({"kind":"tts_error","error":e.to_string(),"at":epoch()})
                     .to_string(),
             )?;
-            chime(&[220.0, 180.0])?;
+            let _ = chime(&[220.0, 180.0]); // never fatal: a beep must not kill the robot
         }
     }
     Ok(())
@@ -253,29 +251,132 @@ fn chat(user_text: &str, prev: Option<&str>) -> std::io::Result<(String, String)
     Ok((text, id))
 }
 
-/// Synthesize speech. Returns mono PCM samples at TTS_RATE (little-endian
-/// on the wire despite the audio/l16 label — verified empirically).
-fn tts(text: &str) -> std::io::Result<Vec<i16>> {
+/// TTS audio as it streams in: samples grow while `done` is false. The
+/// player reads it by position, so pause/rewind/skip work mid-download.
+#[derive(Default)]
+struct AudioStream {
+    samples: Mutex<Vec<i16>>,
+    done: AtomicBool,
+}
+
+/// Start streaming speech synthesis (SSE deltas of little-endian PCM at
+/// TTS_RATE, despite the audio/l16 label — verified empirically). Returns
+/// once the first audio arrives, so callers see synthesis errors; a
+/// background thread keeps filling the stream and saves the finished WAV.
+fn tts_stream(text: &str, save_path: PathBuf) -> std::io::Result<Arc<AudioStream>> {
+    let key = std::env::var("GEMINI_API_KEY")
+        .map_err(|_| std::io::Error::other("GEMINI_API_KEY not set"))?;
     let body = serde_json::json!({
         "model": TTS_MODEL,
         "input": text,
         "response_format": {"type": "audio"},
-        "generation_config": {"speech_config": [{"voice": TTS_VOICE}]}
+        "generation_config": {"speech_config": [{"voice": TTS_VOICE}]},
+        "stream": true
     });
-    let resp = gemini(&body)?;
-    let content = model_output(&resp)
-        .filter(|c| c["type"] == "audio")
-        .ok_or_else(|| std::io::Error::other(format!("no audio in: {}", excerpt(&resp))))?;
-    let data = content["data"]
-        .as_str()
-        .ok_or_else(|| std::io::Error::other("audio content has no data"))?;
-    let raw = base64::engine::general_purpose::STANDARD
-        .decode(data)
-        .map_err(|e| std::io::Error::other(format!("bad base64 audio: {e}")))?;
-    Ok(raw
-        .chunks_exact(2)
-        .map(|c| i16::from_le_bytes([c[0], c[1]]))
-        .collect())
+    let mut curl = Command::new("curl")
+        .args([
+            "-sN",
+            "--max-time",
+            "300",
+            "-X",
+            "POST",
+            "https://generativelanguage.googleapis.com/v1beta/interactions",
+            "-H",
+            &format!("x-goog-api-key: {key}"),
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            "@-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    curl.stdin.take().unwrap().write_all(body.to_string().as_bytes())?;
+    let stdout = curl.stdout.take().unwrap();
+
+    let stream = Arc::new(AudioStream::default());
+    let (tx, rx) = mpsc::channel::<std::io::Result<()>>();
+    {
+        let stream = stream.clone();
+        std::thread::spawn(move || {
+            let result = read_sse_audio(stdout, &stream, &tx);
+            stream.done.store(true, SeqCst);
+            let _ = curl.wait();
+            if let Err(e) = result {
+                let _ = tx.send(Err(e)); // only reaches rx if no audio ever arrived
+            }
+            // clone so the disk write never blocks the live playback reader
+            let samples = stream.samples.lock().unwrap().clone();
+            if samples.is_empty() {
+                return;
+            }
+            if let Err(e) = save_wav(&save_path, &samples, TTS_RATE) {
+                eprintln!("failed to save {}: {e}", save_path.display());
+            }
+        });
+    }
+    rx.recv()
+        .map_err(|_| std::io::Error::other("tts stream ended before any audio"))?
+        .map(|_| stream)
+}
+
+/// Parse SSE lines from curl, appending each audio delta's samples to the
+/// stream. Signals `tx` once ~0.5s of audio is buffered (or the stream ends
+/// with less), so playback starts with an underrun cushion.
+fn read_sse_audio(
+    stdout: impl Read,
+    stream: &AudioStream,
+    tx: &mpsc::Sender<std::io::Result<()>>,
+) -> std::io::Result<()> {
+    const PREBUFFER: usize = TTS_RATE as usize / 2;
+    let mut total = 0usize;
+    let mut signaled = false;
+    let mut leftover: Option<u8> = None; // deltas can split a sample across events
+    for line in BufReader::new(stdout).lines() {
+        let line = line?;
+        let Some(payload) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if payload == "[DONE]" {
+            break;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else {
+            continue;
+        };
+        let Some(b64) = v["delta"]["data"].as_str().filter(|_| v["delta"]["type"] == "audio")
+        else {
+            continue;
+        };
+        let pcm = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| std::io::Error::other(format!("bad base64 audio: {e}")))?;
+        let mut data: &[u8] = &pcm;
+        if data.is_empty() {
+            continue;
+        }
+        let mut samples = stream.samples.lock().unwrap();
+        if let Some(lo) = leftover.take() {
+            samples.push(i16::from_le_bytes([lo, data[0]]));
+            data = &data[1..];
+        }
+        samples.extend(data.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])));
+        if data.len() % 2 == 1 {
+            leftover = Some(data[data.len() - 1]);
+        }
+        total = samples.len();
+        drop(samples);
+        if !signaled && total >= PREBUFFER {
+            signaled = true;
+            let _ = tx.send(Ok(()));
+        }
+    }
+    if total == 0 {
+        return Err(std::io::Error::other("tts stream produced no audio"));
+    }
+    if !signaled {
+        let _ = tx.send(Ok(())); // reply shorter than the prebuffer
+    }
+    Ok(())
 }
 
 /// POST one interactions-API request via curl (our HTTP shim).
@@ -369,21 +470,21 @@ impl Player {
         }
     }
 
-    fn play(self: &Arc<Self>, samples: Vec<i16>) {
+    fn play(self: &Arc<Self>, stream: Arc<AudioStream>) {
         let st = self.clone();
         st.speaking.store(true, SeqCst);
         st.skip_flag.store(false, SeqCst);
         std::thread::spawn(move || {
-            st.playback_loop(&samples);
+            st.playback_loop(&stream);
             st.speaking.store(false, SeqCst);
         });
     }
 
-    fn playback_loop(&self, samples: &[i16]) {
+    fn playback_loop(&self, stream: &AudioStream) {
         const CHUNK: usize = 4800; // 200ms at 24k
         let rate = TTS_RATE as usize;
         let mut pos = 0usize;
-        while pos < samples.len() {
+        while !stream.finished(pos) {
             // paused (or queued behind an active recording)
             while self.mic_active.load(SeqCst) {
                 if self.skip_flag.swap(false, SeqCst) {
@@ -411,8 +512,8 @@ impl Player {
             *self.current.lock().unwrap() = Some(child);
             let seg_start = Instant::now();
             let seg_base = pos;
-            let mut interrupted = false;
-            while pos < samples.len() {
+            let mut interrupted = false; // by mic or skip, incl. during drain
+            loop {
                 if self.mic_active.load(SeqCst) || self.skip_flag.load(SeqCst) {
                     interrupted = true;
                     break;
@@ -425,26 +526,73 @@ impl Player {
                     std::thread::sleep(Duration::from_millis(50));
                     continue; // re-check flags while throttled
                 }
-                let end = (pos + CHUNK).min(samples.len());
-                let bytes: Vec<u8> =
-                    samples[pos..end].iter().flat_map(|s| s.to_le_bytes()).collect();
+                let chunk = stream.chunk(pos, CHUNK);
+                if chunk.is_empty() {
+                    if stream.finished(pos) {
+                        break;
+                    }
+                    // buffer momentarily dry: synthesis is still ahead of us
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+                let bytes: Vec<u8> = chunk.iter().flat_map(|s| s.to_le_bytes()).collect();
                 if stdin.write_all(&bytes).is_err() {
                     interrupted = true; // aplay was killed under us
                     break;
                 }
-                pos = end;
+                pos += chunk.len();
             }
             drop(stdin);
+            if !interrupted {
+                // Natural end: let aplay drain its tail, but stay killable —
+                // the mic or a skip must still be able to cut it off, and the
+                // child must stay in self.current so kill_current can see it.
+                interrupted = loop {
+                    if self.skip_flag.load(SeqCst) || self.mic_active.load(SeqCst) {
+                        self.kill_current();
+                        break true;
+                    }
+                    let drained = {
+                        let mut cur = self.current.lock().unwrap();
+                        match cur.as_mut() {
+                            None => true, // killed from outside
+                            Some(c) => match c.try_wait() {
+                                Ok(None) => false,
+                                _ => {
+                                    cur.take();
+                                    true
+                                }
+                            },
+                        }
+                    };
+                    if drained {
+                        break false;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                };
+            }
             if interrupted {
                 self.kill_current();
                 if self.skip_flag.swap(false, SeqCst) {
                     return;
                 }
                 pos = pos.saturating_sub(REWIND_SAMPLES);
-            } else if let Some(mut c) = self.current.lock().unwrap().take() {
-                let _ = c.wait(); // natural end: let aplay drain
             }
         }
+    }
+}
+
+impl AudioStream {
+    /// Up to `max` samples starting at `pos`; empty if none are ready yet.
+    fn chunk(&self, pos: usize, max: usize) -> Vec<i16> {
+        let samples = self.samples.lock().unwrap();
+        let end = (pos + max).min(samples.len());
+        samples.get(pos..end).map(<[i16]>::to_vec).unwrap_or_default()
+    }
+
+    /// True once every received sample has been consumed and no more can come.
+    fn finished(&self, pos: usize) -> bool {
+        self.done.load(SeqCst) && pos >= self.samples.lock().unwrap().len()
     }
 }
 

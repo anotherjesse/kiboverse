@@ -5,20 +5,31 @@
 //! back every clip since the last reply, then logging the reply.
 //!
 //! Durability rules (see voiceflow.md — NEVER LOSE USER DATA): the clip is
-//! finalized on disk (atomic rename to recording-<uuid>.wav) and logged in
+//! finalized on disk (atomic rename to a timestamped name) and logged in
 //! turns.jsonl before anything else happens to it. Clips are never deleted
 //! by an AI turn; the reply is just another line in the log.
+//!
+//! arecord/aplay are kept as thin device shims, but audio flows through us:
+//! arecord emits raw PCM on stdout, we meter it and write the WAV ourselves.
 
 use recplay::{chime, run};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const RECORD_BTN: u8 = 0;
 const AI_BTN: u8 = 1;
 const MIN_CLIP: Duration = Duration::from_millis(500);
+
+struct Recording {
+    arecord: Child,
+    writer: JoinHandle<std::io::Result<i16>>,
+    started: Instant,
+    work: PathBuf,
+}
 
 fn main() -> std::io::Result<()> {
     let frag = std::env::args().nth(1).unwrap_or_else(|| "USB Gamepad".into());
@@ -31,7 +42,7 @@ fn main() -> std::io::Result<()> {
 
     let mut dev = File::open(&js)?;
     let mut buf = [0u8; 8]; // struct js_event: u32 time, i16 value, u8 type, u8 number
-    let mut rec: Option<(Child, Instant, PathBuf)> = None;
+    let mut rec: Option<Recording> = None;
 
     loop {
         dev.read_exact(&mut buf)?;
@@ -43,21 +54,18 @@ fn main() -> std::io::Result<()> {
         }
         match (number, value, &rec) {
             (RECORD_BTN, 1, None) => {
-                let work = dir.join("current-recording.wav");
                 chime(&[660.0, 880.0])?;
-                let child = Command::new("arecord")
-                    .args(["-q", "-f", "S16_LE", "-r", "44100", "-c", "1"])
-                    .arg(&work)
-                    .spawn()?;
+                rec = Some(start_recording(&dir)?);
                 println!("recording...");
-                rec = Some((child, Instant::now(), work));
             }
             (RECORD_BTN, 0, Some(_)) => {
-                let (mut child, started, work) = rec.take().unwrap();
+                let Recording { mut arecord, writer, started, work } = rec.take().unwrap();
                 let elapsed = started.elapsed();
-                // SIGINT so arecord finalizes the WAV header (SIGKILL corrupts it)
-                run("kill", &["-INT", &child.id().to_string()])?;
-                child.wait()?;
+                arecord.kill()?; // raw stream on stdout: no header to corrupt
+                arecord.wait()?;
+                let peak = writer
+                    .join()
+                    .map_err(|_| std::io::Error::other("writer thread panicked"))??;
                 if elapsed < MIN_CLIP {
                     let _ = fs::remove_file(&work);
                     println!("discarded accidental tap ({}ms)", elapsed.as_millis());
@@ -65,15 +73,19 @@ fn main() -> std::io::Result<()> {
                 } else {
                     let (id, file) = clip_name(&dir);
                     fs::rename(&work, dir.join(&file))?;
+                    let peak_pct = peak as u32 * 100 / i16::MAX as u32;
                     append_turn(
                         &dir,
                         &format!(
-                            r#"{{"kind":"clip","id":"{id}","file":"{file}","ms":{},"at":{}}}"#,
+                            r#"{{"kind":"clip","id":"{id}","file":"{file}","ms":{},"peak":{peak_pct},"at":{}}}"#,
                             elapsed.as_millis(),
                             epoch()
                         ),
                     )?;
-                    println!("saved {file} ({}ms)", elapsed.as_millis());
+                    println!("saved {file} ({}ms, peak {peak_pct}%)", elapsed.as_millis());
+                    if peak_pct == 0 {
+                        println!("WARNING: clip is silent — check mic / USB bandwidth");
+                    }
                     chime(&[880.0, 660.0])?;
                 }
             }
@@ -83,6 +95,66 @@ fn main() -> std::io::Result<()> {
             _ => {}
         }
     }
+}
+
+/// Spawn arecord emitting raw PCM and a thread that streams it into a WAV.
+fn start_recording(dir: &Path) -> std::io::Result<Recording> {
+    let work = dir.join("current-recording.wav");
+    let mut arecord = Command::new("arecord")
+        .args(["-q", "-t", "raw", "-f", "S16_LE", "-r", "44100", "-c", "1", "-"])
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let stdout = arecord.stdout.take().unwrap();
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: recplay::RATE,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let wav = hound::WavWriter::create(&work, spec).map_err(io_err)?;
+    Ok(Recording {
+        arecord,
+        writer: std::thread::spawn(move || stream_to_wav(stdout, wav)),
+        started: Instant::now(),
+        work,
+    })
+}
+
+/// Copy raw PCM from arecord's stdout into the WAV as it arrives, tracking
+/// the peak level. Audio hits the disk continuously while recording, so a
+/// crash mid-clip loses at most the header, not the samples.
+fn stream_to_wav(
+    mut src: impl Read,
+    mut wav: hound::WavWriter<BufWriter<File>>,
+) -> std::io::Result<i16> {
+    let mut buf = [0u8; 4096];
+    let mut leftover: Option<u8> = None;
+    let mut peak: i16 = 0;
+    loop {
+        let n = src.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let mut data: &[u8] = &buf[..n];
+        // pipe reads can split a 2-byte sample; carry the odd byte over
+        let first = leftover.take().map(|lo| {
+            let s = i16::from_le_bytes([lo, data[0]]);
+            data = &data[1..];
+            s
+        });
+        let rest = data
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]));
+        for s in first.into_iter().chain(rest) {
+            peak = peak.max(s.saturating_abs());
+            wav.write_sample(s).map_err(io_err)?;
+        }
+        if data.len() % 2 == 1 {
+            leftover = Some(data[data.len() - 1]);
+        }
+    }
+    wav.finalize().map_err(io_err)?;
+    Ok(peak)
 }
 
 /// Play back every clip since the last reply, then log the reply.
@@ -161,6 +233,10 @@ fn clip_name(dir: &Path) -> (String, String) {
         id = format!("{base}-{n}");
     }
     (id.clone(), format!("recording-{id}.wav"))
+}
+
+fn io_err(e: hound::Error) -> std::io::Error {
+    std::io::Error::other(e.to_string())
 }
 
 fn epoch() -> u64 {

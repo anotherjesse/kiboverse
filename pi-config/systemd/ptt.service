@@ -1,0 +1,18 @@
+# Installed to /etc/systemd/system/ptt.service by deploy.sh.
+# Logs: journalctl -u ptt -f
+[Unit]
+Description=kibo push-to-talk (joystick record/playback loop)
+After=sound.target
+
+[Service]
+User=jesse
+Environment=HOME=/home/jesse
+WorkingDirectory=/home/jesse
+ExecStart=/home/jesse/ptt
+# Also covers the joystick being unplugged at boot: keep retrying until
+# it appears.
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -63,10 +63,18 @@ aplay -D plughw:A01,0 /tmp/t.wav
 - `original/` — snapshot of the face-animation scripts as they existed on the
   Pi (`f2.py`–`f9.py` are iterations; `face.py` is the largest/most complete).
   Kept as-is for reference before any refactoring happens here.
-- `recplay/` — Rust app: chime, record N seconds (default 5) from the mic,
-  chime, play it back. First building block of the sound pipeline; shells out
-  to `arecord`/`aplay`, chimes are sine notes generated in Rust and piped to
-  `aplay` as raw samples (no audio C libraries needed).
+- `recplay/` — Rust package, two binaries. `recplay`: chime, record N
+  seconds, chime, play back. `ptt`: joystick push-to-talk — hold button 0 to
+  record (raw PCM streamed from `arecord` through Rust, WAV written by us,
+  live peak metering), release to save durably (timestamped file +
+  `turns.jsonl`, blob before metadata), button 1 plays back everything since
+  the last reply (simulated AI turn). No audio C libraries; `arecord`/`aplay`
+  are used only as thin device shims.
+- `pi-config/` — files that live on the Pi, kept here so it's reproducible:
+  the WirePlumber rule (→ `~/.config/wireplumber/main.lua.d/`) and the ptt
+  systemd unit (→ `/etc/systemd/system/`).
+- `deploy.sh` — build + push binary and config + (re)start the `ptt`
+  service, all in one. Logs on the Pi: `journalctl -u ptt -f`.
 
 ## Rust cross-compile (Mac → Pi)
 

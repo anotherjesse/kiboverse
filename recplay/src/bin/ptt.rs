@@ -132,12 +132,13 @@ fn main() -> std::io::Result<()> {
                 player.resume(); // continue any paused speech, rewound
             }
             (AI_BTN, 1, None) => {
-                if player.speaking() {
-                    println!("skipping the rest of the speech");
-                    player.skip();
-                } else if ai_busy.swap(true, SeqCst) {
+                if ai_busy.swap(true, SeqCst) {
                     println!("already thinking...");
                 } else {
+                    if player.speaking() {
+                        println!("interrupting speech for a new turn");
+                        player.skip();
+                    }
                     let (dir, player, ai_busy) = (dir.clone(), player.clone(), ai_busy.clone());
                     std::thread::spawn(move || {
                         if let Err(e) = ai_turn(&dir, &player) {

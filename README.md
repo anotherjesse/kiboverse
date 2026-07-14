@@ -58,6 +58,25 @@ Both directions verified working.
 - `original/` — snapshot of the face-animation scripts as they existed on the
   Pi (`f2.py`–`f9.py` are iterations; `face.py` is the largest/most complete).
   Kept as-is for reference before any refactoring happens here.
+- `recplay/` — Rust app: chime, record N seconds (default 5) from the mic,
+  chime, play it back. First building block of the sound pipeline; shells out
+  to `arecord`/`aplay`, chimes are sine notes generated in Rust and piped to
+  `aplay` as raw samples (no audio C libraries needed).
+
+## Rust cross-compile (Mac → Pi)
+
+The Pi is aarch64 / glibc 2.36. Build on the Mac with `cargo-zigbuild`
+(zig is the cross-linker; no VM or Docker needed) and copy the binary over:
+
+```sh
+cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.36
+scp target/aarch64-unknown-linux-gnu/release/recplay kibo.local:
+ssh kibo.local ./recplay
+```
+
+This stays trivial as long as dependencies are pure Rust (`evdev`, `hound`,
+`reqwest` with `rustls-tls`, …). Crates that link Linux C libraries
+(`alsa`/`cpal`, `openssl-sys`) would need a real cross-sysroot — avoid them.
 
 ## Roadmap
 

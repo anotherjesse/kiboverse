@@ -206,15 +206,16 @@ final class WatchStore: ObservableObject {
         }
     }
 
-    func speech(turnID: String) async throws -> (Data, Int) {
+    func speechStream(turnID: String, fromSample: Int) async throws -> SpeechResponseStream {
         guard let projectID = selectedProjectID,
               let conversationID = selectedConversationID else {
             throw APIError.invalidResponse
         }
-        return try await api.speech(
+        return try await api.speechStream(
             projectID: projectID,
             conversationID: conversationID,
-            turnID: turnID
+            turnID: turnID,
+            fromSample: fromSample
         )
     }
 

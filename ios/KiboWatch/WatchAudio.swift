@@ -1,4 +1,5 @@
 @preconcurrency import AVFoundation
+import Combine
 import Foundation
 
 struct WatchLocalRecording: Sendable {
@@ -88,7 +89,22 @@ struct WatchPendingUploadSpool {
 }
 
 @MainActor
-final class WatchAudioRecorder: NSObject, ObservableObject, @preconcurrency AVAudioRecorderDelegate {
+protocol WatchAudioCapturing: AnyObject {
+    var objectWillChange: ObservableObjectPublisher { get }
+    var isRecording: Bool { get }
+    var isStarting: Bool { get }
+    var level: CGFloat { get }
+    var errorMessage: String? { get set }
+    func prepare() async
+    func start(holdID: UUID) async -> Bool
+    func stop(holdID: UUID) -> WatchLocalRecording?
+    func cancel(holdID: UUID?)
+    func resetAudioObjects()
+}
+
+@MainActor
+final class WatchAudioRecorder: NSObject, ObservableObject, WatchAudioCapturing,
+    @preconcurrency AVAudioRecorderDelegate {
     @Published private(set) var isRecording = false
     @Published private(set) var isStarting = false
     @Published private(set) var level: CGFloat = 0
@@ -100,19 +116,27 @@ final class WatchAudioRecorder: NSObject, ObservableObject, @preconcurrency AVAu
     private var activeHoldID: UUID?
     private var isPreparing = false
     private var peakPct = 0
+    private var audioObjectEpoch = UUID()
 
     func prepare() async {
         guard recorder == nil, preparedRecorder == nil, !isPreparing, !isStarting else { return }
+        let epoch = audioObjectEpoch
         isPreparing = true
-        defer { isPreparing = false }
+        defer {
+            if audioObjectEpoch == epoch { isPreparing = false }
+        }
         guard await requestPermission() else { return }
+        guard !Task.isCancelled, audioObjectEpoch == epoch else { return }
         do {
-            try configureRecordingSession()
             let recorder = try makeRecorder()
             guard recorder.prepareToRecord() else { throw WatchRecorderError.couldNotPrepare }
+            guard !Task.isCancelled, audioObjectEpoch == epoch else {
+                try? FileManager.default.removeItem(at: recorder.url)
+                return
+            }
             preparedRecorder = recorder
         } catch {
-            preparedRecorder = nil
+            if audioObjectEpoch == epoch { preparedRecorder = nil }
         }
     }
 
@@ -130,7 +154,6 @@ final class WatchAudioRecorder: NSObject, ObservableObject, @preconcurrency AVAu
         guard activeHoldID == holdID, !Task.isCancelled else { return false }
 
         do {
-            try configureRecordingSession()
             let recorder: AVAudioRecorder
             if let preparedRecorder {
                 recorder = preparedRecorder
@@ -153,7 +176,6 @@ final class WatchAudioRecorder: NSObject, ObservableObject, @preconcurrency AVAu
         } catch {
             if activeHoldID == holdID { activeHoldID = nil }
             errorMessage = error.localizedDescription
-            Task { await prepare() }
             return false
         }
     }
@@ -161,10 +183,7 @@ final class WatchAudioRecorder: NSObject, ObservableObject, @preconcurrency AVAu
     func stop(holdID: UUID) -> WatchLocalRecording? {
         guard activeHoldID == holdID else { return nil }
         activeHoldID = nil
-        guard let recorder else {
-            Task { await prepare() }
-            return nil
-        }
+        guard let recorder else { return nil }
         let durationMs = Int((recorder.currentTime * 1000).rounded())
         let workingURL = recorder.url
         recorder.stop()
@@ -173,19 +192,16 @@ final class WatchAudioRecorder: NSObject, ObservableObject, @preconcurrency AVAu
         self.recorder = nil
         level = 0
         isRecording = false
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
 
         guard durationMs >= 500 else {
             try? FileManager.default.removeItem(at: workingURL)
             errorMessage = "Hold a little longer to record."
-            Task { await prepare() }
             return nil
         }
         let id = UUID().uuidString.lowercased()
         let finalURL = recordingDirectory().appendingPathComponent("recording-\(id).wav")
         do {
             try FileManager.default.moveItem(at: workingURL, to: finalURL)
-            Task { await prepare() }
             return WatchLocalRecording(
                 id: id,
                 url: finalURL,
@@ -196,7 +212,6 @@ final class WatchAudioRecorder: NSObject, ObservableObject, @preconcurrency AVAu
         } catch {
             try? FileManager.default.removeItem(at: workingURL)
             errorMessage = "The recording could not be saved. \(error.localizedDescription)"
-            Task { await prepare() }
             return nil
         }
     }
@@ -215,8 +230,6 @@ final class WatchAudioRecorder: NSObject, ObservableObject, @preconcurrency AVAu
         level = 0
         isRecording = false
         isStarting = false
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-        Task { await prepare() }
     }
 
     func audioRecorderDidFinishRecording(_ recorder: AVAudioRecorder, successfully flag: Bool) {
@@ -227,12 +240,6 @@ final class WatchAudioRecorder: NSObject, ObservableObject, @preconcurrency AVAu
 
     private func requestPermission() async -> Bool {
         await AVAudioApplication.requestRecordPermission()
-    }
-
-    private func configureRecordingSession() throws {
-        let session = AVAudioSession.sharedInstance()
-        try session.setCategory(.playAndRecord, mode: .spokenAudio)
-        try session.setActive(true)
     }
 
     private func makeRecorder() throws -> AVAudioRecorder {
@@ -272,154 +279,23 @@ final class WatchAudioRecorder: NSObject, ObservableObject, @preconcurrency AVAu
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         return directory
     }
-}
 
-@MainActor
-final class WatchSpeechPlayer: NSObject, ObservableObject, @preconcurrency AVAudioPlayerDelegate {
-    @Published private(set) var playingID: String?
-    @Published private(set) var loadingID: String?
-    @Published private(set) var lastFinishedID: String?
-    @Published var errorMessage: String?
-
-    private struct PlaybackSnapshot {
-        let id: String
-        let data: Data
-        let time: TimeInterval
-    }
-
-    private var player: AVAudioPlayer?
-    private var currentData: Data?
-    private var interrupted: PlaybackSnapshot?
-    private var recordingInterruptionActive = false
-    private var requestID = UUID()
-
-    func playReply(turnID: String, store: WatchStore) {
-        let id = "reply-\(turnID)"
-        lastFinishedID = nil
-        stopPlayback()
-        let requestID = UUID()
-        self.requestID = requestID
-        loadingID = id
-        Task { [weak self] in
-            do {
-                let (pcm, sampleRate) = try await store.speech(turnID: turnID)
-                try Task.checkCancellation()
-                guard let self, self.requestID == requestID else { return }
-                self.loadingID = nil
-                self.errorMessage = nil
-                try self.playLoaded(id: id, data: Self.wav(pcm: pcm, sampleRate: sampleRate))
-            } catch is CancellationError {
-                return
-            } catch {
-                guard let self, self.requestID == requestID else { return }
-                self.loadingID = nil
-                self.playingID = nil
-                self.errorMessage = error.localizedDescription
-            }
+    func resetAudioObjects() {
+        audioObjectEpoch = UUID()
+        isPreparing = false
+        activeHoldID = nil
+        meterTask?.cancel()
+        meterTask = nil
+        if let recorder {
+            let url = recorder.url
+            recorder.stop()
+            try? FileManager.default.removeItem(at: url)
         }
-    }
-
-    func pauseForRecording() {
-        lastFinishedID = nil
-        guard !recordingInterruptionActive else { return }
-        recordingInterruptionActive = true
-        guard let id = playingID, let data = currentData else { return }
-        interrupted = PlaybackSnapshot(id: id, data: data, time: player?.currentTime ?? 0)
-        player?.stop()
-        player = nil
-    }
-
-    func resumeAfterRecording() {
-        guard recordingInterruptionActive else { return }
-        recordingInterruptionActive = false
-        guard let interrupted else { return }
-        self.interrupted = nil
-        do {
-            try startPlayback(
-                id: interrupted.id,
-                data: interrupted.data,
-                at: max(0, interrupted.time - 1)
-            )
-        } catch {
-            playingID = nil
-            currentData = nil
-            errorMessage = error.localizedDescription
-        }
-    }
-
-    func stop() {
-        recordingInterruptionActive = false
-        lastFinishedID = nil
-        stopPlayback()
-    }
-
-    func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-        guard player === self.player else { return }
-        lastFinishedID = playingID
-        self.player = nil
-        playingID = nil
-        currentData = nil
-        interrupted = nil
-    }
-
-    private func playLoaded(id: String, data: Data) throws {
-        currentData = data
-        playingID = id
-        if recordingInterruptionActive {
-            interrupted = PlaybackSnapshot(id: id, data: data, time: 0)
-        } else {
-            try startPlayback(id: id, data: data, at: 0)
-        }
-    }
-
-    private func startPlayback(id: String, data: Data, at time: TimeInterval) throws {
-        let session = AVAudioSession.sharedInstance()
-        try session.setCategory(.playback, mode: .spokenAudio)
-        try session.setActive(true)
-        let player = try AVAudioPlayer(data: data)
-        player.delegate = self
-        player.currentTime = time
-        player.prepareToPlay()
-        guard player.play() else { throw WatchPlayerError.couldNotPlay }
-        self.player = player
-        currentData = data
-        playingID = id
-    }
-
-    private func stopPlayback() {
-        requestID = UUID()
-        player?.stop()
-        player = nil
-        playingID = nil
-        loadingID = nil
-        currentData = nil
-        interrupted = nil
-    }
-
-    private static func wav(pcm: Data, sampleRate: Int) -> Data {
-        var data = Data()
-        func append(_ value: UInt32) {
-            var little = value.littleEndian
-            data.append(Data(bytes: &little, count: 4))
-        }
-        func append16(_ value: UInt16) {
-            var little = value.littleEndian
-            data.append(Data(bytes: &little, count: 2))
-        }
-        data.append("RIFF".data(using: .ascii)!)
-        append(UInt32(36 + pcm.count))
-        data.append("WAVEfmt ".data(using: .ascii)!)
-        append(16)
-        append16(1)
-        append16(1)
-        append(UInt32(sampleRate))
-        append(UInt32(sampleRate * 2))
-        append16(2)
-        append16(16)
-        data.append("data".data(using: .ascii)!)
-        append(UInt32(pcm.count))
-        data.append(pcm)
-        return data
+        recorder = nil
+        preparedRecorder = nil
+        level = 0
+        isRecording = false
+        isStarting = false
     }
 }
 
@@ -433,9 +309,4 @@ private enum WatchRecorderError: LocalizedError {
         case .couldNotPrepare: "The microphone could not be prepared."
         }
     }
-}
-
-private enum WatchPlayerError: LocalizedError {
-    case couldNotPlay
-    var errorDescription: String? { "The reply could not be played." }
 }

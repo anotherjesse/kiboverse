@@ -111,17 +111,6 @@ actor KiboAPI {
         )
     }
 
-    func speech(projectID: String, conversationID: String, turnID: String) async throws -> (Data, Int) {
-        var request = try makeRequest(path: [
-            "v1", "projects", projectID, "conversations", conversationID, "turns", turnID, "speech"
-        ])
-        request.timeoutInterval = 120
-        let (data, response) = try await session.data(for: request)
-        try validate(response: response, data: data)
-        let rate = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "X-Audio-Sample-Rate").flatMap(Int.init) ?? 24_000
-        return (data, rate)
-    }
-
     func speechStream(
         projectID: String,
         conversationID: String,
@@ -136,6 +125,7 @@ actor KiboAPI {
             query: [URLQueryItem(name: "from_sample", value: String(max(0, fromSample)))]
         )
         request.timeoutInterval = 120
+        request.networkServiceType = .avStreaming
         request.setValue(
             "application/vnd.kibo.pcm; format=s16le",
             forHTTPHeaderField: "Accept"

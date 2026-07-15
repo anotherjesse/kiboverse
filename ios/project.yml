@@ -77,6 +77,19 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.anotherjesse.kibo.uitests
         GENERATE_INFOPLIST_FILE: YES
+  KiboWatchTests:
+    type: bundle.unit-test
+    platform: watchOS
+    sources:
+      - path: KiboWatchTests
+    dependencies:
+      - target: KiboWatch
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.anotherjesse.kibo.watchtests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Kibo Watch.app/Kibo Watch"
+        BUNDLE_LOADER: "$(TEST_HOST)"
   KiboWatchUITests:
     type: bundle.ui-testing
     platform: watchOS
@@ -103,7 +116,9 @@ schemes:
     build:
       targets:
         KiboWatch: all
+        KiboWatchTests: [test]
         KiboWatchUITests: [test]
     test:
       targets:
+        - KiboWatchTests
         - KiboWatchUITests

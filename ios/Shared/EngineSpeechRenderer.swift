@@ -1,18 +1,6 @@
 @preconcurrency import AVFoundation
 
 @MainActor
-protocol SpeechRendering: AnyObject {
-    var playedSample: Int { get }
-    func schedule(
-        samples: [Int16],
-        startingAt startSample: Int,
-        onPlayed: @escaping @MainActor (_ endSample: Int) -> Void
-    ) throws
-    func play()
-    func stop()
-}
-
-@MainActor
 final class EngineSpeechRenderer: SpeechRendering {
     private let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
@@ -29,7 +17,7 @@ final class EngineSpeechRenderer: SpeechRendering {
             channels: 1,
             interleaved: false
         ) else {
-            throw PlayerError.unsupportedFormat
+            throw StreamingSpeechError.unsupportedFormat
         }
         self.format = format
         baseSample = startSample
@@ -77,8 +65,6 @@ final class EngineSpeechRenderer: SpeechRendering {
             options: [],
             completionCallbackType: .dataPlayedBack
         ) { [weak self] callbackType in
-            // AVAudioPlayerNode also invokes scheduled callbacks when stop()
-            // clears its queue. Only actual speaker drain advances playedSample.
             guard callbackType == .dataPlayedBack else { return }
             Task { @MainActor in
                 guard let self, !self.stopped else { return }
@@ -107,18 +93,6 @@ final class EngineSpeechRenderer: SpeechRendering {
 
 enum PlayerError: LocalizedError {
     case couldNotPlay
-    case unsupportedFormat
-    case incompleteSample
-    case emptySpeech
-    case replyTooLong
 
-    var errorDescription: String? {
-        switch self {
-        case .couldNotPlay: "The reply audio could not be played."
-        case .unsupportedFormat: "The reply used an unsupported audio format."
-        case .incompleteSample: "The reply audio ended partway through a sample."
-        case .emptySpeech: "The reply contained no audio."
-        case .replyTooLong: "The reply audio exceeded the ten-minute safety limit."
-        }
-    }
+    var errorDescription: String? { "The reply audio could not be played." }
 }

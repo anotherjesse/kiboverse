@@ -40,6 +40,8 @@ targets:
       path: Generated/KiboWatch-Info.plist
       properties:
         CFBundleDisplayName: Kibo
+        NSMicrophoneUsageDescription: Kibo records your voice so it can send your question to your selected conversation.
+        NSLocalNetworkUsageDescription: Kibo connects to your Kibo server on your local network.
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
         WKCompanionAppBundleIdentifier: com.anotherjesse.kibo
@@ -47,6 +49,8 @@ targets:
     sources:
       - path: Shared
       - path: KiboWatch
+      - path: Kibo/Assets.xcassets
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.anotherjesse.kibo.watchkitapp
@@ -73,6 +77,17 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.anotherjesse.kibo.uitests
         GENERATE_INFOPLIST_FILE: YES
+  KiboWatchUITests:
+    type: bundle.ui-testing
+    platform: watchOS
+    sources:
+      - path: KiboWatchUITests
+    dependencies:
+      - target: KiboWatch
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.anotherjesse.kibo.watchuitests
+        GENERATE_INFOPLIST_FILE: YES
 schemes:
   Kibo:
     build:
@@ -88,3 +103,7 @@ schemes:
     build:
       targets:
         KiboWatch: all
+        KiboWatchUITests: [test]
+    test:
+      targets:
+        - KiboWatchUITests

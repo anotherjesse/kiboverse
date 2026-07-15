@@ -2,30 +2,78 @@ import SwiftUI
 
 @main
 struct KiboWatchApp: App {
-    var body: some Scene { WindowGroup { WatchProjectsView() } }
+    var body: some Scene {
+        WindowGroup { WatchTalkView() }
+    }
 }
 
 @MainActor
 final class WatchStore: ObservableObject {
+    static let defaultServerURL = "https://wideboi.stingray-nominal.ts.net/"
+
+    private enum Key {
+        static let serverURL = "watchServerURL"
+        static let projectID = "watchSelectedProjectID"
+        static let conversationID = "watchSelectedConversationID"
+    }
+
     @Published var projects: [KiboProject] = []
     @Published var conversations: [KiboConversation] = []
-    @Published var selectedID: String?
+    @Published var events: [KiboEvent] = []
+    @Published var selectedProjectID: String?
+    @Published var selectedConversationID: String?
     @Published var status = "Connecting…"
     @Published var errorMessage: String?
+    @Published var isUploading = false
+    @Published var isSubmitting = false
+    @Published var pendingUploadCount = 0
 
     private let defaults = UserDefaults.standard
+    private let spool = WatchPendingUploadSpool()
     private var api: KiboAPI
-    private var selectionVersion = 0
+    private var pollTask: Task<Void, Never>?
+    private var uploadTask: Task<Bool, Never>?
+    private var hasStarted = false
     private var loadVersion = 0
+    private var selectionVersion = 0
+
     var serverURL: String {
-        let raw = defaults.string(forKey: "watchServerURL") ?? "https://wideboi.stingray-nominal.ts.net/"
-        return KiboAPI.canonicalServerURL(raw) ?? "https://wideboi.stingray-nominal.ts.net/"
+        let raw = defaults.string(forKey: Key.serverURL) ?? Self.defaultServerURL
+        return KiboAPI.canonicalServerURL(raw) ?? Self.defaultServerURL
+    }
+
+    var selectedProject: KiboProject? {
+        projects.first { $0.id == selectedProjectID }
+    }
+
+    var selectedConversation: KiboConversation? {
+        conversations.first { $0.id == selectedConversationID }
+    }
+
+    var isAskingKibo: Bool {
+        isSubmitting || !events.pendingTurnIDs.isEmpty
     }
 
     init() {
-        let raw = UserDefaults.standard.string(forKey: "watchServerURL") ?? "https://wideboi.stingray-nominal.ts.net/"
-        api = try! KiboAPI(serverURL: KiboAPI.canonicalServerURL(raw) ?? "https://wideboi.stingray-nominal.ts.net/")
-        selectedID = defaults.string(forKey: "watchSelectedProjectID")
+        let raw = UserDefaults.standard.string(forKey: Key.serverURL) ?? Self.defaultServerURL
+        let canonical = KiboAPI.canonicalServerURL(raw) ?? Self.defaultServerURL
+        api = try! KiboAPI(serverURL: canonical)
+        selectedProjectID = defaults.string(forKey: Key.projectID)
+        selectedConversationID = defaults.string(forKey: Key.conversationID)
+        pendingUploadCount = spool.all().filter { $0.serverURL == canonical }.count
+    }
+
+    deinit {
+        pollTask?.cancel()
+        uploadTask?.cancel()
+    }
+
+    func start() async {
+        guard !hasStarted else { return }
+        hasStarted = true
+        await load()
+        _ = await retryPendingUploads()
+        beginPolling()
     }
 
     func load() async {
@@ -35,116 +83,249 @@ final class WatchStore: ObservableObject {
             let loaded = try await api.projects()
             guard version == loadVersion else { return }
             projects = loaded
-            let selected = ProjectSelection.preferred(in: projects, savedID: selectedID)
-            guard await select(selected?.id) else { return }
-            status = "Live"
-            errorMessage = nil
-        } catch { status = "Offline"; errorMessage = error.localizedDescription }
+            let preferred = ProjectSelection.preferred(in: projects, savedID: selectedProjectID)
+            await selectProject(preferred?.id)
+            updatePendingUploadCount()
+            if pendingUploadCount == 0 {
+                status = "Live"
+                errorMessage = nil
+            }
+        } catch {
+            guard version == loadVersion else { return }
+            report(error)
+        }
+    }
+
+    func selectProject(_ id: String?) async {
+        selectionVersion += 1
+        let version = selectionVersion
+        selectedProjectID = id
+        selectedConversationID = nil
+        conversations = []
+        events = []
+        persist(id, key: Key.projectID)
+        guard let id else { return }
+        do {
+            let loaded = try await api.conversations(projectID: id)
+            guard version == selectionVersion, id == selectedProjectID else { return }
+            conversations = loaded
+            let savedID = defaults.string(forKey: Key.conversationID)
+            let preferred = conversations.first { $0.id == savedID } ?? conversations.first
+            await selectConversation(preferred?.id)
+        } catch {
+            guard version == selectionVersion else { return }
+            report(error)
+        }
+    }
+
+    func selectConversation(_ id: String?) async {
+        selectionVersion += 1
+        selectedConversationID = id
+        events = []
+        persist(id, key: Key.conversationID)
+        await refreshEvents()
+    }
+
+    func refreshEvents(quiet: Bool = false) async {
+        guard let projectID = selectedProjectID,
+              let conversationID = selectedConversationID else { return }
+        let version = selectionVersion
+        do {
+            let loaded = try await api.events(
+                projectID: projectID,
+                conversationID: conversationID
+            )
+            guard version == selectionVersion,
+                  projectID == selectedProjectID,
+                  conversationID == selectedConversationID else { return }
+            events = loaded.events
+            updatePendingUploadCount()
+            if pendingUploadCount == 0 && !isUploading {
+                status = "Live"
+                errorMessage = nil
+            }
+        } catch {
+            guard version == selectionVersion else { return }
+            if !quiet || events.isEmpty { report(error) }
+        }
+    }
+
+    func queueRecording(_ recording: WatchLocalRecording) {
+        guard let projectID = selectedProjectID,
+              let conversationID = selectedConversationID else {
+            errorMessage = "Choose a conversation first."
+            return
+        }
+        do {
+            _ = try spool.enqueue(
+                recording: recording,
+                serverURL: serverURL,
+                projectID: projectID,
+                conversationID: conversationID
+            )
+            updatePendingUploadCount()
+            status = "Saved · sending…"
+            Task {
+                _ = await retryPendingUploads(destinationKey: "\(projectID)/\(conversationID)")
+                await refreshEvents(quiet: true)
+            }
+        } catch {
+            report(error)
+        }
     }
 
     @discardableResult
-    func select(_ id: String?) async -> Bool {
-        selectionVersion += 1
-        let version = selectionVersion
-        selectedID = id
-        conversations = []
-        if let id { defaults.set(id, forKey: "watchSelectedProjectID") }
-        guard let id else { return true }
+    func submitTurn() async -> String? {
+        guard let projectID = selectedProjectID,
+              let conversationID = selectedConversationID,
+              !isSubmitting else { return nil }
+        let destinationKey = "\(projectID)/\(conversationID)"
+        guard await retryPendingUploads(destinationKey: destinationKey) else { return nil }
+        guard !spool.all().contains(where: {
+            $0.serverURL == serverURL && $0.destinationKey == destinationKey
+        }) else { return nil }
+
+        isSubmitting = true
+        defer { isSubmitting = false }
+        status = "Kibo is thinking…"
+        let commandKey = "watchPendingTurnID.\(serverURL).\(destinationKey)"
+        let turnID = defaults.string(forKey: commandKey) ?? UUID().uuidString.lowercased()
+        defaults.set(turnID, forKey: commandKey)
         do {
-            let loaded = try await api.conversations(projectID: id)
-            guard version == selectionVersion, selectedID == id else { return false }
-            conversations = loaded
-            status = "Live"
-            errorMessage = nil
-            return true
+            try await api.submitTurn(
+                projectID: projectID,
+                conversationID: conversationID,
+                turnID: turnID
+            )
+            defaults.removeObject(forKey: commandKey)
+            await refreshEvents()
+            return turnID
         } catch {
-            guard version == selectionVersion else { return false }
-            status = "Offline"
-            errorMessage = error.localizedDescription
+            report(error)
+            return nil
+        }
+    }
+
+    func speech(turnID: String) async throws -> (Data, Int) {
+        guard let projectID = selectedProjectID,
+              let conversationID = selectedConversationID else {
+            throw APIError.invalidResponse
+        }
+        return try await api.speech(
+            projectID: projectID,
+            conversationID: conversationID,
+            turnID: turnID
+        )
+    }
+
+    func saveServer(_ value: String) async -> Bool {
+        guard !isUploading, !isSubmitting else {
+            errorMessage = "Wait for the current request to finish."
+            return false
+        }
+        guard pendingUploadCount == 0 else {
+            errorMessage = "Let saved recordings finish sending before changing servers."
+            return false
+        }
+        do {
+            guard let canonicalURL = KiboAPI.canonicalServerURL(value) else {
+                throw APIError.invalidServerURL
+            }
+            try await api.setServerURL(canonicalURL)
+            defaults.set(canonicalURL, forKey: Key.serverURL)
+            loadVersion += 1
+            selectionVersion += 1
+            projects = []
+            conversations = []
+            events = []
+            await load()
+            return errorMessage == nil
+        } catch {
+            report(error)
             return false
         }
     }
 
-    func saveServer(_ value: String) async -> Bool {
-        do {
-            guard let canonicalURL = KiboAPI.canonicalServerURL(value) else { throw APIError.invalidServerURL }
-            try await api.setServerURL(canonicalURL)
-            defaults.set(canonicalURL, forKey: "watchServerURL")
-            loadVersion += 1
-            selectionVersion += 1
-            await load()
-            return errorMessage == nil
-        } catch { errorMessage = error.localizedDescription; return false }
+    @discardableResult
+    private func retryPendingUploads(destinationKey: String? = nil) async -> Bool {
+        if let uploadTask { return await uploadTask.value }
+        let candidates = spool.all().filter {
+            $0.serverURL == serverURL
+                && (destinationKey == nil || $0.destinationKey == destinationKey)
+        }
+        guard !candidates.isEmpty else {
+            updatePendingUploadCount()
+            return true
+        }
+        let ids = Set(candidates.map(\.id))
+        let task = Task { [weak self] in
+            guard let self else { return false }
+            return await self.performPendingUploads(ids: ids)
+        }
+        uploadTask = task
+        let result = await task.value
+        uploadTask = nil
+        return result
     }
-}
 
-struct WatchProjectsView: View {
-    @StateObject private var store = WatchStore()
-    @State private var showingServer = false
+    private func performPendingUploads(ids: Set<String>) async -> Bool {
+        let pending = spool.all().filter { ids.contains($0.id) && $0.serverURL == serverURL }
+        guard !pending.isEmpty else { return true }
+        isUploading = true
+        status = "Sending recordings…"
+        defer {
+            isUploading = false
+            updatePendingUploadCount()
+        }
+        var allSent = true
+        for clip in pending {
+            do {
+                try await api.uploadClip(
+                    fileURL: spool.wavURL(for: clip),
+                    projectID: clip.projectID,
+                    conversationID: clip.conversationID,
+                    clipID: clip.id,
+                    durationMs: clip.durationMs,
+                    peakPct: clip.peakPct,
+                    recordedAt: clip.recordedAt
+                )
+                spool.remove(clip)
+            } catch {
+                allSent = false
+                status = "Saved on this Watch"
+                errorMessage = "Recording saved; sending will retry. \(error.localizedDescription)"
+            }
+        }
+        if allSent { status = "Thought saved" }
+        return allSent
+    }
 
-    var body: some View {
-        NavigationStack {
-            List {
-                Section {
-                    ForEach(store.projects) { project in
-                        Button {
-                            Task { await store.select(project.id) }
-                        } label: {
-                            HStack {
-                                Image(systemName: project.id == store.selectedID ? "checkmark.circle.fill" : "circle")
-                                    .foregroundStyle(project.id == store.selectedID ? .orange : .secondary)
-                                Text(project.name).lineLimit(2)
-                            }
-                        }
-                    }
-                } header: { Text("Current project") }
-                if !store.conversations.isEmpty {
-                    Section("Conversations") {
-                        ForEach(store.conversations.prefix(5)) { conversation in
-                            Label(conversation.name, systemImage: "bubble.left")
-                                .font(.caption)
-                        }
-                    }
-                }
-                Section {
-                    Label(store.status, systemImage: store.status == "Live" ? "checkmark.circle" : "wifi.slash")
-                        .font(.caption).foregroundStyle(.secondary)
+    private func beginPolling() {
+        pollTask?.cancel()
+        pollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(2))
+                guard let self else { return }
+                if self.projects.isEmpty {
+                    await self.load()
+                } else {
+                    await self.refreshEvents(quiet: true)
                 }
             }
-            .navigationTitle("Kibo")
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("Server", systemImage: "gearshape") { showingServer = true }
-                }
-            }
-            .refreshable { await store.load() }
-            .task { await store.load() }
-            .sheet(isPresented: $showingServer) { WatchServerView(store: store) }
-            .alert("Kibo", isPresented: Binding(
-                get: { store.errorMessage != nil },
-                set: { if !$0 { store.errorMessage = nil } }
-            )) { Button("OK") { store.errorMessage = nil } }
-            message: { Text(store.errorMessage ?? "Unknown error") }
         }
     }
-}
 
-struct WatchServerView: View {
-    @Environment(\.dismiss) private var dismiss
-    @ObservedObject var store: WatchStore
-    @State private var value = ""
+    private func updatePendingUploadCount() {
+        pendingUploadCount = spool.all().filter { $0.serverURL == serverURL }.count
+    }
 
-    var body: some View {
-        NavigationStack {
-            Form {
-                TextField("Server URL", text: $value)
-                    .textInputAutocapitalization(.never)
-                Button("Connect") {
-                    Task { if await store.saveServer(value) { dismiss() } }
-                }
-            }
-            .navigationTitle("Server")
-            .onAppear { value = store.serverURL }
-        }
+    private func persist(_ value: String?, key: String) {
+        if let value { defaults.set(value, forKey: key) }
+        else { defaults.removeObject(forKey: key) }
+    }
+
+    private func report(_ error: Error) {
+        status = "Offline"
+        errorMessage = error.localizedDescription
     }
 }

@@ -288,6 +288,25 @@ the end of Phase 1.
 | Risk if iroh ecosystem shifts | none | contained to adapters |
 | Phase 1 | identical | identical |
 
+### Client stack note: Tauri (2026-07-14)
+
+If Proposal B wins, the iPhone/iPad app can be **Tauri 2** (stable iOS
+support: Rust core + WKWebView UI). That changes B's economics: the app's
+Rust core compiles directly for iOS, so the `iroh` crate is used natively
+and **iroh-ffi/UniFFI drops out of the design entirely** (Delta Chat ships
+exactly this shape — Rust core with iroh, on the App Store). The Pi client
+and the phone app can share one Rust client crate: protocol client,
+spool-then-upload durability, AudioStream + Player pause/rewind/skip.
+
+The risk moves from networking to audio: mic capture and streamed-PCM
+playback go through either WKWebView web APIs (getUserMedia / AudioWorklet),
+`cpal` (CoreAudio) on the Rust side, or a small Swift Tauri plugin over
+AVFoundation — spike this first, it's the Tauri analog of "can iroh
+stream?". Background/lock-screen audio needs the usual AVAudioSession +
+entitlement work via plugin. The Watch companion stays native SwiftUI either
+way (no Tauri for watchOS): a watchOS target added to the Tauri-generated
+Xcode project plus a WatchConnectivity Swift plugin on the iOS side.
+
 Recommendation: still start with A's shape — but B is now a legitimate
 endgame rather than a consolation phase-4 experiment. Concretely: Phase 1
 unchanged; build the protocol test suite against the HTTP front door; decide

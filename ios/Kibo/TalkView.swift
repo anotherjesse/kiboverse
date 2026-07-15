@@ -9,6 +9,7 @@ struct TalkView: View {
     @State private var recorderStartTask: Task<Void, Never>?
     @State private var autoPlayTurnID: String?
     @State private var showingSettings = false
+    @State private var recordingPulse = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -29,6 +30,10 @@ struct TalkView: View {
                             )
                             .frame(minHeight: 22)
                         Button {
+                            // Guard here instead of .disabled so the button doesn't
+                            // flash bright/gray on every push-to-talk cycle.
+                            guard !recorder.isRecording, !recorder.isStarting,
+                                  !store.isUploading, !store.isAskingKibo else { return }
                             Task {
                                 if let turnID = await store.submitTurn() {
                                     autoPlayTurnID = turnID
@@ -49,7 +54,7 @@ struct TalkView: View {
                             .padding(.vertical, 14)
                         }
                         .buttonStyle(.borderedProminent)
-                        .disabled(store.selectedConversationID == nil || recorder.isRecording || recorder.isStarting || store.isUploading || store.isAskingKibo)
+                        .disabled(store.selectedConversationID == nil)
                         .padding(.horizontal)
                     }
                     .padding(.top, 22)
@@ -124,13 +129,27 @@ struct TalkView: View {
                 .frame(width: diameter, height: diameter)
                 .scaleEffect(recorder.isRecording ? 1 + recorder.level * 0.12 : 1)
                 .animation(.easeOut(duration: 0.08), value: recorder.level)
-            Circle()
-                .fill(recorder.isRecording ? Color.red : Color.kiboCoral)
-                .frame(width: diameter * 0.745, height: diameter * 0.745)
-                .shadow(color: .kiboCoral.opacity(0.35), radius: 24, y: 10)
-            Image(systemName: recorder.isRecording ? "waveform" : "mic.fill")
-                .font(.system(size: 54, weight: .semibold))
-                .foregroundStyle(.white)
+            ZStack {
+                Circle()
+                    .fill(recorder.isRecording ? Color.red : Color.kiboCoral)
+                    .frame(width: diameter * 0.745, height: diameter * 0.745)
+                    .shadow(color: .kiboCoral.opacity(0.35), radius: 24, y: 10)
+                Image(systemName: recorder.isRecording ? "waveform" : "mic.fill")
+                    .font(.system(size: 54, weight: .semibold))
+                    .foregroundStyle(.white)
+            }
+            .scaleEffect(recordingPulse ? 1.07 : 1.0)
+        }
+        .onChange(of: recorder.isRecording) { _, recording in
+            if recording {
+                withAnimation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true)) {
+                    recordingPulse = true
+                }
+            } else {
+                withAnimation(.easeOut(duration: 0.25)) {
+                    recordingPulse = false
+                }
+            }
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Hold to talk")

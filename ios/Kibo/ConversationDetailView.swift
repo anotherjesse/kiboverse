@@ -26,6 +26,7 @@ struct ConversationDetailView: View {
                         }
                         .padding()
                     }
+                    .defaultScrollAnchor(.bottom)
                     .onChange(of: store.timeline.count) { _, _ in
                         if let id = store.timeline.last?.id { withAnimation { proxy.scrollTo(id, anchor: .bottom) } }
                     }

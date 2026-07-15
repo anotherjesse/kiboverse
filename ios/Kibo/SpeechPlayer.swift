@@ -38,126 +38,177 @@ private final class SystemSpeechAudioPlayer: NSObject, SpeechAudioPlaying, @prec
 
 @MainActor
 final class SpeechPlayer: ObservableObject {
+    private static let maximumReplySamples = 24_000 * 60 * 10
     typealias PlayerFactory = @MainActor (Data) throws -> any SpeechAudioPlaying
-    typealias SessionActivator = @MainActor (_ reset: Bool) throws -> Void
+    typealias RendererFactory = @MainActor (_ sampleRate: Int, _ startSample: Int) throws -> any SpeechRendering
+    typealias SessionActivator = @MainActor (_ intent: AudioSessionIntent) throws -> Void
+    typealias StreamLoader = @MainActor (_ fromSample: Int) async throws -> SpeechResponseStream
 
-    private struct Asset {
+    private struct ClipAsset {
         let id: String
         let data: Data
     }
 
-    private struct InterruptionSnapshot {
-        let asset: Asset
-        let time: TimeInterval
+    private struct StreamAsset {
+        let id: String
+        var ledger = PCMStreamLedger()
+        var sampleRate: Int?
+        var scheduledSample = 0
+        var confirmedPlayedSample = 0
+        var isComplete = false
+    }
+
+    private enum InterruptionSnapshot {
+        case clip(ClipAsset, TimeInterval)
+        case stream(Int)
     }
 
     @Published private(set) var playingID: String?
     @Published private(set) var loadingID: String?
     @Published var errorMessage: String?
-    private var player: (any SpeechAudioPlaying)?
-    private var currentAsset: Asset?
+
+    private var clipPlayer: (any SpeechAudioPlaying)?
+    private var clipAsset: ClipAsset?
+    private var renderer: (any SpeechRendering)?
+    private var rendererEpoch = UUID()
+    private var streamAsset: StreamAsset?
+    private var streamLoader: StreamLoader?
     private var interruptionSnapshot: InterruptionSnapshot?
-    private var requestID = UUID()
-    private var loadingTask: Task<Void, Never>?
+    private var pendingPlaybackIntent: AudioSessionIntent?
+    private var generation = UUID()
+    private var transportTask: Task<Void, Never>?
     private var recordingInterruptionActive = false
     private let makePlayer: PlayerFactory
+    private let makeRenderer: RendererFactory
     private let activateSession: SessionActivator
 
     init(
         makePlayer: @escaping PlayerFactory = { try SystemSpeechAudioPlayer(data: $0) },
-        activateSession: @escaping SessionActivator = SpeechPlayer.activateSystemSession
+        makeRenderer: @escaping RendererFactory = { try EngineSpeechRenderer(sampleRate: $0, startingAt: $1) },
+        activateSession: @escaping SessionActivator
     ) {
         self.makePlayer = makePlayer
+        self.makeRenderer = makeRenderer
         self.activateSession = activateSession
     }
 
     func toggleReply(turnID: String, store: AppStore) {
         let id = "reply-\(turnID)"
-        toggle(id: id) {
-            let (pcm, rate) = try await store.speech(turnID: turnID)
-            return Self.wav(pcm: pcm, sampleRate: rate)
-        }
+        if playingID == id || loadingID == id { stop(); return }
+        playReply(turnID: turnID, store: store)
     }
 
     func playReply(turnID: String, store: AppStore) {
-        let id = "reply-\(turnID)"
+        playReply(id: "reply-\(turnID)") { fromSample in
+            try await store.speechStream(turnID: turnID, fromSample: fromSample)
+        }
+    }
+
+    func playReply(id: String, load: @escaping StreamLoader) {
         guard playingID != id, loadingID != id else { return }
-        play(id: id) {
-            let (pcm, rate) = try await store.speech(turnID: turnID)
-            return Self.wav(pcm: pcm, sampleRate: rate)
+        stopPlayback()
+        let generation = UUID()
+        self.generation = generation
+        streamAsset = StreamAsset(id: id)
+        streamLoader = load
+        loadingID = id
+        errorMessage = nil
+        transportTask = Task { [weak self] in
+            await self?.receiveStream(generation: generation)
         }
     }
 
     func toggleClip(clipID: String, store: AppStore) {
-        toggle(id: "clip-\(clipID)") { try await store.clipAudio(clipID: clipID) }
-    }
-
-    private func toggle(id: String, load: @escaping @MainActor () async throws -> Data) {
+        let id = "clip-\(clipID)"
         if playingID == id || loadingID == id { stop(); return }
-        play(id: id, load: load)
+        playClip(id: id) { try await store.clipAudio(clipID: clipID) }
     }
 
-    private func play(id: String, load: @escaping @MainActor () async throws -> Data) {
+    private func playClip(id: String, load: @escaping @MainActor () async throws -> Data) {
         stopPlayback()
-        let requestID = UUID()
-        self.requestID = requestID
+        let generation = UUID()
+        self.generation = generation
         loadingID = id
-        loadingTask = Task { [weak self] in
+        transportTask = Task { [weak self] in
             do {
                 let data = try await load()
                 try Task.checkCancellation()
-                guard let self, self.requestID == requestID else { return }
-                self.loadingTask = nil
+                guard let self, self.generation == generation else { return }
+                self.transportTask = nil
                 self.loadingID = nil
                 self.errorMessage = nil
                 try self.playLoadedAudio(id: id, data: data)
             } catch is CancellationError {
                 return
             } catch {
-                guard let self, self.requestID == requestID else { return }
-                self.player = nil
-                self.currentAsset = nil
-                self.interruptionSnapshot = nil
-                self.playingID = nil
-                self.loadingTask = nil
-                self.loadingID = nil
-                self.errorMessage = error.localizedDescription
+                self?.fail(error, generation: generation)
             }
         }
     }
 
-    /// Mirrors the Pi voiceflow: silence speech before the microphone opens.
-    /// Audio which finishes loading during the hold stays queued here.
+    /// Capture owns audible hardware immediately, while the reply transport
+    /// remains free to fill its append-only cache.
     func pauseForRecording() {
         guard !recordingInterruptionActive else { return }
         recordingInterruptionActive = true
-        guard let asset = currentAsset, playingID == asset.id else { return }
-        let time = player?.currentTime ?? 0
-        interruptionSnapshot = InterruptionSnapshot(asset: asset, time: time)
-        player?.stop()
-        player = nil
+        if let asset = streamAsset, playingID == asset.id {
+            let sample = min(
+                asset.scheduledSample,
+                min(asset.ledger.receivedSample, renderer?.playedSample ?? asset.confirmedPlayedSample)
+            )
+            interruptionSnapshot = .stream(sample)
+            rendererEpoch = UUID()
+            renderer?.stop()
+            renderer = nil
+        } else if let asset = clipAsset, playingID == asset.id {
+            interruptionSnapshot = .clip(asset, clipPlayer?.currentTime ?? 0)
+            clipPlayer?.stop()
+            clipPlayer = nil
+        }
     }
 
-    /// Continue interrupted speech with a short rewind so the sentence remains
-    /// understandable after the inline recording interruption.
     func resumeAfterRecording(rewindBy seconds: TimeInterval = 1) {
         guard recordingInterruptionActive else { return }
         recordingInterruptionActive = false
-        guard let snapshot = interruptionSnapshot else { return }
+        guard let snapshot = interruptionSnapshot else {
+            pendingPlaybackIntent = .rebuildPlayback
+            pumpRenderer(sessionIntent: .rebuildPlayback)
+            return
+        }
         interruptionSnapshot = nil
+        pendingPlaybackIntent = nil
         do {
-            try startFreshPlayback(
-                asset: snapshot.asset,
-                at: Self.rewoundTime(snapshot.time, by: seconds),
-                resettingSession: true
-            )
+            switch snapshot {
+            case let .clip(asset, time):
+                try startFreshClip(
+                    asset: asset,
+                    at: Self.rewoundTime(time, by: seconds),
+                    sessionIntent: .rebuildPlayback
+                )
+            case let .stream(sample):
+                guard let rate = streamAsset?.sampleRate else { return }
+                try startFreshRenderer(
+                    at: max(0, sample - Int((Double(rate) * seconds).rounded())),
+                    sessionIntent: .rebuildPlayback
+                )
+            }
             errorMessage = nil
         } catch {
-            self.player = nil
-            currentAsset = nil
-            playingID = nil
-            errorMessage = error.localizedDescription
+            fail(error, generation: generation)
         }
+    }
+
+    func rebuildAfterRouteChange() {
+        guard !recordingInterruptionActive, let asset = streamAsset, playingID == asset.id else { return }
+        let sample = min(
+            asset.scheduledSample,
+            min(asset.ledger.receivedSample, renderer?.playedSample ?? asset.confirmedPlayedSample)
+        )
+        rendererEpoch = UUID()
+        renderer?.stop()
+        renderer = nil
+        do { try startFreshRenderer(at: sample, sessionIntent: .rebuildPlayback) }
+        catch { fail(error, generation: generation) }
     }
 
     func stop() {
@@ -166,97 +217,230 @@ final class SpeechPlayer: ObservableObject {
     }
 
     private func stopPlayback() {
-        requestID = UUID()
-        loadingTask?.cancel()
-        loadingTask = nil
-        player?.stop()
-        player = nil
-        currentAsset = nil
+        generation = UUID()
+        rendererEpoch = UUID()
+        transportTask?.cancel()
+        transportTask = nil
+        renderer?.stop()
+        renderer = nil
+        clipPlayer?.stop()
+        clipPlayer = nil
+        clipAsset = nil
+        streamAsset = nil
+        streamLoader = nil
         interruptionSnapshot = nil
+        pendingPlaybackIntent = nil
         playingID = nil
         loadingID = nil
     }
 
-    /// Internal so the player lifecycle can be regression-tested without a network request.
+    /// Internal so clip lifecycle can be regression-tested without a request.
     func playLoadedAudio(id: String, data: Data) throws {
-        let asset = Asset(id: id, data: data)
-        currentAsset = asset
+        let asset = ClipAsset(id: id, data: data)
+        clipAsset = asset
         playingID = id
         if recordingInterruptionActive {
-            interruptionSnapshot = InterruptionSnapshot(asset: asset, time: 0)
+            interruptionSnapshot = .clip(asset, 0)
         } else {
-            try startFreshPlayback(asset: asset, at: 0, resettingSession: false)
+            try startFreshClip(asset: asset, at: 0, sessionIntent: .beginPlayback)
         }
     }
 
-    private func startFreshPlayback(
-        asset: Asset,
+    private func receiveStream(generation: UUID) async {
+        var failures = 0
+        while !Task.isCancelled, self.generation == generation {
+            do {
+                guard let loader = streamLoader, let asset = streamAsset else { return }
+                let response = try await loader(asset.ledger.receivedSample)
+                try validate(response: response)
+                for try await data in response.chunks {
+                    try Task.checkCancellation()
+                    guard self.generation == generation, var current = streamAsset else { return }
+                    current.ledger.append(data)
+                    guard current.ledger.receivedSample <= Self.maximumReplySamples else {
+                        throw PlayerError.replyTooLong
+                    }
+                    streamAsset = current
+                    pumpRenderer(sessionIntent: .beginPlayback)
+                }
+                guard self.generation == generation, var current = streamAsset else { return }
+                guard !current.ledger.hasPartialSample else { throw PlayerError.incompleteSample }
+                guard current.ledger.receivedSample > 0 else { throw PlayerError.emptySpeech }
+                current.isComplete = true
+                streamAsset = current
+                transportTask = nil
+                pumpRenderer(sessionIntent: .beginPlayback)
+                finishIfDrained()
+                return
+            } catch is CancellationError {
+                return
+            } catch {
+                guard self.generation == generation, var current = streamAsset else { return }
+                current.ledger.discardPartialSample()
+                streamAsset = current
+                if let playerError = error as? PlayerError {
+                    switch playerError {
+                    case .incompleteSample:
+                        break
+                    default:
+                        fail(error, generation: generation)
+                        return
+                    }
+                }
+                failures += 1
+                if failures >= 4 {
+                    fail(error, generation: generation)
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(250 * failures))
+            }
+        }
+    }
+
+    private func validate(response: SpeechResponseStream) throws {
+        guard response.channels == 1,
+              (1...192_000).contains(response.sampleRate),
+              response.encoding == .signed16LittleEndian else {
+            throw PlayerError.unsupportedFormat
+        }
+        if let rate = streamAsset?.sampleRate, rate != response.sampleRate {
+            throw PlayerError.unsupportedFormat
+        }
+        if streamAsset?.sampleRate == nil {
+            streamAsset?.sampleRate = response.sampleRate
+        }
+    }
+
+    private func pumpRenderer(sessionIntent: AudioSessionIntent) {
+        guard !recordingInterruptionActive,
+              let asset = streamAsset,
+              let rate = asset.sampleRate else { return }
+        if renderer != nil {
+            scheduleAvailable()
+            return
+        }
+        let prebuffer = max(1, rate * 3 / 10)
+        guard asset.ledger.receivedSample >= prebuffer || asset.isComplete else { return }
+        do {
+            try startFreshRenderer(
+                at: asset.confirmedPlayedSample,
+                sessionIntent: pendingPlaybackIntent ?? sessionIntent
+            )
+            pendingPlaybackIntent = nil
+        } catch {
+            fail(error, generation: generation)
+        }
+    }
+
+    private func startFreshRenderer(at startSample: Int, sessionIntent: AudioSessionIntent) throws {
+        guard var asset = streamAsset, let rate = asset.sampleRate else { return }
+        try activateSession(sessionIntent)
+        rendererEpoch = UUID()
+        renderer?.stop()
+        let start = min(max(0, startSample), asset.ledger.receivedSample)
+        let renderer = try makeRenderer(rate, start)
+        self.renderer = renderer
+        rendererEpoch = UUID()
+        asset.scheduledSample = start
+        asset.confirmedPlayedSample = start
+        streamAsset = asset
+        playingID = asset.id
+        loadingID = nil
+        scheduleAvailable()
+        renderer.play()
+    }
+
+    private func scheduleAvailable() {
+        guard let renderer, var asset = streamAsset, let rate = asset.sampleRate else { return }
+        let generation = generation
+        let rendererEpoch = rendererEpoch
+        let maximum = max(1, rate / 5)
+        let played = max(asset.confirmedPlayedSample, renderer.playedSample)
+        let schedulingLimit = min(asset.ledger.receivedSample, played + rate)
+        while asset.scheduledSample < schedulingLimit {
+            let start = asset.scheduledSample
+            let samples = asset.ledger.chunk(
+                from: start,
+                maximumCount: min(maximum, schedulingLimit - start)
+            )
+            guard !samples.isEmpty else { break }
+            asset.scheduledSample += samples.count
+            do {
+                try renderer.schedule(samples: samples, startingAt: start) { [weak self] endSample in
+                    guard let self,
+                          self.generation == generation,
+                          self.rendererEpoch == rendererEpoch,
+                          var current = self.streamAsset else { return }
+                    current.confirmedPlayedSample = max(current.confirmedPlayedSample, endSample)
+                    self.streamAsset = current
+                    self.scheduleAvailable()
+                    self.finishIfDrained()
+                }
+            } catch {
+                fail(error, generation: generation)
+                return
+            }
+        }
+        streamAsset = asset
+        renderer.play()
+    }
+
+    private func finishIfDrained() {
+        guard let asset = streamAsset,
+              asset.isComplete,
+              asset.confirmedPlayedSample >= asset.ledger.receivedSample else { return }
+        renderer = nil
+        rendererEpoch = UUID()
+        streamAsset = nil
+        streamLoader = nil
+        playingID = nil
+        loadingID = nil
+    }
+
+    private func fail(_ error: Error, generation: UUID) {
+        guard self.generation == generation else { return }
+        transportTask?.cancel()
+        transportTask = nil
+        rendererEpoch = UUID()
+        renderer?.stop()
+        renderer = nil
+        clipPlayer?.stop()
+        clipPlayer = nil
+        clipAsset = nil
+        streamAsset = nil
+        streamLoader = nil
+        interruptionSnapshot = nil
+        pendingPlaybackIntent = nil
+        playingID = nil
+        loadingID = nil
+        errorMessage = error.localizedDescription
+    }
+
+    private func startFreshClip(
+        asset: ClipAsset,
         at time: TimeInterval,
-        resettingSession: Bool
+        sessionIntent: AudioSessionIntent
     ) throws {
-        try activateSession(resettingSession)
+        try activateSession(sessionIntent)
         let player = try makePlayer(asset.data)
         player.currentTime = max(0, time)
         player.prepareToPlay()
         player.didFinish = { [weak self, weak player] in
-            guard let self, let player, self.player === player else { return }
-            self.player = nil
-            self.currentAsset = nil
-            self.interruptionSnapshot = nil
+            guard let self, let player, self.clipPlayer === player else { return }
+            self.clipPlayer = nil
+            self.clipAsset = nil
             self.playingID = nil
         }
-        self.player = player
-        currentAsset = asset
+        clipPlayer = player
+        clipAsset = asset
         playingID = asset.id
         guard player.play() else {
-            self.player = nil
+            clipPlayer = nil
             throw PlayerError.couldNotPlay
         }
-    }
-
-    private static func activateSystemSession(reset: Bool) throws {
-        let session = AVAudioSession.sharedInstance()
-        // Recording and playback use the same category, but a full activation cycle
-        // gives every newly-created player a clean route after the microphone closes.
-        if reset {
-            try? session.setActive(false, options: .notifyOthersOnDeactivation)
-        }
-        try session.setCategory(
-            .playAndRecord,
-            mode: .spokenAudio,
-            options: [.defaultToSpeaker, .allowBluetoothHFP, .allowBluetoothA2DP]
-        )
-        try? session.overrideOutputAudioPort(.none)
-        try session.setActive(true)
-    }
-
-    static func wav(pcm: Data, sampleRate: Int) -> Data {
-        var data = Data()
-        func append(_ value: UInt32) {
-            var little = value.littleEndian
-            data.append(Data(bytes: &little, count: 4))
-        }
-        func append16(_ value: UInt16) {
-            var little = value.littleEndian
-            data.append(Data(bytes: &little, count: 2))
-        }
-        data.append("RIFF".data(using: .ascii)!)
-        append(UInt32(36 + pcm.count))
-        data.append("WAVEfmt ".data(using: .ascii)!)
-        append(16); append16(1); append16(1)
-        append(UInt32(sampleRate)); append(UInt32(sampleRate * 2))
-        append16(2); append16(16)
-        data.append("data".data(using: .ascii)!)
-        append(UInt32(pcm.count)); data.append(pcm)
-        return data
     }
 
     static func rewoundTime(_ currentTime: TimeInterval, by seconds: TimeInterval = 1) -> TimeInterval {
         max(0, currentTime - seconds)
     }
-}
-
-private enum PlayerError: LocalizedError {
-    case couldNotPlay
-    var errorDescription: String? { "The reply audio could not be played." }
 }

@@ -2,8 +2,7 @@ import SwiftUI
 
 struct ConversationDetailView: View {
     @EnvironmentObject private var store: AppStore
-    @EnvironmentObject private var recorder: AudioRecorder
-    @EnvironmentObject private var player: SpeechPlayer
+    @EnvironmentObject private var audio: AudioCoordinator
 
     var body: some View {
         Group {
@@ -49,10 +48,10 @@ struct ConversationDetailView: View {
             }
         }
         .alert("Audio unavailable", isPresented: Binding(
-            get: { player.errorMessage != nil },
-            set: { if !$0 { player.errorMessage = nil } }
-        )) { Button("OK") { player.errorMessage = nil } }
-        message: { Text(player.errorMessage ?? "Unknown playback error") }
+            get: { audio.playbackErrorMessage != nil },
+            set: { if !$0 { audio.playbackErrorMessage = nil } }
+        )) { Button("OK") { audio.playbackErrorMessage = nil } }
+        message: { Text(audio.playbackErrorMessage ?? "Unknown playback error") }
     }
 
     private var compactComposer: some View {
@@ -68,8 +67,8 @@ struct ConversationDetailView: View {
                 .buttonStyle(.bordered)
                 .disabled(store.isUploading || store.isSubmitting)
         }
-        .onChange(of: store.selectedConversationID) { _, _ in player.stop() }
-        .onDisappear { player.stop() }
+        .onChange(of: store.selectedConversationID) { _, _ in audio.stop() }
+        .onDisappear { audio.stop() }
         .padding()
         .frame(maxWidth: .infinity)
         .background(.ultraThinMaterial)
@@ -78,8 +77,8 @@ struct ConversationDetailView: View {
     @ViewBuilder
     private func MessageCard(item: TimelineItem, isGroupStart: Bool) -> some View {
         let playbackID = playbackID(for: item)
-        let isLoading = playbackID != nil && player.loadingID == playbackID
-        let isPlaying = playbackID != nil && player.playingID == playbackID
+        let isLoading = playbackID != nil && audio.loadingID == playbackID
+        let isPlaying = playbackID != nil && audio.playingID == playbackID
         let shape = RoundedRectangle(cornerRadius: 18, style: .continuous)
         HStack {
             if item.role == .person { Spacer(minLength: 44) }
@@ -127,9 +126,9 @@ struct ConversationDetailView: View {
 
     private func togglePlayback(_ item: TimelineItem) {
         if let clipID = item.clipID {
-            player.toggleClip(clipID: clipID, store: store)
+            audio.toggleClip(clipID: clipID, store: store)
         } else if item.canPlay, let turnID = item.turnID {
-            player.toggleReply(turnID: turnID, store: store)
+            audio.toggleReply(turnID: turnID, store: store)
         }
     }
 

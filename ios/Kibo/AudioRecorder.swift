@@ -33,7 +33,6 @@ final class AudioRecorder: NSObject, ObservableObject, @preconcurrency AVAudioRe
         let allowed = await AVAudioApplication.requestRecordPermission()
         guard allowed, recorder == nil, preparedRecorder == nil, !isStarting else { return }
         do {
-            try configureVoiceSession()
             let recorder = try makeRecorder()
             guard recorder.prepareToRecord() else { throw RecorderError.couldNotPrepare }
             preparedRecorder = recorder
@@ -55,12 +54,10 @@ final class AudioRecorder: NSObject, ObservableObject, @preconcurrency AVAudioRe
                 activeHoldID = nil
                 finishStarting(holdID)
                 try? FileManager.default.removeItem(at: preparedRecorder.url)
-                Task { await prepare() }
                 return false
             }
             // Playback may have changed the shared route after this recorder was
             // prepared. Try the warm recorder first, then fall back to a fresh one.
-            try? configureVoiceSession()
             if beginRecording(preparedRecorder, holdID: holdID) { return true }
             preparedRecorder.stop()
             try? FileManager.default.removeItem(at: preparedRecorder.url)
@@ -70,18 +67,15 @@ final class AudioRecorder: NSObject, ObservableObject, @preconcurrency AVAudioRe
         guard activeHoldID == holdID, !Task.isCancelled else {
             if activeHoldID == holdID { activeHoldID = nil }
             finishStarting(holdID)
-            Task { await prepare() }
             return false
         }
         guard allowed else {
             activeHoldID = nil
             finishStarting(holdID)
             errorMessage = "Microphone access is required for push to talk."
-            Task { await prepare() }
             return false
         }
         do {
-            try configureVoiceSession()
             let recorder = try makeRecorder()
             recorder.prepareToRecord()
             guard beginRecording(recorder, holdID: holdID) else {
@@ -94,7 +88,6 @@ final class AudioRecorder: NSObject, ObservableObject, @preconcurrency AVAudioRe
             finishStarting(holdID)
             errorMessage = error.localizedDescription
             isRecording = false
-            Task { await prepare() }
             return false
         }
     }
@@ -106,7 +99,6 @@ final class AudioRecorder: NSObject, ObservableObject, @preconcurrency AVAudioRe
             finishStarting(holdID)
             return nil
         }
-        defer { Task { await self.prepare() } }
         let durationMs = Int((recorder.currentTime * 1000).rounded())
         let workingURL = recorder.url
         recorder.stop()
@@ -151,7 +143,6 @@ final class AudioRecorder: NSObject, ObservableObject, @preconcurrency AVAudioRe
         recorder = nil
         level = 0
         isRecording = false
-        Task { await prepare() }
     }
 
     func audioRecorderDidFinishRecording(_ recorder: AVAudioRecorder, successfully flag: Bool) {
@@ -167,14 +158,12 @@ final class AudioRecorder: NSObject, ObservableObject, @preconcurrency AVAudioRe
         return directory
     }
 
-    private func configureVoiceSession() throws {
-        let session = AVAudioSession.sharedInstance()
-        try session.setCategory(
-            .playAndRecord,
-            mode: .spokenAudio,
-            options: [.defaultToSpeaker, .allowBluetoothHFP, .allowBluetoothA2DP]
-        )
-        try session.setActive(true)
+    func resetAudioObjects() {
+        cancel()
+        if let preparedRecorder {
+            try? FileManager.default.removeItem(at: preparedRecorder.url)
+        }
+        preparedRecorder = nil
     }
 
     private func makeRecorder() throws -> AVAudioRecorder {

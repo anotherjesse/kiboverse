@@ -30,17 +30,19 @@ final class AppStore: ObservableObject {
     private var api: KiboAPI
     private var pollTask: Task<Void, Never>?
     private var uploadTask: (id: UUID, task: Task<UploadRunResult, Never>)?
+    private var recordingTasks: [UUID: Task<Void, Never>] = [:]
     private let spool = PendingUploadSpool()
     private var serverVersion = 0
     private var projectSelectionVersion = 0
     private var eventSelectionVersion = 0
     private var eventRequestVersion = 0
 
-    init() {
+    init(session: URLSession = .shared) {
         let rawURL = UserDefaults.standard.string(forKey: Key.serverURL) ?? Self.defaultServerURL
         let savedURL = KiboAPI.canonicalServerURL(rawURL) ?? Self.defaultServerURL
         serverURL = savedURL
-        api = (try? KiboAPI(serverURL: savedURL)) ?? (try! KiboAPI(serverURL: Self.defaultServerURL))
+        api = (try? KiboAPI(serverURL: savedURL, session: session))
+            ?? (try! KiboAPI(serverURL: Self.defaultServerURL, session: session))
         selectedProjectID = UserDefaults.standard.string(forKey: Key.projectID)
         selectedConversationID = UserDefaults.standard.string(forKey: Key.conversationID)
         pendingUploadCount = spool.all().filter { $0.serverURL == savedURL }.count
@@ -49,6 +51,7 @@ final class AppStore: ObservableObject {
     deinit {
         pollTask?.cancel()
         uploadTask?.task.cancel()
+        for task in recordingTasks.values { task.cancel() }
     }
 
     var selectedProject: KiboProject? { projects.first { $0.id == selectedProjectID } }
@@ -170,13 +173,22 @@ final class AppStore: ObservableObject {
             )
             updatePendingUploadCount()
             status = "Saved locally · sending…"
-            Task {
+            let taskID = UUID()
+            recordingTasks[taskID] = Task { [weak self] in
+                guard let self else { return }
                 _ = await retryPendingUploads(destinationKey: "\(projectID)/\(conversationID)")
                 await refreshEvents()
+                recordingTasks[taskID] = nil
             }
         } catch {
             report(error)
         }
+    }
+
+    /// Test/support seam: queued recording work is explicit rather than an
+    /// untracked task that can leak requests into a later lifecycle.
+    func waitForRecordingTasks() async {
+        while let task = recordingTasks.values.first { await task.value }
     }
 
     @discardableResult
@@ -289,6 +301,7 @@ final class AppStore: ObservableObject {
             )
             UserDefaults.standard.removeObject(forKey: commandKey)
             await refreshEvents()
+            restartPollingIfStarted()
             return turnID
         } catch {
             report(error)
@@ -328,11 +341,16 @@ final class AppStore: ObservableObject {
         }
     }
 
-    func speech(turnID: String) async throws -> (Data, Int) {
+    func speechStream(turnID: String, fromSample: Int = 0) async throws -> SpeechResponseStream {
         guard let projectID = selectedProjectID, let conversationID = selectedConversationID else {
             throw APIError.invalidResponse
         }
-        return try await api.speech(projectID: projectID, conversationID: conversationID, turnID: turnID)
+        return try await api.speechStream(
+            projectID: projectID,
+            conversationID: conversationID,
+            turnID: turnID,
+            fromSample: fromSample
+        )
     }
 
     func clipAudio(clipID: String) async throws -> Data {
@@ -348,7 +366,6 @@ final class AppStore: ObservableObject {
         pollTask?.cancel()
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(2))
                 guard let self else { return }
                 if self.projects.isEmpty {
                     // First load failed (e.g. app launched before the network
@@ -357,8 +374,17 @@ final class AppStore: ObservableObject {
                 } else {
                     await self.refreshEvents()
                 }
+                let interval: Duration = self.events.pendingTurnIDs.isEmpty && !self.isSubmitting
+                    ? .seconds(2)
+                    : .milliseconds(250)
+                try? await Task.sleep(for: interval)
             }
         }
+    }
+
+    private func restartPollingIfStarted() {
+        guard pollTask != nil else { return }
+        beginPolling()
     }
 
     private func report(_ error: Error, quiet: Bool = false) {

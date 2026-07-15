@@ -3,15 +3,13 @@ import SwiftUI
 @main
 struct KiboApp: App {
     @StateObject private var store = AppStore()
-    @StateObject private var recorder = AudioRecorder()
-    @StateObject private var player = SpeechPlayer()
+    @StateObject private var audio = AudioCoordinator()
 
     var body: some Scene {
         WindowGroup {
             RootView()
                 .environmentObject(store)
-                .environmentObject(recorder)
-                .environmentObject(player)
+                .environmentObject(audio)
                 .tint(.kiboCoral)
                 .task { await store.start() }
         }

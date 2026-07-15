@@ -3,10 +3,7 @@ import SwiftUI
 struct TalkView: View {
     @Environment(\.scenePhase) private var scenePhase
     @EnvironmentObject private var store: AppStore
-    @EnvironmentObject private var recorder: AudioRecorder
-    @EnvironmentObject private var player: SpeechPlayer
-    @State private var activeHoldID: UUID?
-    @State private var recorderStartTask: Task<Void, Never>?
+    @EnvironmentObject private var audio: AudioCoordinator
     @State private var autoPlayTurnID: String?
     @State private var showingSettings = false
     @State private var recordingPulse = false
@@ -18,21 +15,21 @@ struct TalkView: View {
                 let buttonDiameter = min(220.0, max(180.0, geometry.size.height * 0.34))
                 VStack(spacing: 16) {
                     VStack(spacing: 12) {
-                        Text(recorder.isRecording ? "Listening…" : "Push to talk")
+                        Text(audio.isRecording ? "Listening…" : "Push to talk")
                             .font(.system(.title2, design: .rounded, weight: .bold))
-                        Text(recorder.isRecording ? "Release when you’re finished" : "Hold the button while you speak")
+                        Text(audio.isRecording ? "Release when you’re finished" : "Hold the button while you speak")
                             .foregroundStyle(.secondary)
-                        Text(recorder.errorMessage ?? player.errorMessage ?? store.status)
+                        Text(audio.recordingErrorMessage ?? audio.playbackErrorMessage ?? store.status)
                             .font(.footnote)
                             .foregroundColor(
-                                recorder.errorMessage == nil && player.errorMessage == nil
+                                audio.recordingErrorMessage == nil && audio.playbackErrorMessage == nil
                                     ? .secondary : .red
                             )
                             .frame(minHeight: 22)
                         Button {
                             // Guard here instead of .disabled so the button doesn't
                             // flash bright/gray on every push-to-talk cycle.
-                            guard !recorder.isRecording, !recorder.isStarting,
+                            guard !audio.isRecording, !audio.isStarting,
                                   !store.isUploading, !store.isAskingKibo else { return }
                             Task {
                                 if let turnID = await store.submitTurn() {
@@ -69,22 +66,22 @@ struct TalkView: View {
         }
         .background(Color(.systemGroupedBackground))
         .sheet(isPresented: $showingSettings) { SettingsView() }
-        .task { await recorder.prepare() }
+        .task { await audio.prepare() }
         .onChange(of: store.events) { _, _ in playAwaitedReplyIfReady() }
         .onChange(of: store.selectedConversationID) { _, _ in
             autoPlayTurnID = nil
-            player.stop()
+            audio.stop()
         }
         .onChange(of: scenePhase) { _, phase in
             if phase != .active {
-                player.stop()
+                audio.stopForInactivity()
                 cancelHold()
             } else {
-                Task { await recorder.prepare() }
+                Task { await audio.prepare() }
             }
         }
         .onDisappear {
-            player.stop()
+            audio.stop()
             cancelHold()
             autoPlayTurnID = nil
         }
@@ -100,7 +97,7 @@ struct TalkView: View {
                 Label(store.selectedProject?.name ?? "Project", systemImage: "folder")
                     .lineLimit(1)
             }
-            .disabled(recorder.isRecording || recorder.isStarting)
+            .disabled(audio.isRecording || audio.isStarting)
             Divider().frame(height: 22)
             Menu {
                 ForEach(store.conversations) { conversation in
@@ -110,7 +107,7 @@ struct TalkView: View {
                 Label(store.selectedConversation?.name ?? "Conversation", systemImage: "bubble.left")
                     .lineLimit(1)
             }
-            .disabled(recorder.isRecording || recorder.isStarting)
+            .disabled(audio.isRecording || audio.isStarting)
             Spacer()
             Circle().fill(store.status == "Live" ? .green : .orange).frame(width: 8, height: 8)
             Button("Settings", systemImage: "gearshape") { showingSettings = true }
@@ -125,22 +122,22 @@ struct TalkView: View {
     private func talkButton(diameter: CGFloat) -> some View {
         ZStack {
             Circle()
-                .fill(Color.kiboCoral.opacity(recorder.isRecording ? 0.18 : 0.10))
+                .fill(Color.kiboCoral.opacity(audio.isRecording ? 0.18 : 0.10))
                 .frame(width: diameter, height: diameter)
-                .scaleEffect(recorder.isRecording ? 1 + recorder.level * 0.12 : 1)
-                .animation(.easeOut(duration: 0.08), value: recorder.level)
+                .scaleEffect(audio.isRecording ? 1 + audio.level * 0.12 : 1)
+                .animation(.easeOut(duration: 0.08), value: audio.level)
             ZStack {
                 Circle()
-                    .fill(recorder.isRecording ? Color.red : Color.kiboCoral)
+                    .fill(audio.isRecording ? Color.red : Color.kiboCoral)
                     .frame(width: diameter * 0.745, height: diameter * 0.745)
                     .shadow(color: .kiboCoral.opacity(0.35), radius: 24, y: 10)
-                Image(systemName: recorder.isRecording ? "waveform" : "mic.fill")
+                Image(systemName: audio.isRecording ? "waveform" : "mic.fill")
                     .font(.system(size: 54, weight: .semibold))
                     .foregroundStyle(.white)
             }
             .scaleEffect(recordingPulse ? 1.07 : 1.0)
         }
-        .onChange(of: recorder.isRecording) { _, recording in
+        .onChange(of: audio.isRecording) { _, recording in
             if recording {
                 withAnimation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true)) {
                     recordingPulse = true
@@ -153,10 +150,10 @@ struct TalkView: View {
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Hold to talk")
-        .accessibilityValue(recorder.isRecording ? "Recording" : "Ready")
+        .accessibilityValue(audio.isRecording ? "Recording" : "Ready")
         .accessibilityAddTraits(.isButton)
         .accessibilityAction {
-            if activeHoldID == nil { beginHold() } else { endHold() }
+            if audio.isHolding { endHold() } else { beginHold() }
         }
         .gesture(DragGesture(minimumDistance: 0)
             .onChanged { _ in beginHold() }
@@ -169,7 +166,7 @@ struct TalkView: View {
         guard let turnID = autoPlayTurnID else { return }
         if store.timeline.contains(where: { $0.turnID == turnID && $0.canPlay }) {
             autoPlayTurnID = nil
-            player.playReply(turnID: turnID, store: store)
+            audio.playReply(turnID: turnID, store: store)
         } else if store.events.contains(where: {
             ($0.kind == "reply_error" || $0.kind == "tts_error") && $0.turn == turnID
         }) {
@@ -178,44 +175,16 @@ struct TalkView: View {
     }
 
     private func beginHold() {
-        guard activeHoldID == nil else { return }
-        let holdID = UUID()
-        activeHoldID = holdID
-        player.pauseForRecording()
-        recorderStartTask = Task {
-            guard !Task.isCancelled else { return }
-            let started = await recorder.start(holdID: holdID)
-            guard !Task.isCancelled else {
-                if started { recorder.cancel(holdID: holdID) }
-                return
-            }
-            if !started, activeHoldID == holdID {
-                // Keep the gesture latched until release. DragGesture.onChanged
-                // may fire repeatedly while the finger remains down; clearing the
-                // ID here would start/pause/resume in a loop after a mic failure.
-                player.resumeAfterRecording()
-            }
-            recorderStartTask = nil
-        }
+        audio.beginHold()
     }
 
     private func endHold() {
-        guard let holdID = activeHoldID else { return }
-        activeHoldID = nil
-        recorderStartTask?.cancel()
-        recorderStartTask = nil
-        if let recording = recorder.stop(holdID: holdID) {
+        if let recording = audio.endHold() {
             store.queueRecording(recording)
         }
-        player.resumeAfterRecording()
     }
 
     private func cancelHold() {
-        guard let holdID = activeHoldID else { return }
-        activeHoldID = nil
-        recorderStartTask?.cancel()
-        recorderStartTask = nil
-        recorder.cancel(holdID: holdID)
-        player.resumeAfterRecording()
+        audio.cancelHold()
     }
 }

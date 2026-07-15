@@ -15,6 +15,29 @@ enum APIError: LocalizedError {
     }
 }
 
+enum SpeechPCMEncoding: Sendable, Equatable {
+    case signed16LittleEndian
+}
+
+struct SpeechResponseStream: Sendable {
+    let sampleRate: Int
+    let channels: Int
+    let encoding: SpeechPCMEncoding
+    let chunks: AsyncThrowingStream<Data, Error>
+
+    init(
+        sampleRate: Int,
+        channels: Int,
+        encoding: SpeechPCMEncoding = .signed16LittleEndian,
+        chunks: AsyncThrowingStream<Data, Error>
+    ) {
+        self.sampleRate = sampleRate
+        self.channels = channels
+        self.encoding = encoding
+        self.chunks = chunks
+    }
+}
+
 actor KiboAPI {
     private let session: URLSession
     private var baseURL: URL
@@ -97,6 +120,66 @@ actor KiboAPI {
         try validate(response: response, data: data)
         let rate = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "X-Audio-Sample-Rate").flatMap(Int.init) ?? 24_000
         return (data, rate)
+    }
+
+    func speechStream(
+        projectID: String,
+        conversationID: String,
+        turnID: String,
+        fromSample: Int = 0
+    ) async throws -> SpeechResponseStream {
+        var request = try makeRequest(
+            path: [
+                "v1", "projects", projectID, "conversations", conversationID,
+                "turns", turnID, "speech",
+            ],
+            query: [URLQueryItem(name: "from_sample", value: String(max(0, fromSample)))]
+        )
+        request.timeoutInterval = 120
+        request.setValue(
+            "application/vnd.kibo.pcm; format=s16le",
+            forHTTPHeaderField: "Accept"
+        )
+        let (bytes, response) = try await session.bytes(for: request)
+        try validate(response: response, data: nil)
+        guard let http = response as? HTTPURLResponse,
+              let contentType = http.value(forHTTPHeaderField: "Content-Type")?.lowercased(),
+              contentType.contains("application/vnd.kibo.pcm"),
+              contentType.contains("format=s16le"),
+              let rate = http.value(forHTTPHeaderField: "X-Audio-Sample-Rate").flatMap(Int.init),
+              (1...192_000).contains(rate),
+              let channels = http.value(forHTTPHeaderField: "X-Audio-Channels").flatMap(Int.init),
+              channels == 1 else {
+            throw APIError.invalidResponse
+        }
+
+        let chunks = AsyncThrowingStream<Data, Error> { continuation in
+            let task = Task {
+                do {
+                    var chunk = Data()
+                    chunk.reserveCapacity(4_096)
+                    for try await byte in bytes {
+                        try Task.checkCancellation()
+                        chunk.append(byte)
+                        if chunk.count >= 4_096 {
+                            continuation.yield(chunk)
+                            chunk.removeAll(keepingCapacity: true)
+                        }
+                    }
+                    if !chunk.isEmpty { continuation.yield(chunk) }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { @Sendable _ in task.cancel() }
+        }
+        return SpeechResponseStream(
+            sampleRate: rate,
+            channels: channels,
+            encoding: .signed16LittleEndian,
+            chunks: chunks
+        )
     }
 
     func clipAudio(projectID: String, conversationID: String, clipID: String) async throws -> Data {

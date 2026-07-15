@@ -44,6 +44,10 @@ targets:
         NSLocalNetworkUsageDescription: Kibo connects to your Kibo server on your local network.
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
+        CFBundleURLTypes:
+          - CFBundleURLName: com.anotherjesse.kibo.watchkitapp
+            CFBundleURLSchemes:
+              - kibo-watch
         WKCompanionAppBundleIdentifier: com.anotherjesse.kibo
         WKApplication: true
     sources:
@@ -51,10 +55,30 @@ targets:
       - path: KiboWatch
       - path: Kibo/Assets.xcassets
         buildPhase: resources
+    dependencies:
+      - target: KiboWatchComplication
+        embed: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.anotherjesse.kibo.watchkitapp
         PRODUCT_NAME: Kibo Watch
+  KiboWatchComplication:
+    type: app-extension
+    platform: watchOS
+    info:
+      path: Generated/KiboWatchComplication-Info.plist
+      properties:
+        CFBundleDisplayName: Kibo
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    sources:
+      - path: KiboWatchComplication
+    settings:
+      base:
+        APPLICATION_EXTENSION_API_ONLY: YES
+        PRODUCT_BUNDLE_IDENTIFIER: com.anotherjesse.kibo.watchkitapp.kibowidget
+        PRODUCT_NAME: Kibo Complication
+        SKIP_INSTALL: YES
   KiboTests:
     type: bundle.unit-test
     platform: iOS

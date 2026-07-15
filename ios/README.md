@@ -66,6 +66,16 @@ invalidates queued work and prepared audio objects, stops
 capture/transport/rendering, then deactivates the session; no background audio
 mode is enabled.
 
+## Watch-face complication
+
+The Watch app includes a static WidgetKit complication named **Kibo** for the
+small circular accessory slot used by information-dense watch faces. It shows a
+waveform inside the system complication background and opens the Watch app when
+tapped. In the Watch face editor, choose a circular complication position and
+select Kibo. The complication has no timeline refreshes or network work.
+Physical Watch verification confirmed that it appears in the circular slot and
+opens Kibo when tapped.
+
 This foreground short-form policy is deliberate. Apple documents incremental
 buffer scheduling on [`AVAudioPlayerNode`](https://developer.apple.com/documentation/avfaudio/avaudioplayernode)
 and engine playback on [`AVAudioEngine`](https://developer.apple.com/documentation/avfaudio/avaudioengine).

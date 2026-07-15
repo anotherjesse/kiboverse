@@ -1,0 +1,77 @@
+name: Kibo
+options:
+  bundleIdPrefix: com.anotherjesse
+  deploymentTarget:
+    iOS: "18.0"
+    watchOS: "11.0"
+  xcodeVersion: "16.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    CODE_SIGN_STYLE: Automatic
+targets:
+  Kibo:
+    type: application
+    platform: iOS
+    info:
+      path: Generated/Kibo-Info.plist
+      properties:
+        CFBundleDisplayName: Kibo
+        NSMicrophoneUsageDescription: Kibo records your voice so it can send your question to your selected conversation.
+        NSLocalNetworkUsageDescription: Kibo connects to your Kibo server on your local network.
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        UILaunchScreen: {}
+    sources:
+      - path: Shared
+      - path: Kibo
+    dependencies:
+      - target: KiboWatch
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.anotherjesse.kibo
+        PRODUCT_NAME: Kibo
+        TARGETED_DEVICE_FAMILY: "1,2"
+  KiboWatch:
+    type: application
+    platform: watchOS
+    info:
+      path: Generated/KiboWatch-Info.plist
+      properties:
+        CFBundleDisplayName: Kibo
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        WKCompanionAppBundleIdentifier: com.anotherjesse.kibo
+        WKApplication: true
+    sources:
+      - path: Shared
+      - path: KiboWatch
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.anotherjesse.kibo.watchkitapp
+        PRODUCT_NAME: Kibo Watch
+  KiboTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: KiboTests
+    dependencies:
+      - target: Kibo
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.anotherjesse.kibo.tests
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  Kibo:
+    build:
+      targets:
+        Kibo: all
+        KiboTests: [test]
+    test:
+      targets:
+        - KiboTests
+  KiboWatch:
+    build:
+      targets:
+        KiboWatch: all

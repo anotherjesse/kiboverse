@@ -186,7 +186,7 @@ fn render_page(
 <details class=\"new-item\"><summary>New project</summary><form method=\"post\" action=\"/ui/projects\"><label>Name<input name=\"name\" maxlength=\"100\" required></label><button> create </button></form></details>
 </aside><main class=\"main\"><header class=\"conversation-header\"><div><p class=\"eyebrow\">{project} {mock_notice}</p><h1>{conversation}</h1></div><span id=\"connection-status\">Connecting…</span></header>
 <section id=\"timeline\" class=\"timeline\" aria-live=\"polite\">{timeline}</section>
-<section class=\"composer\" aria-label=\"Voice controls\"><div class=\"record-group\"><button id=\"record-button\" type=\"button\" aria-pressed=\"false\" aria-label=\"Hold to record\"><span aria-hidden=\"true\">●</span></button><div><strong>Hold to talk</strong><div id=\"recording-status\">Your recording is saved before it is sent.</div><button id=\"discard-failed-button\" class=\"discard-button\" type=\"button\" hidden>Discard failed recording</button></div></div><button id=\"turn-button\" type=\"button\">Ask Kibo</button></section>
+<section class=\"composer\" aria-label=\"Voice controls\"><div class=\"record-group\"><button id=\"record-button\" type=\"button\" aria-pressed=\"false\" aria-label=\"Hold to record\"><span aria-hidden=\"true\">●</span></button><div><strong>Hold to talk <kbd>space</kbd></strong><div id=\"recording-status\">Hold the spacebar (or the button) to record.</div><button id=\"discard-failed-button\" class=\"discard-button\" type=\"button\" hidden>Discard failed recording</button></div></div><button id=\"turn-button\" type=\"button\">Ask Kibo</button></section>
 </main></div></body></html>",
         conversation = escape(&conversation.name),
         project = escape(&project.name),

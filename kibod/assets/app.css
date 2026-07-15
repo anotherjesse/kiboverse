@@ -239,6 +239,17 @@ h1 {
   gap: 0.8rem;
 }
 
+.record-group kbd {
+  padding: 0.05rem 0.4rem;
+  border: 1px solid rgba(31, 42, 51, 0.18);
+  border-bottom-width: 2px;
+  border-radius: 0.35rem;
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 0.78rem;
+  font-weight: 500;
+}
+
 #record-button {
   display: grid;
   width: 4rem;

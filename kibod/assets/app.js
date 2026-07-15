@@ -505,7 +505,7 @@
     const attempt = {};
     acquireRecordingHold(attempt);
     recordingAttempt = attempt;
-    recordButton?.setPointerCapture?.(event.pointerId);
+    if (event.type === "pointerdown") recordButton?.setPointerCapture?.(event.pointerId);
     preparedRecorder?.context.resume().catch(() => {});
     startRecording(attempt);
   }
@@ -522,12 +522,27 @@
     commit.finally(() => clipCommits.delete(commit));
   }
 
+  function isTextEntry(target) {
+    if (!(target instanceof Element)) return false;
+    if (target.isContentEditable) return true;
+    const tag = target.tagName;
+    return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+  }
+
   recordButton?.addEventListener("pointerdown", beginRecord);
   recordButton?.addEventListener("pointerup", endRecord);
   recordButton?.addEventListener("pointercancel", endRecord);
   recordButton?.addEventListener("lostpointercapture", endRecord);
-  recordButton?.addEventListener("keydown", beginRecord);
-  recordButton?.addEventListener("keyup", endRecord);
+  document.addEventListener("keydown", (event) => {
+    if (event.code !== "Space" || event.ctrlKey || event.metaKey || event.altKey) return;
+    if (isTextEntry(event.target)) return;
+    beginRecord(event);
+  });
+  document.addEventListener("keyup", (event) => {
+    if (event.code !== "Space" || !recordPressed) return;
+    endRecord(event);
+  });
+  window.addEventListener("blur", endRecord);
   prewarmGrantedMicrophone();
   window.addEventListener("pageshow", prewarmGrantedMicrophone);
   window.addEventListener("pagehide", () => {

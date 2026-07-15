@@ -1,0 +1,40 @@
+#!/bin/sh
+# Build, sign, install, and launch Kibo on a paired iPhone.
+set -eu
+
+cd "$(dirname "$0")"
+
+device="${1:-ij}"
+team="${DEVELOPMENT_TEAM:-NR57ZU358K}"
+derived_data="${DERIVED_DATA:-/tmp/kibo-derived}"
+app="$derived_data/Build/Products/Debug-iphoneos/Kibo.app"
+
+command -v xcodegen >/dev/null 2>&1 || {
+  echo "error: xcodegen is required (brew install xcodegen)" >&2
+  exit 1
+}
+
+echo "Building Kibo for iPhone..."
+xcodegen generate --spec project.yml
+xcodebuild \
+  -project Kibo.xcodeproj \
+  -scheme Kibo \
+  -configuration Debug \
+  -destination 'generic/platform=iOS' \
+  -derivedDataPath "$derived_data" \
+  DEVELOPMENT_TEAM="$team" \
+  build
+
+echo "Installing Kibo on $device..."
+xcrun devicectl device install app --device "$device" "$app"
+
+echo "Launching Kibo on $device..."
+if xcrun devicectl device process launch \
+  --device "$device" \
+  --terminate-existing \
+  com.anotherjesse.kibo
+then
+  echo "Kibo deployed and launched on $device."
+else
+  echo "Kibo was installed, but could not be launched. Unlock the phone and open Kibo." >&2
+fi

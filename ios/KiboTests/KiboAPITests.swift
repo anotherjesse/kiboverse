@@ -62,6 +62,16 @@ final class KiboAPITests: XCTestCase {
         XCTAssertTrue(events.timeline().last?.canPlay == true)
     }
 
+    func testTimelineSplitsEachRecordingIntoItsOwnCard() throws {
+        let data = #"[{"seq":1,"kind":"clip","id":"c1","ms":1500},{"seq":2,"kind":"clip","id":"c2","ms":900},{"seq":3,"kind":"transcript","clip":"c1","text":"First"},{"seq":4,"kind":"transcript","clip":"c2","text":"Second"},{"seq":5,"kind":"turn","id":"t1","clips":["c1","c2"]},{"seq":6,"kind":"reply","turn":"t1","text":"Hi","audio":"tts/t1.wav"}]"#.data(using: .utf8)!
+        let events = try JSONDecoder().decode([KiboEvent].self, from: data)
+        let cards = events.timeline()
+        XCTAssertEqual(cards.map(\.body), ["First", "Second", "Hi"])
+        XCTAssertEqual(cards.compactMap(\.clipID), ["c1", "c2"])
+        XCTAssertEqual(cards.first?.durationMs, 1500)
+        XCTAssertTrue(cards.allSatisfy { $0.role == .kibo || $0.canPlay })
+    }
+
     func testTimelineUsesLatestDuplicateEventInsteadOfCrashing() throws {
         let data = #"[{"seq":1,"kind":"clip","id":"c1"},{"seq":2,"kind":"transcript_error","clip":"c1","error":"first"},{"seq":3,"kind":"transcript_error","clip":"c1","error":"latest"}]"#.data(using: .utf8)!
         let events = try JSONDecoder().decode([KiboEvent].self, from: data)

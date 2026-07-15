@@ -62,7 +62,7 @@ final class AppStore: ObservableObject {
         beginPolling()
     }
 
-    func reloadProjects() async {
+    func reloadProjects(quiet: Bool = false) async {
         let version = serverVersion
         isLoading = true
         defer { isLoading = false }
@@ -79,7 +79,7 @@ final class AppStore: ObservableObject {
             await selectProject(preferred?.id)
         } catch {
             guard version == serverVersion else { return }
-            report(error)
+            report(error, quiet: quiet)
         }
     }
 
@@ -349,7 +349,14 @@ final class AppStore: ObservableObject {
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(2))
-                await self?.refreshEvents()
+                guard let self else { return }
+                if self.projects.isEmpty {
+                    // First load failed (e.g. app launched before the network
+                    // was up) — keep retrying until projects appear.
+                    await self.reloadProjects(quiet: true)
+                } else {
+                    await self.refreshEvents()
+                }
             }
         }
     }

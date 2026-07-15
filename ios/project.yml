@@ -62,15 +62,28 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.anotherjesse.kibo.tests
         GENERATE_INFOPLIST_FILE: YES
+  KiboUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: KiboUITests
+    dependencies:
+      - target: Kibo
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.anotherjesse.kibo.uitests
+        GENERATE_INFOPLIST_FILE: YES
 schemes:
   Kibo:
     build:
       targets:
         Kibo: all
         KiboTests: [test]
+        KiboUITests: [test]
     test:
       targets:
         - KiboTests
+        - KiboUITests
   KiboWatch:
     build:
       targets:

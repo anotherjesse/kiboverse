@@ -76,7 +76,8 @@ struct TimelineItem: Identifiable, Hashable {
     let title: String
     let body: String
     let turnID: String?
-    let clipIDs: [String]
+    let clipID: String?
+    let durationMs: UInt64?
     let canPlay: Bool
 }
 
@@ -92,11 +93,14 @@ extension Array where Element == KiboEvent {
     func timeline() -> [TimelineItem] {
         var transcripts: [String: String] = [:]
         var transcriptErrors: [String: String] = [:]
+        var durations: [String: UInt64] = [:]
         var replies: [String: KiboEvent] = [:]
         var replyErrors: [String: String] = [:]
         var speechState: [String: SpeechStatus] = [:]
         for event in sorted(by: { $0.seq < $1.seq }) {
-            if event.kind == "transcript", let clip = event.clip {
+            if event.kind == "clip", let clip = event.idValue {
+                durations[clip] = event.durationMs
+            } else if event.kind == "transcript", let clip = event.clip {
                 transcripts[clip] = event.text ?? "Transcribing…"
             } else if event.kind == "transcript_error", let clip = event.clip {
                 transcriptErrors[clip] = event.error ?? "Transcription failed"
@@ -113,45 +117,47 @@ extension Array where Element == KiboEvent {
         var claimed = Set<String>()
         var result: [TimelineItem] = []
 
+        func personCard(clipID: String, title: String) -> TimelineItem {
+            TimelineItem(
+                id: "clip-\(clipID)", role: .person, title: title,
+                body: transcripts[clipID] ?? transcriptErrors[clipID] ?? "Transcribing…",
+                turnID: nil, clipID: clipID, durationMs: durations[clipID], canPlay: true
+            )
+        }
+
         for event in self where event.kind == "turn" {
             guard let turnID = event.idValue else { continue }
             let clipIDs = event.clips ?? []
             claimed.formUnion(clipIDs)
-            let thoughts = clipIDs.map { id in transcripts[id] ?? transcriptErrors[id] ?? "Transcribing…" }
-            result.append(TimelineItem(
-                id: "person-\(turnID)", role: .person, title: "You",
-                body: thoughts.joined(separator: "\n"), turnID: nil,
-                clipIDs: clipIDs, canPlay: false
-            ))
+            // One card per recording, not one clump per turn.
+            for clipID in clipIDs {
+                result.append(personCard(clipID: clipID, title: "You"))
+            }
             if let reply = replies[turnID] {
                 let speechError: String? = if case let .failed(message) = speechState[turnID] { message } else { nil }
                 result.append(TimelineItem(
                     id: "kibo-\(turnID)", role: .kibo, title: "Kibo",
                     body: [reply.text ?? "Reply ready", speechError.map { "Speech unavailable: \($0)" }]
                         .compactMap { $0 }.joined(separator: "\n\n"),
-                    turnID: turnID, clipIDs: [],
+                    turnID: turnID, clipID: nil, durationMs: nil,
                     canPlay: speechError == nil && (speechState[turnID]?.isReady == true || reply.audio != nil)
                 ))
             } else if let error = replyErrors[turnID] {
                 result.append(TimelineItem(
                     id: "error-\(turnID)", role: .error, title: "Reply failed",
-                    body: error, turnID: nil, clipIDs: [], canPlay: false
+                    body: error, turnID: nil, clipID: nil, durationMs: nil, canPlay: false
                 ))
             } else {
                 result.append(TimelineItem(
                     id: "status-\(turnID)", role: .status, title: "Kibo",
-                    body: "Thinking…", turnID: nil, clipIDs: [], canPlay: false
+                    body: "Thinking…", turnID: nil, clipID: nil, durationMs: nil, canPlay: false
                 ))
             }
         }
 
         for event in self where event.kind == "clip" {
             guard let clipID = event.idValue, !claimed.contains(clipID) else { continue }
-            result.append(TimelineItem(
-                id: "clip-\(clipID)", role: .person, title: "You · not asked yet",
-                body: transcripts[clipID] ?? transcriptErrors[clipID] ?? "Transcribing…",
-                turnID: nil, clipIDs: [clipID], canPlay: false
-            ))
+            result.append(personCard(clipID: clipID, title: "You · not asked yet"))
         }
         return result
     }

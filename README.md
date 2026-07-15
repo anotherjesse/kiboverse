@@ -9,6 +9,46 @@ survive long-term.
 
 The Pi is reachable on the local network as `kibo.local` (ssh).
 
+## Phase-one server and web client
+
+`kibod` is the shared Rust server described in `server-design.md`. It stores
+projects and conversations, accepts idempotent WAV clip uploads, transcribes
+them, creates AI turns, streams reply audio as 24 kHz mono PCM, and serves the
+HTMX browser client. Every client selects an explicit project and conversation;
+there is no server-global "active conversation."
+
+Start it locally:
+
+```sh
+cargo run -p kibod
+```
+
+Then open <http://127.0.0.1:3000>. Without `GEMINI_API_KEY`, kibod deliberately
+runs in mock mode so the full record → upload → turn → streamed-audio path can
+be exercised without credentials. Set these environment variables as needed:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `GEMINI_API_KEY` | unset | Enables Gemini transcription, chat, and TTS |
+| `KIBO_AI_MODE` | automatic | Set to `mock` to force deterministic local AI |
+| `KIBO_DATA_DIR` | `~/kibo-data` | Durable projects, logs, clips, and speech |
+| `KIBO_BIND` | `127.0.0.1:3000` | Listen address; use `0.0.0.0:3000` on a trusted LAN/tailnet |
+
+The browser records mono WAV, commits each clip to an IndexedDB retry spool
+before uploading, and will not submit a turn until its pending uploads are
+acknowledged. The server log remains authoritative: live WebSocket events are
+paired with cursor-based `GET /events?after=<seq>` recovery.
+
+New conversations are named from the first successful transcription. A later
+AI-generated title after a few completed turns is intentionally left as a
+phase-two TODO; manual names will remain authoritative.
+
+This phase has no user authentication and is intended only for localhost or a
+trusted tailnet. Browser microphone capture works on localhost; remote browser
+access must be placed behind an HTTPS terminator because browsers do not expose
+the microphone to ordinary remote HTTP pages. Browser mutations and WebSocket
+connections are restricted to the page's own origin.
+
 ## Hardware
 
 - **Raspberry Pi 4 Model B Rev 1.4** — Debian 12 (bookworm), Python 3.11.2
@@ -114,8 +154,8 @@ between kibo and an AI:
    durable in `turns.jsonl` *before* TTS runs, then
    `gemini-3.1-flash-tts-preview` (voice Kore, 24kHz PCM — little-endian
    despite the `audio/l16` label) speaks it. Voiceflow-style playback:
-   holding record pauses speech instantly and resumes ~1s rewound after the
-   clip saves; pressing the AI button while kibo talks skips the speech.
+   holding record pauses speech instantly and resumes from the same position
+   after the clip saves; pressing the AI button while kibo talks skips the speech.
    Future: streaming TTS (`"stream": true`, `step.delta` events) for lower
    latency on long replies.
 

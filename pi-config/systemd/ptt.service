@@ -1,4 +1,8 @@
-# Installed to /etc/systemd/system/ptt.service by deploy.sh.
+# Installed to /etc/systemd/system/ptt.service during explicit office/dev
+# target setup. Ordinary deploy.sh releases do not alter machine config. This is the
+# legacy recplay/ptt Pi runtime; deploy.sh does not install kibod.
+# This process owns its local flat turns.jsonl; it does not upload to or
+# coordinate authority with kibod.
 # Logs: journalctl -u ptt -f
 [Unit]
 Description=kibo push-to-talk (joystick record/playback loop)
@@ -7,7 +11,8 @@ After=sound.target
 [Service]
 User=jesse
 Environment=HOME=/home/jesse
-# GEMINI_API_KEY lives here; deploy.sh pushes it from the repo's .env
+# GEMINI_API_KEY lives here; target setup installs it explicitly and releases
+# preserve it.
 EnvironmentFile=-/home/jesse/.env
 WorkingDirectory=/home/jesse
 ExecStart=/home/jesse/ptt

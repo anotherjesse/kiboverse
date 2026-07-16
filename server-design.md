@@ -7,6 +7,14 @@ iroh.computer / n0-computer GitHub (verified via web research July 2026).*
 
 ## 1. Recommended architecture
 
+> **Current deployment boundary:** this section describes the target
+> architecture, not what `deploy.sh` installs today. Its fixed target is the
+> office development Pi; that hardware has not moved to the bedroom and is not
+> a production deployment. Its service is still the legacy `recplay`/`ptt`
+> binary, whose local flat `turns.jsonl` is its authority. It does not upload to
+> or coordinate with `kibod`. `kibod` is a separate local/server runtime until
+> the Pi-client migration below is shipped.
+
 **A transport-agnostic turn protocol served by a boring Rust server (`kibod`:
 axum + tokio, pure-Rust stack), reachable over a Tailscale tailnet. Thin
 clients: Pi (Rust), iPhone/iPad (Swift/URLSession), Watch (via the iPhone).

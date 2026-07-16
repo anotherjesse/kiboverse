@@ -7,7 +7,9 @@ embodiment (3D-printed body, servos, animated face) is the current form
 factor but may change — the body needs a re-print and the robot part may not
 survive long-term.
 
-The Pi is reachable on the local network as `kibo.local` (ssh).
+The office development Pi is reachable on the local network as `kibo.local`
+(ssh). It has not been moved to the bedroom, and nothing in this repository
+currently represents a bedroom/production deployment.
 
 ## Phase-one server and web client
 
@@ -16,6 +18,12 @@ projects and conversations, accepts idempotent WAV clip uploads, transcribes
 them, creates AI turns, streams reply audio as 24 kHz mono PCM, and serves the
 HTMX browser client. Every client selects an explicit project and conversation;
 there is no server-global "active conversation."
+
+`kibod` is currently a separate local/server runtime. The Pi deployment script
+does not install it: `deploy.sh` deliberately continues to manage the legacy
+`recplay` package's `ptt` joystick runtime described below. That runtime's
+local flat `turns.jsonl` remains its authority; it neither uploads to nor
+coordinates state with `kibod`.
 
 Start it locally:
 
@@ -129,21 +137,85 @@ aplay -D plughw:A01,0 /tmp/t.wav
   `turns.jsonl`, blob before metadata), button 1 plays back everything since
   the last reply (simulated AI turn). No audio C libraries; `arecord`/`aplay`
   are used only as thin device shims.
-- `pi-config/` — files that live on the Pi, kept here so it's reproducible:
+- `pi-config/` — files that live on the office/dev Pi, kept here so it's reproducible:
   the WirePlumber rule (→ `~/.config/wireplumber/main.lua.d/`) and the ptt
   systemd unit (→ `/etc/systemd/system/`).
-- `deploy.sh` — build + push binary and config + (re)start the `ptt`
-  service, all in one. Logs on the Pi: `journalctl -u ptt -f`.
+- `deploy.sh` — build, verify, push, and transactionally restart the legacy
+  `recplay`/`ptt` service on the fixed office/dev target. It verifies both the
+  staged and running executable SHA-256, and restores and verifies the previous
+  binary if activation is unhealthy. Logs: `journalctl -u ptt -f`.
 
 ## Rust cross-compile (Mac → Pi)
 
-The Pi is aarch64 / glibc 2.36. Build on the Mac with `cargo-zigbuild`
-(zig is the cross-linker; no VM or Docker needed) and copy the binary over:
+The office/dev Pi contract is fixed: hostname `kibo`, SSH user/home
+`jesse`/`/home/jesse`, role `office-dev`, timezone `America/Los_Angeles`,
+aarch64 with glibc 2.36, and an enabled/active `ptt.service`. The deployer
+rejects any target that does not satisfy it. `KIBO_DEPLOY_HOST` may select a
+different SSH route to that same machine, but it cannot change the identity or
+home. This is deliberately not a generic fleet or production deployer.
+
+One-time target setup is explicit because it changes machine identity,
+timezone, service configuration, and the Gemini secret. Run it only while
+intentionally configuring this office/dev Pi:
 
 ```sh
-cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.36
-scp target/aarch64-unknown-linux-gnu/release/recplay kibo.local:
-ssh kibo.local ./recplay
+set -eu
+test -s .env
+grep -Eq '^GEMINI_API_KEY=..*$' .env
+./deploy.sh --build-only
+ssh kibo.local 'set -eu
+  test "$(hostname)" = kibo
+  test "$(id -un)" = jesse
+  test "$(uname -m)" = aarch64
+  install -d -m 0755 /home/jesse/.config/wireplumber/main.lua.d
+  sudo install -d -m 0755 /etc/kibo
+  printf "office-dev\n" | sudo tee /etc/kibo/device-role >/dev/null
+  sudo chmod 0644 /etc/kibo/device-role
+  sudo timedatectl set-timezone America/Los_Angeles
+'
+scp pi-config/wireplumber/51-disable-airhug.lua \
+  kibo.local:/home/jesse/.config/wireplumber/main.lua.d/
+scp pi-config/systemd/ptt.service kibo.local:/tmp/ptt.service
+scp target/deploy-ptt/aarch64-unknown-linux-gnu/release/ptt \
+  kibo.local:/home/jesse/.ptt.bootstrap
+ssh kibo.local 'umask 077; cat > /home/jesse/.env.bootstrap' < .env
+ssh kibo.local 'set -eu
+  test -s /home/jesse/.env.bootstrap
+  grep -Eq "^GEMINI_API_KEY=..*$" /home/jesse/.env.bootstrap
+  chmod 0600 /home/jesse/.env.bootstrap
+  mv -f /home/jesse/.env.bootstrap /home/jesse/.env
+  chmod 0644 /home/jesse/.config/wireplumber/main.lua.d/51-disable-airhug.lua
+  chmod 0755 /home/jesse/.ptt.bootstrap
+  mv -f /home/jesse/.ptt.bootstrap /home/jesse/ptt
+  sudo install -m 0644 /tmp/ptt.service /etc/systemd/system/ptt.service
+  rm -f /tmp/ptt.service
+  sudo systemctl daemon-reload
+  sudo systemctl enable ptt
+  sudo systemctl restart ptt
+'
+```
+
+Ordinary releases do not rotate `.env`, alter machine configuration, or
+change service enablement. They build only the `recplay` package's `ptt`
+binary into a dedicated target directory, so a stale workspace artifact
+cannot be deployed. Validate the cross-build without contacting the Pi with:
+
+```sh
+./deploy.sh --build-only
+```
+
+Run `./deploy.sh` to release it. All transfers and remote verification finish
+before activation. The remote installer takes an exclusive lock, atomically
+replaces only `/home/jesse/ptt`, restarts the already enabled/active service,
+and requires one stable PID/restart count whose `/proc/<pid>/exe` SHA matches
+the build. Failure restores the prior binary and receipt, restarts, and verifies
+the restored process. Success publishes the exact verified build manifest at
+`~/.kibo/deployments/ptt.receipt`.
+
+The deployment transaction and failure paths have a no-network test harness:
+
+```sh
+just test-deploy
 ```
 
 This stays trivial as long as dependencies are pure Rust (`evdev`, `hound`,
@@ -164,8 +236,8 @@ between kibo and an AI:
    transcript lands in `turns.jsonl` as a durable record; failures are
    durable `transcript_error` records and retry on next startup. Silent
    (peak-0) clips are never sent — Gemini hallucinates speech from silence.
-   Needs `GEMINI_API_KEY` in `.env` (gitignored; deploy.sh pushes it to the
-   Pi, systemd loads it).
+   Needs `GEMINI_API_KEY` in `.env` (gitignored; explicit target setup installs
+   it on the Pi, ordinary releases preserve it, and systemd loads it).
 4. **Respond** — ✓ done. Press the AI button and all transcripts since the
    last reply become one user turn; `gemini-3.5-flash` writes the reply
    (conversation memory is server-side via `previous_interaction_id`, with

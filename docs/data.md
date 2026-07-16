@@ -217,12 +217,15 @@ line is a JSON object. All events currently have this envelope:
 - `at` is server epoch seconds.
 - `kind` selects the remaining fields.
 
-The store deliberately persists open JSON objects so old logs remain readable
-and new event kinds can be added. All lifecycle consumers on the server pass
-those objects through one typed `ConversationWorkflow` projection. That
-projection defines event precedence, attempt state, runnable work, turn order,
-history, API readiness, and browser presentation; workers do not independently
-reinterpret the raw fields.
+Production writes enter the store as an opaque typed `JournalWrite`; only the
+store serializes it and assigns `seq` and `at`. This prevents new code from
+inventing a kind, owner field, stage, or contradictory retry/terminal shape.
+Reads deliberately remain open JSON values so legacy records, unknown future
+kinds, and recovery fixtures remain readable. All lifecycle consumers on the
+server pass those values through one typed `ConversationWorkflow` projection.
+That projection defines event precedence, attempt state, runnable work, turn
+order, history, API readiness, and browser presentation; workers do not
+independently reinterpret the raw fields.
 
 ### Event types
 
@@ -612,10 +615,11 @@ data-loss review documents those client-side capture gaps in detail.
 These are observed properties of the current implementation that matter when
 evolving the model.
 
-1. **The event envelope is open and unversioned.** Persistence remains generic
-JSON for forward compatibility. The typed server projection validates the
-known lifecycle subset, but unknown kinds and malformed references are ignored
-rather than rejecting the full log.
+1. **The event envelope is open and unversioned.** New in-process writes are
+typed, but durable reads remain generic JSON for forward and legacy
+compatibility. The typed server projection validates the known lifecycle
+subset, but unknown kinds and malformed references are ignored rather than
+rejecting the full log.
 2. **Conversation rename is a two-record update.** `conversation.json` is
 replaced before `conversation_renamed` is appended, so a crash or append
 failure can update metadata without notifying event consumers. Apple clients
@@ -654,6 +658,7 @@ to account for both “captured locally” and “committed to the server.”
 shapes.
 - `kibod/src/knowledge.rs` — canonical conversation projection, Jina Reader,
 content-addressed URL imports, ingestion receipts, and Markdown persistence.
+- `kibod/src/journal.rs` — strict shapes and constructors for new durable events.
 - `kibod/src/store.rs` — filesystem layout, event append/read, clip and turn
 idempotency, metadata writes, and crash repair.
 - `kibod/src/workflow.rs` — canonical typed journal projection, lifecycle

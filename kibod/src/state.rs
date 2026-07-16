@@ -1,4 +1,5 @@
 use crate::ai::{Ai, HistoryTurn, TTS_RATE};
+use crate::journal::JournalWrite;
 use crate::knowledge::{self, Document, IngestReceipt, JinaReader, ReaderDocument, WebSource};
 use crate::model::epoch_millis;
 use crate::store::{AutoNameOutcome, Store, hex_sha256};
@@ -7,7 +8,9 @@ use crate::workflow::{
     TranscriptState, TurnAction,
 };
 use anyhow::{Context, Result, anyhow};
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -96,13 +99,17 @@ struct WorkflowPolicy {
 }
 
 struct AttemptFailure<'a> {
-    kind: &'static str,
-    owner_field: &'static str,
-    owner_id: &'a str,
+    subject: AttemptSubject<'a>,
     attempt: u32,
-    stage: FailureStage,
     error: String,
     retryable: bool,
+}
+
+#[derive(Clone, Copy)]
+enum AttemptSubject<'a> {
+    Transcript(&'a str),
+    Reply(&'a str),
+    Speech(&'a str),
 }
 
 impl Default for WorkflowPolicy {
@@ -378,16 +385,21 @@ impl AppState {
         self.channel(project_id, conversation_id).subscribe()
     }
 
-    pub fn publish(&self, project_id: &str, conversation_id: &str, event: Value) {
+    pub(crate) fn publish_persisted(&self, project_id: &str, conversation_id: &str, event: Value) {
         let _ = self.channel(project_id, conversation_id).send(event);
     }
 
-    pub fn append(&self, project_id: &str, conversation_id: &str, event: Value) -> Result<Value> {
+    fn append(
+        &self,
+        project_id: &str,
+        conversation_id: &str,
+        event: JournalWrite,
+    ) -> Result<Value> {
         let event = self
             .inner
             .store
             .append(project_id, conversation_id, event)?;
-        self.publish(project_id, conversation_id, event.clone());
+        self.publish_persisted(project_id, conversation_id, event.clone());
         Ok(event)
     }
 
@@ -395,7 +407,7 @@ impl AppState {
         &self,
         project_id: &str,
         conversation_id: &str,
-        event: Value,
+        event: JournalWrite,
         predicate: F,
     ) -> Result<Option<Value>>
     where
@@ -406,7 +418,7 @@ impl AppState {
             .store
             .append_if(project_id, conversation_id, event, predicate)?;
         if let Some(event) = &event {
-            self.publish(project_id, conversation_id, event.clone());
+            self.publish_persisted(project_id, conversation_id, event.clone());
         }
         Ok(event)
     }
@@ -421,11 +433,7 @@ impl AppState {
                 if let Err(error) = self.append(
                     project_id,
                     conversation_id,
-                    json!({
-                        "kind": "conversation_renamed",
-                        "name": conversation.name,
-                        "source": "transcript"
-                    }),
+                    JournalWrite::conversation_renamed(conversation.name),
                 ) {
                     tracing::error!(%project_id, %conversation_id, "record automatic conversation name: {error:#}");
                 }
@@ -520,7 +528,7 @@ impl AppState {
         self.append_if(
             project_id,
             conversation_id,
-            json!({"kind":"transcript_retry_requested", "clip":clip_id, "reason":reason}),
+            JournalWrite::transcript_retry_requested(clip_id, reason),
             move |records| {
                 matches!(
                     ConversationWorkflow::from_records(records)
@@ -611,10 +619,7 @@ impl AppState {
             let started = self.append_if(
                 project_id,
                 conversation_id,
-                json!({
-                    "kind":"transcript_started", "clip":clip_id,
-                    "attempt":attempt, "stage":"transcription"
-                }),
+                JournalWrite::transcript_started(clip_id, attempt),
                 move |records| {
                     let workflow = ConversationWorkflow::from_records(records);
                     match workflow.clip(&expected_clip).map(|clip| &clip.transcript) {
@@ -643,7 +648,7 @@ impl AppState {
                     let transcript = self.append_if(
                         project_id,
                         conversation_id,
-                        json!({"kind":"transcript", "clip":clip_id, "text":text, "attempt":attempt}),
+                        JournalWrite::transcript_succeeded(clip_id, text, attempt),
                         move |records| {
                             matches!(
                                 ConversationWorkflow::from_records(records)
@@ -662,12 +667,9 @@ impl AppState {
                 }
                 Err(error) => {
                     let event = self.attempt_error_event(
-                        &AttemptFailure {
-                            kind: "transcript_error",
-                            owner_field: "clip",
-                            owner_id: clip_id,
+                        AttemptFailure {
+                            subject: AttemptSubject::Transcript(clip_id),
                             attempt,
-                            stage: FailureStage::Transcription,
                             error: format!("{error:#}"),
                             retryable: self.inner.ai.failure_is_retryable(&error),
                         },
@@ -735,36 +737,60 @@ impl AppState {
         failure: AttemptFailure<'_>,
         policy: &RetryPolicy,
     ) -> Result<()> {
-        let event = self.attempt_error_event(&failure, policy);
+        let event = self.attempt_error_event(failure, policy);
         self.append(project_id, conversation_id, event)?;
         Ok(())
     }
 
-    fn attempt_error_event(&self, failure: &AttemptFailure<'_>, policy: &RetryPolicy) -> Value {
-        let mut event = json!({
-            "error":failure.error, "attempt":failure.attempt,
-            "stage":failure.stage.as_str()
-        });
-        event[failure.owner_field] = failure.owner_id.into();
+    fn attempt_error_event(
+        &self,
+        failure: AttemptFailure<'_>,
+        policy: &RetryPolicy,
+    ) -> JournalWrite {
+        let owner_id = match failure.subject {
+            AttemptSubject::Transcript(clip_id) => clip_id,
+            AttemptSubject::Reply(turn_id) | AttemptSubject::Speech(turn_id) => turn_id,
+        };
         let retry_delay = if failure.retryable {
             policy.retry_delay_after(failure.attempt)
         } else {
             None
         };
         if let Some(delay) = retry_delay {
-            event["kind"] = match failure.stage {
-                FailureStage::Transcription => "transcript_retry_scheduled",
-                FailureStage::Reply => "reply_retry_scheduled",
-                FailureStage::Speech => "speech_retry_scheduled",
+            let retry_at_ms = retry_deadline_ms(delay, owner_id, failure.attempt);
+            match failure.subject {
+                AttemptSubject::Transcript(clip_id) => JournalWrite::transcript_retry_scheduled(
+                    clip_id,
+                    failure.attempt,
+                    failure.error,
+                    retry_at_ms,
+                ),
+                AttemptSubject::Reply(turn_id) => JournalWrite::reply_retry_scheduled(
+                    turn_id,
+                    failure.attempt,
+                    failure.error,
+                    retry_at_ms,
+                ),
+                AttemptSubject::Speech(turn_id) => JournalWrite::speech_retry_scheduled(
+                    turn_id,
+                    failure.attempt,
+                    failure.error,
+                    retry_at_ms,
+                ),
             }
-            .into();
-            event["retry_at_ms"] =
-                retry_deadline_ms(delay, failure.owner_id, failure.attempt).into();
         } else {
-            event["kind"] = failure.kind.into();
-            event["terminal"] = true.into();
+            match failure.subject {
+                AttemptSubject::Transcript(clip_id) => {
+                    JournalWrite::transcript_failed(clip_id, failure.attempt, failure.error)
+                }
+                AttemptSubject::Reply(turn_id) => {
+                    JournalWrite::reply_failed(turn_id, failure.attempt, failure.error)
+                }
+                AttemptSubject::Speech(turn_id) => {
+                    JournalWrite::speech_failed(turn_id, failure.attempt, failure.error)
+                }
+            }
         }
-        event
     }
 
     fn ensure_transcriptions(&self, project_id: &str, conversation_id: &str) -> Result<()> {
@@ -790,7 +816,7 @@ impl AppState {
         self.append_if(
             project_id,
             conversation_id,
-            json!({"kind":"transcript_retry_requested", "clip":clip_id, "reason":reason}),
+            JournalWrite::transcript_retry_requested(clip_id, reason),
             move |records| {
                 matches!(
                     ConversationWorkflow::from_records(records)
@@ -833,7 +859,7 @@ impl AppState {
                 let retry = self.append_if(
                     project_id,
                     conversation_id,
-                    json!({"kind":"transcript_retry_requested", "clip":clip_id, "reason":"turn_retry"}),
+                    JournalWrite::transcript_retry_requested(clip_id, "turn_retry"),
                     move |records| {
                         matches!(
                             ConversationWorkflow::from_records(records)
@@ -857,7 +883,7 @@ impl AppState {
             self.append_if(
                 project_id,
                 conversation_id,
-                json!({"kind":"reply_retry_requested", "turn":turn_id, "reason":"turn_retry"}),
+                JournalWrite::reply_retry_requested(turn_id, "turn_retry"),
                 move |records| {
                     matches!(
                         ConversationWorkflow::from_records(records)
@@ -872,7 +898,7 @@ impl AppState {
             self.append_if(
                 project_id,
                 conversation_id,
-                json!({"kind":"speech_retry_requested", "turn":turn_id, "reason":"turn_retry"}),
+                JournalWrite::speech_retry_requested(turn_id, "turn_retry"),
                 move |records| {
                     matches!(
                         ConversationWorkflow::from_records(records)
@@ -969,11 +995,11 @@ impl AppState {
                     self.append_if(
                         project_id,
                         conversation_id,
-                        json!({
-                            "kind":"reply_error", "turn":turn_id,
-                            "error":format!("one or more claimed clips could not be transcribed: {error}"),
-                            "attempt":1, "terminal":true, "stage":"transcription"
-                        }),
+                        JournalWrite::reply_failed_from_transcription(
+                            &turn_id,
+                            1,
+                            format!("one or more claimed clips could not be transcribed: {error}"),
+                        ),
                         move |records| {
                             matches!(
                                 ConversationWorkflow::from_records(records)
@@ -1027,7 +1053,7 @@ impl AppState {
         self.append(
             project_id,
             conversation_id,
-            json!({"kind":"reply_started", "turn":turn_id, "attempt":attempt, "stage":"reply"}),
+            JournalWrite::reply_started(turn_id, attempt),
         )?;
         let turn = workflow
             .turn(turn_id)
@@ -1037,11 +1063,8 @@ impl AppState {
                 project_id,
                 conversation_id,
                 AttemptFailure {
-                    kind: "reply_error",
-                    owner_field: "turn",
-                    owner_id: turn_id,
+                    subject: AttemptSubject::Reply(turn_id),
                     attempt,
-                    stage: FailureStage::Reply,
                     error: "turn has no clips".into(),
                     retryable: false,
                 },
@@ -1055,7 +1078,7 @@ impl AppState {
             self.append(
                 project_id,
                 conversation_id,
-                json!({"kind":"reply", "turn":turn_id, "text":"[nothing to answer]", "answers":turn.clips}),
+                JournalWrite::reply_text(turn_id, "[nothing to answer]", turn.clips.clone()),
             )?;
             return Ok(());
         }
@@ -1096,13 +1119,14 @@ impl AppState {
                 if let Err(error) = self.append(
                     project_id,
                     conversation_id,
-                    json!({
-                        "kind":"reply", "turn":turn_id, "text":reply.text,
-                        "answers":turn.clips, "audio":format!("tts/{turn_id}.wav"),
-                        "interaction_id":reply.interaction_id,
-                        "speech_generation":generation,
-                        "history_through_seq":history_through_seq
-                    }),
+                    JournalWrite::reply_spoken(
+                        turn_id,
+                        reply.text,
+                        turn.clips.clone(),
+                        reply.interaction_id,
+                        generation,
+                        history_through_seq,
+                    ),
                 ) {
                     if let Some((key, stream)) = prepared {
                         self.discard_speech_endpoint(&key, &stream, &error);
@@ -1115,11 +1139,8 @@ impl AppState {
                     project_id,
                     conversation_id,
                     AttemptFailure {
-                        kind: "reply_error",
-                        owner_field: "turn",
-                        owner_id: turn_id,
+                        subject: AttemptSubject::Reply(turn_id),
                         attempt,
-                        stage: FailureStage::Reply,
                         error: format!("{error:#}"),
                         retryable: self.inner.ai.failure_is_retryable(&error),
                     },
@@ -1158,10 +1179,7 @@ impl AppState {
         if let Err(error) = self.append(
             project_id,
             conversation_id,
-            json!({
-                "kind":"speech_started", "turn":turn_id, "attempt":attempt,
-                "stage":"speech", "generation":generation
-            }),
+            JournalWrite::speech_started(turn_id, attempt, &generation),
         ) {
             if let Some((key, stream)) = prepared {
                 self.discard_speech_endpoint(&key, &stream, &error);
@@ -1183,10 +1201,7 @@ impl AppState {
                 self.append(
                     project_id,
                     conversation_id,
-                    json!({
-                        "kind":"speech_ready", "turn":turn_id,
-                        "samples":samples, "rate":TTS_RATE, "recovered":recovered
-                    }),
+                    JournalWrite::speech_ready(turn_id, samples, TTS_RATE, recovered),
                 )?;
             }
             Err(error) => {
@@ -1194,11 +1209,8 @@ impl AppState {
                     project_id,
                     conversation_id,
                     AttemptFailure {
-                        kind: "tts_error",
-                        owner_field: "turn",
-                        owner_id: turn_id,
+                        subject: AttemptSubject::Speech(turn_id),
                         attempt,
-                        stage: FailureStage::Speech,
                         error: format!("{error:#}"),
                         retryable: self.inner.ai.failure_is_retryable(&error),
                     },
@@ -1270,30 +1282,27 @@ impl AppState {
         let records = self.inner.store.records(project_id, conversation_id)?;
         let workflow = ConversationWorkflow::from_records(&records);
         for (turn_id, stage) in workflow.interrupted_turn_stages() {
-            let kind = match stage {
-                FailureStage::Reply | FailureStage::Transcription => "reply_retry_requested",
-                FailureStage::Speech => "speech_retry_requested",
+            let event = match stage {
+                FailureStage::Reply | FailureStage::Transcription => {
+                    JournalWrite::reply_retry_requested(&turn_id, reason)
+                }
+                FailureStage::Speech => JournalWrite::speech_retry_requested(&turn_id, reason),
             };
             let expected_turn = turn_id.clone();
-            self.append_if(
-                project_id,
-                conversation_id,
-                json!({"kind":kind, "turn":turn_id, "reason":reason}),
-                move |records| {
-                    let workflow = ConversationWorkflow::from_records(records);
-                    let Some(turn) = workflow.turn(&expected_turn) else {
-                        return false;
-                    };
-                    match stage {
-                        FailureStage::Reply | FailureStage::Transcription => {
-                            matches!(turn.reply, ReplyState::Attempting { .. })
-                        }
-                        FailureStage::Speech => {
-                            matches!(turn.speech, Some(SpeechState::Attempting { .. }))
-                        }
+            self.append_if(project_id, conversation_id, event, move |records| {
+                let workflow = ConversationWorkflow::from_records(records);
+                let Some(turn) = workflow.turn(&expected_turn) else {
+                    return false;
+                };
+                match stage {
+                    FailureStage::Reply | FailureStage::Transcription => {
+                        matches!(turn.reply, ReplyState::Attempting { .. })
                     }
-                },
-            )?;
+                    FailureStage::Speech => {
+                        matches!(turn.speech, Some(SpeechState::Attempting { .. }))
+                    }
+                }
+            })?;
         }
         Ok(())
     }
@@ -1323,7 +1332,7 @@ impl AppState {
             self.append_if(
                 project_id,
                 conversation_id,
-                json!({"kind":"transcript_retry_requested", "clip":clip_id, "reason":"startup_recovery"}),
+                JournalWrite::transcript_retry_requested(&clip_id, "startup_recovery"),
                 move |records| {
                     matches!(
                         ConversationWorkflow::from_records(records)
@@ -1335,28 +1344,23 @@ impl AppState {
             )?;
         }
         for (turn_id, stage) in workflow.interrupted_turn_stages() {
-            let kind = if stage == FailureStage::Speech {
-                "speech_retry_requested"
+            let event = if stage == FailureStage::Speech {
+                JournalWrite::speech_retry_requested(&turn_id, "startup_recovery")
             } else {
-                "reply_retry_requested"
+                JournalWrite::reply_retry_requested(&turn_id, "startup_recovery")
             };
             let expected_turn = turn_id.clone();
-            self.append_if(
-                project_id,
-                conversation_id,
-                json!({"kind":kind, "turn":turn_id, "reason":"startup_recovery"}),
-                move |records| {
-                    let workflow = ConversationWorkflow::from_records(records);
-                    let Some(turn) = workflow.turn(&expected_turn) else {
-                        return false;
-                    };
-                    if stage == FailureStage::Speech {
-                        matches!(turn.speech, Some(SpeechState::Attempting { .. }))
-                    } else {
-                        matches!(turn.reply, ReplyState::Attempting { .. })
-                    }
-                },
-            )?;
+            self.append_if(project_id, conversation_id, event, move |records| {
+                let workflow = ConversationWorkflow::from_records(records);
+                let Some(turn) = workflow.turn(&expected_turn) else {
+                    return false;
+                };
+                if stage == FailureStage::Speech {
+                    matches!(turn.speech, Some(SpeechState::Attempting { .. }))
+                } else {
+                    matches!(turn.reply, ReplyState::Attempting { .. })
+                }
+            })?;
         }
         for turn in workflow.turns() {
             if matches!(turn.speech, Some(SpeechState::Succeeded(()))) {
@@ -1369,7 +1373,7 @@ impl AppState {
                     self.append_if(
                         project_id,
                         conversation_id,
-                        json!({"kind":"speech_retry_requested", "turn":turn.id, "reason":"startup_validation"}),
+                        JournalWrite::speech_retry_requested(&turn.id, "startup_validation"),
                         move |records| {
                             matches!(
                                 ConversationWorkflow::from_records(records)
@@ -1580,14 +1584,14 @@ mod tests {
         let conversation = store.create_conversation("kibo", None).unwrap();
         let conversation_id = conversation.id.as_str();
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 conversation_id,
                 json!({"kind":"turn", "id":"turn-1", "clips":["clip-1"]}),
             )
             .unwrap();
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 conversation_id,
                 json!({"kind":"reply", "turn":"turn-1", "text":"Recovered reply", "audio":"tts/turn-1.wav"}),
@@ -1617,7 +1621,9 @@ mod tests {
             json!({"kind":"speech_started", "turn":"turn-1", "attempt":1, "generation":"lost-generation"}),
             json!({"kind":"speech_ready", "turn":"turn-1", "samples":10, "rate":24000}),
         ] {
-            store.append("kibo", conversation_id, event).unwrap();
+            store
+                .append_fixture("kibo", conversation_id, event)
+                .unwrap();
         }
 
         let state = AppState::new(store.clone(), Ai::mock());
@@ -1656,17 +1662,17 @@ mod tests {
             ("clip-2", "turn-2", "second"),
         ] {
             store
-                .append("kibo", conversation_id, json!({"kind":"clip", "id":clip}))
+                .append_fixture("kibo", conversation_id, json!({"kind":"clip", "id":clip}))
                 .unwrap();
             store
-                .append(
+                .append_fixture(
                     "kibo",
                     conversation_id,
                     json!({"kind":"transcript", "clip":clip, "text":text}),
                 )
                 .unwrap();
             store
-                .append(
+                .append_fixture(
                     "kibo",
                     conversation_id,
                     json!({"kind":"turn", "id":turn, "clips":[clip]}),
@@ -1704,7 +1710,7 @@ mod tests {
             1,
         );
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 &transcription.id,
                 json!({"kind":"transcript_started", "clip":"clip-transcription", "attempt":1}),
@@ -1715,24 +1721,24 @@ mod tests {
             .create_conversation("kibo", Some("Interrupted reply"))
             .unwrap();
         store
-            .append("kibo", &reply.id, json!({"kind":"clip", "id":"clip-reply"}))
+            .append_fixture("kibo", &reply.id, json!({"kind":"clip", "id":"clip-reply"}))
             .unwrap();
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 &reply.id,
                 json!({"kind":"transcript", "clip":"clip-reply", "text":"continue"}),
             )
             .unwrap();
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 &reply.id,
                 json!({"kind":"turn", "id":"turn-reply", "clips":["clip-reply"]}),
             )
             .unwrap();
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 &reply.id,
                 json!({"kind":"reply_started", "turn":"turn-reply", "attempt":1}),
@@ -1743,21 +1749,21 @@ mod tests {
             .create_conversation("kibo", Some("Interrupted speech"))
             .unwrap();
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 &speech.id,
                 json!({"kind":"turn", "id":"turn-speech", "clips":[]}),
             )
             .unwrap();
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 &speech.id,
                 json!({"kind":"reply", "turn":"turn-speech", "text":"continue speech", "audio":"tts/turn-speech.wav"}),
             )
             .unwrap();
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 &speech.id,
                 json!({"kind":"speech_started", "turn":"turn-speech", "attempt":1}),
@@ -1804,7 +1810,7 @@ mod tests {
             1,
         );
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 &conversation.id,
                 json!({"kind":"transcript_started", "clip":"clip-1", "attempt":1}),
@@ -1868,7 +1874,7 @@ mod tests {
             1,
         );
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 &conversation.id,
                 json!({
@@ -1917,7 +1923,7 @@ mod tests {
                 recorded_at,
             );
             store
-                .append(
+                .append_fixture(
                     "kibo",
                     &conversation.id,
                     json!({
@@ -1928,7 +1934,7 @@ mod tests {
                 .unwrap();
         }
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 &conversation.id,
                 json!({"kind":"turn", "id":"turn-1", "clips":["clip-1", "clip-2"]}),
@@ -2068,7 +2074,7 @@ mod tests {
 
         put_test_clip(&store, conversation_id, "clip-2", wav, 2);
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 conversation_id,
                 json!({"kind":"transcript", "clip":"clip-2", "text":"second"}),
@@ -2230,7 +2236,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(outcome, crate::store::PutClip::Repaired);
-        state.publish("kibo", &conversation.id, event.unwrap());
+        state.publish_persisted("kibo", &conversation.id, event.unwrap());
         state
             .reconcile_transcriptions("kibo", &conversation.id)
             .unwrap();
@@ -2372,28 +2378,28 @@ mod tests {
         let store = Store::open(temporary.path()).unwrap();
         let conversation = store.create_conversation("kibo", None).unwrap();
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 &conversation.id,
                 json!({"kind":"clip", "id":"clip-1"}),
             )
             .unwrap();
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 &conversation.id,
                 json!({"kind":"transcript", "clip":"clip-1", "text":"retry explicitly"}),
             )
             .unwrap();
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 &conversation.id,
                 json!({"kind":"turn", "id":"turn-1", "clips":["clip-1"]}),
             )
             .unwrap();
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 &conversation.id,
                 json!({"kind":"reply_error", "turn":"turn-1", "attempt":3, "terminal":true, "stage":"reply", "error":"provider rejected"}),
@@ -2449,28 +2455,28 @@ mod tests {
         let conversation = store.create_conversation("kibo", None).unwrap();
         let conversation_id = conversation.id.as_str();
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 conversation_id,
                 json!({"kind":"clip", "id":"clip-1"}),
             )
             .unwrap();
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 conversation_id,
                 json!({"kind":"transcript", "clip":"clip-1", "text":"retry me"}),
             )
             .unwrap();
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 conversation_id,
                 json!({"kind":"turn", "id":"turn-1", "clips":["clip-1"]}),
             )
             .unwrap();
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 conversation_id,
                 json!({"kind":"reply_error", "turn":"turn-1", "error":"legacy outage"}),
@@ -2500,14 +2506,14 @@ mod tests {
         let conversation = store.create_conversation("kibo", None).unwrap();
         let conversation_id = conversation.id.as_str();
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 conversation_id,
                 json!({"kind":"turn", "id":"turn-1", "clips":["clip-1"]}),
             )
             .unwrap();
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 conversation_id,
                 json!({"kind":"reply", "turn":"turn-1", "text":"Recovered speech", "audio":"tts/turn-1.wav"}),
@@ -2515,7 +2521,7 @@ mod tests {
             .unwrap();
         let deadline = epoch_millis() + 250;
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 conversation_id,
                 json!({
@@ -2551,7 +2557,7 @@ mod tests {
             .create_conversation("kibo", Some("Design notes"))
             .unwrap();
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 &conversation.id,
                 json!({"kind":"transcript", "clip":"clip-1", "text":"Keep raw sources separate from generated notes."}),
@@ -2573,7 +2579,7 @@ mod tests {
         ));
 
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 &conversation.id,
                 json!({"kind":"speech_ready", "turn":"turn-1", "samples":10, "rate":24000}),

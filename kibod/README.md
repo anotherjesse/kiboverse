@@ -23,7 +23,9 @@ kibo-data/
 
 `turns.jsonl` is the durable source of truth and has one monotonic `seq` per
 conversation. Blob files are synced and renamed before their events are
-appended. The Gemini `interaction_id` saved on replies is only a continuation
+appended. New events use strict typed write constructors; historical reads stay
+open so legacy and unknown records can still be projected or recovered. The
+Gemini `interaction_id` saved on replies is only a continuation
 cache. New replies persist the latest durable reply sequence covered by that
 provider context; out-of-order recovery invalidates an unproven legacy anchor.
 If the cache is absent, stale, or rejected, kibod reconstructs context from

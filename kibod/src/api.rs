@@ -130,7 +130,7 @@ async fn put_clip(
             }
         })?;
     if let Some(event) = event {
-        state.publish(&project_id, &conversation_id, event);
+        state.publish_persisted(&project_id, &conversation_id, event);
     }
     state
         .reconcile_transcriptions(&project_id, &conversation_id)
@@ -169,7 +169,7 @@ async fn create_turn(
         })?;
     let (status, clips, created) = match outcome {
         CreateTurnOutcome::Created { record, clips } => {
-            state.publish(&project_id, &conversation_id, record);
+            state.publish_persisted(&project_id, &conversation_id, record);
             (StatusCode::ACCEPTED, clips, true)
         }
         CreateTurnOutcome::Existing { clips, .. } => (StatusCode::OK, clips, false),
@@ -626,7 +626,9 @@ mod tests {
                 "kind":"speech_ready", "turn":"turn-1", "samples":2, "rate":24000
             }),
         ] {
-            store.append("kibo", &conversation.id, event).unwrap();
+            store
+                .append_fixture("kibo", &conversation.id, event)
+                .unwrap();
         }
         let path = store
             .speech_path("kibo", &conversation.id, "turn-1")

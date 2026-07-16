@@ -1,7 +1,9 @@
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FailureStage {
     Transcription,
     Reply,
@@ -9,14 +11,6 @@ pub enum FailureStage {
 }
 
 impl FailureStage {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Transcription => "transcription",
-            Self::Reply => "reply",
-            Self::Speech => "speech",
-        }
-    }
-
     fn parse(value: Option<&str>, default: Self) -> Self {
         match value {
             Some("transcription") => Self::Transcription,

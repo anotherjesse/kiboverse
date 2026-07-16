@@ -1,5 +1,6 @@
 pub mod ai;
 pub mod api;
+mod journal;
 pub mod knowledge;
 pub mod model;
 pub mod state;

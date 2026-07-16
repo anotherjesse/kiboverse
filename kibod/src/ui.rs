@@ -817,7 +817,7 @@ mod tests {
         let store = Store::open(temporary.path()).unwrap();
         let conversation = store.create_conversation("kibo", Some("Research")).unwrap();
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 &conversation.id,
                 serde_json::json!({"kind":"transcript", "clip":"clip-1", "text":"A testable source"}),
@@ -841,7 +841,7 @@ mod tests {
         let store = Store::open(temporary.path()).unwrap();
         let conversation = store.create_conversation("kibo", Some("Safety")).unwrap();
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 &conversation.id,
                 serde_json::json!({"kind":"transcript", "clip":"clip-1", "text":"safe input"}),

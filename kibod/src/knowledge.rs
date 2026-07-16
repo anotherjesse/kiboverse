@@ -661,7 +661,7 @@ mod tests {
         let store = Store::open(temporary.path()).unwrap();
         let conversation = store.create_conversation("kibo", Some("Ideas")).unwrap();
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 &conversation.id,
                 json!({"kind":"transcript", "clip":"c1", "text":"A useful idea"}),
@@ -669,7 +669,7 @@ mod tests {
             .unwrap();
         let before = conversation_document(&store, "kibo", &conversation.id).unwrap();
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 &conversation.id,
                 json!({"kind":"speech_ready", "turn":"t1", "samples":10, "rate":24000}),

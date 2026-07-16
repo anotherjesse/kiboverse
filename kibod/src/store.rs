@@ -1,9 +1,12 @@
+use crate::journal::JournalWrite;
 use crate::model::{
     ConversationNameSource, KiboConversation, KiboProject, epoch, make_id, valid_id,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use fs2::FileExt;
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -330,7 +333,12 @@ impl Store {
         read_jsonl(&path)
     }
 
-    pub fn append(&self, project_id: &str, conversation_id: &str, record: Value) -> Result<Value> {
+    pub(crate) fn append(
+        &self,
+        project_id: &str,
+        conversation_id: &str,
+        record: JournalWrite,
+    ) -> Result<Value> {
         self.conversation(project_id, conversation_id)?;
         let lock = self.conversation_lock(project_id, conversation_id);
         let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -341,11 +349,11 @@ impl Store {
     /// holds. The read, decision, and append share the conversation lock, so a
     /// dependent worker cannot publish a stale terminal event after the event
     /// that invalidated it.
-    pub fn append_if<F>(
+    pub(crate) fn append_if<F>(
         &self,
         project_id: &str,
         conversation_id: &str,
-        record: Value,
+        record: JournalWrite,
         predicate: F,
     ) -> Result<Option<Value>>
     where
@@ -363,6 +371,15 @@ impl Store {
     }
 
     fn append_unlocked(
+        &self,
+        project_id: &str,
+        conversation_id: &str,
+        record: JournalWrite,
+    ) -> Result<Value> {
+        self.append_value_unlocked(project_id, conversation_id, record.into_value()?)
+    }
+
+    fn append_value_unlocked(
         &self,
         project_id: &str,
         conversation_id: &str,
@@ -391,6 +408,43 @@ impl Store {
         append_jsonl(&path, &record)?;
         self.record_activity_best_effort(project_id, conversation_id, record["at"].as_u64());
         Ok(record)
+    }
+
+    /// Raw journal input is deliberately available only to tests that need to
+    /// model legacy, malformed, unknown, or externally written records.
+    #[cfg(test)]
+    pub(crate) fn append_fixture(
+        &self,
+        project_id: &str,
+        conversation_id: &str,
+        record: Value,
+    ) -> Result<Value> {
+        self.conversation(project_id, conversation_id)?;
+        let lock = self.conversation_lock(project_id, conversation_id);
+        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.append_value_unlocked(project_id, conversation_id, record)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn append_fixture_if<F>(
+        &self,
+        project_id: &str,
+        conversation_id: &str,
+        record: Value,
+        predicate: F,
+    ) -> Result<Option<Value>>
+    where
+        F: FnOnce(&[Value]) -> bool,
+    {
+        self.conversation(project_id, conversation_id)?;
+        let lock = self.conversation_lock(project_id, conversation_id);
+        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let records = self.records_unlocked(project_id, conversation_id)?;
+        if !predicate(&records) {
+            return Ok(None);
+        }
+        self.append_value_unlocked(project_id, conversation_id, record)
+            .map(Some)
     }
 
     #[cfg(test)]
@@ -435,11 +489,10 @@ impl Store {
                     let event = self.append_unlocked(
                         upload.project_id,
                         upload.conversation_id,
-                        json!({
-                            "kind":"transcript_retry_requested",
-                            "clip":upload.clip_id,
-                            "reason":"payload_repaired"
-                        }),
+                        JournalWrite::transcript_retry_requested(
+                            upload.clip_id,
+                            "payload_repaired",
+                        ),
                     )?;
                     write_clip_atomic(&directory, upload.clip_id, upload.bytes)?;
                     return Ok((PutClip::Repaired, Some(event)));
@@ -462,25 +515,17 @@ impl Store {
 
         let path = directory.join("turns.jsonl");
         repair_jsonl_tail(&path)?;
-        let seq = next_seq(&path)?;
-        let record = json!({
-            "kind": "clip",
-            "seq": seq,
-            "at": epoch(),
-            "id": upload.clip_id,
-            "file": format!("clips/{filename}"),
-            "mime": "audio/wav",
-            "ms": upload.duration_ms,
-            "peak": upload.peak_pct,
-            "recorded_at": upload.recorded_at,
-            "sha256": actual_sha,
-        });
-        append_jsonl(&path, &record)?;
-        self.record_activity_best_effort(
+        let record = self.append_unlocked(
             upload.project_id,
             upload.conversation_id,
-            record["at"].as_u64(),
-        );
+            JournalWrite::clip(
+                upload.clip_id,
+                upload.duration_ms,
+                upload.peak_pct,
+                upload.recorded_at,
+                actual_sha,
+            ),
+        )?;
         Ok((PutClip::Created, Some(record)))
     }
 
@@ -551,15 +596,11 @@ impl Store {
         if clips.is_empty() {
             return Err(NoPendingClips.into());
         }
-        let record = json!({
-            "kind": "turn",
-            "seq": next_seq(&path)?,
-            "at": epoch(),
-            "id": turn_id,
-            "clips": clips,
-        });
-        append_jsonl(&path, &record)?;
-        self.record_activity_best_effort(project_id, conversation_id, record["at"].as_u64());
+        let record = self.append_unlocked(
+            project_id,
+            conversation_id,
+            JournalWrite::turn(turn_id, clips),
+        )?;
         Ok(CreateTurnOutcome::Created {
             clips: turn_clips(&record)?,
             record,
@@ -879,10 +920,10 @@ mod tests {
     fn append_sequence_is_durable_for_existing_general_data() {
         let (_temporary, store) = store_with_general();
         let one = store
-            .append("kibo", "general", json!({"kind":"one"}))
+            .append_fixture("kibo", "general", json!({"kind":"one"}))
             .unwrap();
         let two = store
-            .append("kibo", "general", json!({"kind":"two"}))
+            .append_fixture("kibo", "general", json!({"kind":"two"}))
             .unwrap();
         assert_eq!(one["seq"], 1);
         assert_eq!(two["seq"], 2);
@@ -982,7 +1023,7 @@ mod tests {
     fn append_recovers_an_incomplete_final_jsonl_record() {
         let (_temporary, store) = store_with_general();
         store
-            .append("kibo", "general", json!({"kind":"one"}))
+            .append_fixture("kibo", "general", json!({"kind":"one"}))
             .unwrap();
         let path = store
             .conversation_dir("kibo", "general")
@@ -996,7 +1037,7 @@ mod tests {
 
         assert_eq!(store.records("kibo", "general").unwrap().len(), 1);
         let two = store
-            .append("kibo", "general", json!({"kind":"two"}))
+            .append_fixture("kibo", "general", json!({"kind":"two"}))
             .unwrap();
         assert_eq!(two["seq"], 2);
         assert_eq!(store.records("kibo", "general").unwrap().len(), 2);
@@ -1042,7 +1083,7 @@ mod tests {
                 std::thread::spawn(move || {
                     for event in 0..5 {
                         store
-                            .append(
+                            .append_fixture(
                                 "kibo",
                                 "general",
                                 json!({"kind":"concurrent", "thread":thread, "event":event}),
@@ -1071,7 +1112,7 @@ mod tests {
     fn concurrent_conditional_appends_commit_one_reopen_transition() {
         let (_temporary, store) = store_with_general();
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 "general",
                 json!({"kind":"transcript_error", "clip":"clip-1", "terminal":true}),
@@ -1085,7 +1126,7 @@ mod tests {
                 std::thread::spawn(move || {
                     barrier.wait();
                     store
-                        .append_if(
+                        .append_fixture_if(
                             "kibo",
                             "general",
                             json!({"kind":"transcript_retry_requested", "clip":"clip-1"}),
@@ -1240,7 +1281,7 @@ mod tests {
         store.write_conversation(&newer).unwrap();
 
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 &older.id,
                 json!({"kind":"reply", "at":10, "turn":"turn-1", "text":"hello"}),
@@ -1262,10 +1303,10 @@ mod tests {
         conversation.last_activity_at = 1;
         store.write_conversation(&conversation).unwrap();
         store
-            .append("kibo", &conversation.id, json!({"kind":"one", "at":40}))
+            .append_fixture("kibo", &conversation.id, json!({"kind":"one", "at":40}))
             .unwrap();
         store
-            .append("kibo", &conversation.id, json!({"kind":"two", "at":30}))
+            .append_fixture("kibo", &conversation.id, json!({"kind":"two", "at":30}))
             .unwrap();
         let metadata_path = store
             .conversation_dir("kibo", &conversation.id)
@@ -1294,7 +1335,7 @@ mod tests {
         store.fail_activity_writes.store(true, Ordering::Relaxed);
 
         store
-            .append("kibo", &conversation.id, json!({"kind":"note", "at":50}))
+            .append_fixture("kibo", &conversation.id, json!({"kind":"note", "at":50}))
             .unwrap();
         let bytes = b"RIFF tiny fake wav";
         let sha = hex_sha256(bytes);
@@ -1403,7 +1444,7 @@ mod tests {
         let conversation = store.create_conversation("kibo", None).unwrap();
         for text in ["", "[silent]", "  [mock transcript]  "] {
             store
-                .append(
+                .append_fixture(
                     "kibo",
                     &conversation.id,
                     json!({"kind":"transcript", "clip":"ignored", "text":text}),
@@ -1418,7 +1459,7 @@ mod tests {
         ));
 
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 &conversation.id,
                 json!({
@@ -1438,7 +1479,7 @@ mod tests {
         assert_eq!(named.name_source, ConversationNameSource::Transcript);
 
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 &conversation.id,
                 json!({"kind":"transcript", "clip":"later", "text":"A different title"}),
@@ -1459,7 +1500,7 @@ mod tests {
         let conversation = store.create_conversation("kibo", None).unwrap();
         let long_word = "é".repeat(80);
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 &conversation.id,
                 json!({"kind":"transcript", "clip":"one", "text":long_word}),
@@ -1481,7 +1522,7 @@ mod tests {
         let store = Store::open(temporary.path()).unwrap();
         let conversation = store.create_conversation("kibo", None).unwrap();
         store
-            .append(
+            .append_fixture(
                 "kibo",
                 &conversation.id,
                 json!({"kind":"transcript", "clip":"one", "text":"Stable title"}),

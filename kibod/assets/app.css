@@ -37,10 +37,12 @@ a {
 .app-shell {
   display: grid;
   grid-template-columns: minmax(14rem, 18rem) minmax(0, 1fr);
-  min-height: 100vh;
+  height: 100vh;
+  overflow: hidden;
 }
 
 .sidebar {
+  overflow-y: auto;
   padding: 2rem 1.25rem;
   border-right: 1px solid var(--line);
   background: rgba(249, 247, 240, 0.68);
@@ -113,22 +115,27 @@ a {
 }
 .new-item button { justify-self: start; border: 0; color: var(--moss-dark); background: none; cursor: pointer; }
 .mode-badge { margin-left: 0.45rem; color: var(--coral); }
-.clip-audio audio { width: min(100%, 20rem); height: 2rem; margin-top: 0.7rem; }
 .error-text { color: #a53a2b; font-size: 0.82rem; }
 .thinking { color: var(--muted); }
 
 .main {
-  width: min(100%, 64rem);
-  margin: 0 auto;
-  padding: clamp(1.25rem, 4vw, 3.75rem);
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  min-height: 0;
+  overflow: hidden;
+  padding: 0 clamp(1.25rem, 4vw, 3.75rem);
 }
 
 .conversation-header {
   display: flex;
+  flex: none;
   align-items: flex-end;
   justify-content: space-between;
   gap: 1.5rem;
-  margin-bottom: 2rem;
+  width: min(100%, 64rem);
+  margin: 0 auto;
+  padding: clamp(1.25rem, 4vw, 3.75rem) 0 1.5rem;
 }
 
 h1 {
@@ -166,8 +173,12 @@ h1 {
 
 .timeline {
   display: grid;
-  gap: 1rem;
-  min-height: 12rem;
+  flex: 1 1 auto;
+  gap: 0.5rem;
+  min-height: 0;
+  width: min(100%, 64rem);
+  margin: 0 auto;
+  overflow-y: auto;
   padding-bottom: 13rem;
 }
 
@@ -182,18 +193,18 @@ h1 {
 .message {
   position: relative;
   max-width: 48rem;
-  padding: 1rem 1.15rem;
+  padding: 0.6rem 0.9rem;
   border: 1px solid var(--line);
-  border-radius: 1rem 1rem 1rem 0.3rem;
+  border-radius: 0.9rem 0.9rem 0.9rem 0.3rem;
   background: var(--panel);
-  box-shadow: 0 7px 22px rgba(45, 50, 43, 0.045);
+  box-shadow: 0 6px 18px rgba(45, 50, 43, 0.04);
 }
 
 .event[data-kind="clip"],
 .event[data-role="user"],
 .message.user {
   justify-self: end;
-  border-radius: 1rem 1rem 0.3rem 1rem;
+  border-radius: 0.9rem 0.9rem 0.3rem 0.9rem;
   background: rgba(218, 235, 226, 0.82);
 }
 
@@ -276,8 +287,7 @@ h1 {
 }
 
 #record-button:focus-visible,
-#turn-button:focus-visible,
-.audio-controls button:focus-visible {
+#turn-button:focus-visible {
   outline: 3px solid rgba(31, 107, 82, 0.35);
   outline-offset: 3px;
 }
@@ -320,28 +330,33 @@ h1 {
 #turn-button:hover { background: var(--moss-dark); }
 #turn-button:disabled { cursor: wait; opacity: 0.52; }
 
-.audio-controls {
-  display: flex;
-  align-items: center;
-  gap: 0.45rem;
-  margin-top: 0.8rem;
-}
-
-.audio-controls button {
-  min-height: 2rem;
-  padding: 0.3rem 0.65rem;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.62);
+/* Click-to-play bubbles: the whole bubble is the toggle (mine on the right,
+   replies on the left). Playing state is just a subtle background shift. */
+.clip,
+.message.assistant[data-speech-player] {
   cursor: pointer;
+  transition: transform 120ms ease, box-shadow 120ms ease, background 120ms ease;
 }
 
-.audio-controls button:hover { border-color: rgba(31, 107, 82, 0.4); }
-.audio-position { min-width: 2.5rem; color: var(--muted); font-size: 0.76rem; font-variant-numeric: tabular-nums; }
+.clip:hover,
+.message.assistant[data-speech-player]:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 10px 24px rgba(45, 50, 43, 0.09);
+}
+
+.clip:focus-visible,
+.message.assistant[data-speech-player]:focus-visible {
+  outline: 3px solid rgba(31, 107, 82, 0.35);
+  outline-offset: 3px;
+}
+
+.clip[data-state="playing"] { background: rgba(198, 227, 213, 0.95); }
+.message.assistant[data-state="playing"],
+.message.assistant[data-state="loading"] { background: rgba(232, 240, 235, 0.96); }
 
 @media (max-width: 720px) {
-  .app-shell { display: block; }
-  .sidebar { padding: 0.75rem 1rem; border-right: 0; border-bottom: 1px solid var(--line); }
+  .app-shell { display: block; height: auto; overflow: visible; }
+  .sidebar { overflow: visible; padding: 0.75rem 1rem; border-right: 0; border-bottom: 1px solid var(--line); }
   .brand { margin: 0; }
   .sidebar .nav-label { display: none; }
   .sidebar .nav-list {
@@ -353,8 +368,13 @@ h1 {
   }
   .sidebar .nav-list a { white-space: nowrap; }
   .sidebar .new-item { display: inline-block; margin-right: 1rem; }
-  .main { padding: 1.5rem 1rem; }
-  .conversation-header { align-items: flex-start; }
+  .main { display: block; height: auto; overflow: visible; padding: 1.5rem 1rem; }
+  .conversation-header {
+    align-items: flex-start;
+    width: auto;
+    margin: 0 0 1.5rem;
+    padding: 0;
+  }
   .composer {
     right: 0.75rem;
     bottom: max(0.75rem, env(safe-area-inset-bottom));
@@ -362,7 +382,12 @@ h1 {
     width: auto;
   }
   #record-button { width: 3.5rem; height: 3.5rem; }
-  .timeline { padding-bottom: 11rem; }
+  .timeline {
+    width: auto;
+    margin: 0;
+    overflow: visible;
+    padding-bottom: 11rem;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

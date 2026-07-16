@@ -273,11 +273,11 @@ fn render_timeline(project_id: &str, conversation_id: &str, records: &[Value]) -
             ));
         } else if let Some(error) = reply_errors.get(turn_id) {
             html.push_str(&format!(
-                "<article class=\"message error\"><div class=\"message-meta\">Kibo · reply failed</div><p>{}</p></article>",
+                "<article class=\"message assistant\"><p class=\"error-text\">{}</p></article>",
                 escape(error["error"].as_str().unwrap_or("Unknown error"))
             ));
         } else {
-            html.push_str("<article class=\"message\"><div class=\"message-meta\">Kibo</div><p class=\"thinking\">Thinking…</p></article>");
+            html.push_str("<article class=\"message assistant\"><p class=\"thinking\">Thinking…</p></article>");
         }
     }
 
@@ -307,48 +307,49 @@ fn render_user_message(
     transcripts: &HashMap<&str, &Value>,
     transcript_errors: &HashMap<&str, &Value>,
 ) -> String {
-    let mut parts = Vec::new();
-    let mut audio = String::new();
+    let mut html = String::new();
     for clip_id in clip_ids {
-        if let Some(transcript) = transcripts.get(clip_id) {
-            parts.push(escape(transcript["text"].as_str().unwrap_or("")));
+        let text = if let Some(transcript) = transcripts.get(clip_id) {
+            escape(transcript["text"].as_str().unwrap_or(""))
         } else if let Some(error) = transcript_errors.get(clip_id) {
-            parts.push(format!(
+            format!(
                 "<span class=\"error-text\">Transcription failed: {}</span>",
                 escape(error["error"].as_str().unwrap_or("unknown error"))
+            )
+        } else {
+            "<span class=\"thinking\">Transcribing…</span>".into()
+        };
+        if clips.contains_key(clip_id) {
+            html.push_str(&format!(
+                "<article class=\"message user clip\" data-clip data-state=\"paused\" role=\"button\" tabindex=\"0\" aria-label=\"Play recording\"><p>{}</p><audio preload=\"none\" src=\"/v1/projects/{}/conversations/{}/clips/{}/audio\"></audio></article>",
+                text,
+                url_component(project_id), url_component(conversation_id), url_component(clip_id)
             ));
         } else {
-            parts.push("<span class=\"thinking\">Transcribing…</span>".into());
-        }
-        if clips.contains_key(clip_id) {
-            audio.push_str(&format!(
-                "<audio controls preload=\"none\" src=\"/v1/projects/{}/conversations/{}/clips/{}/audio\"></audio>",
-                url_component(project_id), url_component(conversation_id), url_component(clip_id)
+            html.push_str(&format!(
+                "<article class=\"message user\"><p>{}</p></article>",
+                text
             ));
         }
     }
-    format!(
-        "<article class=\"message user\"><div class=\"message-meta\">You · {} recording{}</div><p>{}</p><div class=\"clip-audio\">{}</div></article>",
-        clip_ids.len(),
-        if clip_ids.len() == 1 { "" } else { "s" },
-        parts.join("<br>"),
-        audio
-    )
+    html
 }
 
 fn render_reply(turn_id: &str, reply: &Value, tts_failed: bool) -> String {
-    let audio = if tts_failed || reply["audio"].is_null() {
-        "<span class=\"error-text\">Speech unavailable</span>".into()
-    } else {
-        format!(
-            "<div class=\"audio-controls\" data-speech-player data-turn-id=\"{}\"><button type=\"button\" data-audio-action=\"toggle\">Play</button><button type=\"button\" data-audio-action=\"rewind\" data-seconds=\"10\">−10s</button><button type=\"button\" data-audio-action=\"restart\">Restart</button><span class=\"audio-position\" data-audio-position>0:00</span></div>",
-            escape_attr(turn_id)
-        )
-    };
+    let text = escape(reply["text"].as_str().unwrap_or(""));
+    if tts_failed {
+        return format!(
+            "<article class=\"message assistant\"><p>{}</p><span class=\"error-text\">Speech unavailable</span></article>",
+            text
+        );
+    }
+    if reply["audio"].is_null() {
+        return format!("<article class=\"message assistant\"><p>{}</p></article>", text);
+    }
     format!(
-        "<article class=\"message assistant\"><div class=\"message-meta\">Kibo</div><p>{}</p>{}</article>",
-        escape(reply["text"].as_str().unwrap_or("")),
-        audio
+        "<article class=\"message assistant\" data-speech-player data-turn-id=\"{}\" role=\"button\" tabindex=\"0\" aria-label=\"Play reply\"><p>{}</p></article>",
+        escape_attr(turn_id),
+        text
     )
 }
 

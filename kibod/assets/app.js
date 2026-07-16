@@ -849,17 +849,59 @@
     return players.get(turnId);
   }
 
-  document.addEventListener("click", (event) => {
-    const button = event.target.closest("[data-audio-action]");
-    if (!button) return;
-    const controls = button.closest("[data-speech-player]");
-    const turnId = controls?.dataset.turnId;
+  // Both a recording and a reply are click-to-play: the whole bubble is the
+  // toggle, with no separate controls. A recording drives a plain hidden
+  // <audio>; a reply drives its streaming PcmPlayer and restarts from the top
+  // on each fresh click (replay). The global capture-phase "play" handler and
+  // PcmPlayer both pause anything else, so only one thing plays at a time.
+  function finishingSelection(bubble) {
+    const selection = window.getSelection?.();
+    return !!selection && !selection.isCollapsed && bubble.contains(selection.anchorNode);
+  }
+
+  function toggleClip(bubble) {
+    const audio = bubble.querySelector("audio");
+    if (!audio) return;
+    if (audio.paused) audio.play().catch(() => {});
+    else audio.pause();
+  }
+
+  function toggleReply(bubble) {
+    const turnId = bubble.dataset.turnId;
     if (!turnId) return;
     const player = playerFor(turnId);
-    if (button.dataset.audioAction === "toggle") player.toggle();
-    if (button.dataset.audioAction === "rewind") player.rewind(Number(button.dataset.seconds || 10));
-    if (button.dataset.audioAction === "restart") player.restart();
+    if (player.playing || playbackPendingFor(player)) player.toggle();
+    else player.restart();
+  }
+
+  document.addEventListener("click", (event) => {
+    const clip = event.target.closest("[data-clip]");
+    if (clip) {
+      if (!finishingSelection(clip)) toggleClip(clip);
+      return;
+    }
+    const reply = event.target.closest("[data-speech-player]");
+    if (reply && !finishingSelection(reply)) toggleReply(reply);
   });
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    const clip = event.target.closest?.("[data-clip]");
+    if (clip) { event.preventDefault(); toggleClip(clip); return; }
+    const reply = event.target.closest?.("[data-speech-player]");
+    if (reply) { event.preventDefault(); toggleReply(reply); }
+  });
+
+  for (const type of ["play", "playing", "pause", "ended"]) {
+    document.addEventListener(type, (event) => {
+      if (!(event.target instanceof HTMLAudioElement)) return;
+      const bubble = event.target.closest("[data-clip]");
+      if (!bubble) return;
+      const playing = (type === "play" || type === "playing") && !event.target.paused;
+      bubble.dataset.state = playing ? "playing" : "paused";
+      bubble.setAttribute("aria-label", playing ? "Pause recording" : "Play recording");
+    }, true);
+  }
 
   function scheduleTimelineRefresh() {
     clearTimeout(refreshTimer);

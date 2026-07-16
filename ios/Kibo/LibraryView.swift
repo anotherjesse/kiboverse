@@ -41,7 +41,7 @@ struct LibraryView: View {
                     NavigationLink(value: conversation.id) {
                         VStack(alignment: .leading, spacing: 3) {
                             Text(conversation.name)
-                            Text(conversation.nameSource ?? "conversation")
+                            Text(conversation.name_source?.rawValue ?? "conversation")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                     }

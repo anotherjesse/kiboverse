@@ -76,13 +76,16 @@ actor KiboAPI {
     }
 
     func createProject(name: String) async throws -> KiboProject {
-        try await request(path: ["v1", "projects"], method: "POST", json: ["name": name], as: KiboProject.self)
+        try await request(
+            path: ["v1", "projects"], method: "POST",
+            json: CreateNamed(name: name), as: KiboProject.self
+        )
     }
 
     func createConversation(projectID: String, name: String? = nil) async throws -> KiboConversation {
         try await request(
             path: ["v1", "projects", projectID, "conversations"], method: "POST",
-            json: name.map { ["name": $0] } ?? [:], as: KiboConversation.self
+            json: CreateConversation(name: name), as: KiboConversation.self
         )
     }
 
@@ -100,14 +103,16 @@ actor KiboAPI {
         request.setValue(String(max(0, min(100, peakPct))), forHTTPHeaderField: "X-Peak-Pct")
         request.setValue(String(recordedAt), forHTTPHeaderField: "X-Recorded-At")
         request.setValue(digest, forHTTPHeaderField: "X-Content-Sha256")
-        let (_, response) = try await session.upload(for: request, from: data)
-        try validate(response: response, data: nil)
+        let (responseData, response) = try await session.upload(for: request, from: data)
+        try validate(response: response, data: responseData)
+        do { _ = try decoder.decode(PutClipResponse.self, from: responseData) }
+        catch { throw APIError.invalidResponse }
     }
 
     func submitTurn(projectID: String, conversationID: String, turnID: String) async throws {
         let _: TurnResponse = try await request(
             path: ["v1", "projects", projectID, "conversations", conversationID, "turns"],
-            method: "POST", json: ["turn_id": turnID], as: TurnResponse.self
+            method: "POST", json: CreateTurn(turn_id: turnID), as: TurnResponse.self
         )
     }
 
@@ -182,12 +187,28 @@ actor KiboAPI {
     }
 
     private func request<T: Decodable>(
-        path: [String], query: [URLQueryItem] = [], method: String = "GET",
-        json: [String: String]? = nil, as type: T.Type
+        path: [String], query: [URLQueryItem] = [], method: String = "GET", as type: T.Type
+    ) async throws -> T {
+        try await request(path: path, query: query, method: method, body: nil, as: type)
+    }
+
+    private func request<Payload: Encodable, T: Decodable>(
+        path: [String], query: [URLQueryItem] = [], method: String,
+        json: Payload, as type: T.Type
+    ) async throws -> T {
+        try await request(
+            path: path, query: query, method: method,
+            body: try encoder.encode(json), as: type
+        )
+    }
+
+    private func request<T: Decodable>(
+        path: [String], query: [URLQueryItem], method: String,
+        body: Data?, as type: T.Type
     ) async throws -> T {
         var request = try makeRequest(path: path, query: query, method: method)
-        if let json {
-            request.httpBody = try encoder.encode(json)
+        if let body {
+            request.httpBody = body
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         }
         let (data, response) = try await session.data(for: request)
@@ -229,9 +250,4 @@ actor KiboAPI {
         parts.path = path.isEmpty ? "/" : "/\(path)"
         return parts.url
     }
-}
-
-private struct TurnResponse: Codable {
-    let turnId: String
-    enum CodingKeys: String, CodingKey { case turnId = "turn_id" }
 }

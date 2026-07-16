@@ -50,7 +50,8 @@ final class KiboAPITests: XCTestCase {
             XCTAssertEqual(request.value(forHTTPHeaderField: "X-Peak-Pct"), "42")
             XCTAssertEqual(request.value(forHTTPHeaderField: "X-Recorded-At"), "1234")
             XCTAssertEqual(request.value(forHTTPHeaderField: "X-Content-Sha256")?.count, 64)
-            return (HTTPURLResponse(url: request.url!, statusCode: 201, httpVersion: nil, headerFields: nil)!, Data())
+            let body = #"{"clip_id":"clip-1","created":true}"#.data(using: .utf8)!
+            return (HTTPURLResponse(url: request.url!, statusCode: 201, httpVersion: nil, headerFields: nil)!, body)
         }
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".wav")
         try Data(repeating: 0, count: 44).write(to: url)
@@ -575,7 +576,9 @@ final class KiboAPITests: XCTestCase {
                     _ = releaseFirstUpload.wait(timeout: .now() + 2)
                 }
                 lock.withLock { activeUploads -= 1 }
-                return (HTTPURLResponse(url: request.url!, statusCode: 201, httpVersion: nil, headerFields: nil)!, Data())
+                let clipID = request.url!.lastPathComponent
+                let body = #"{"clip_id":"\#(clipID)","created":true}"#.data(using: .utf8)!
+                return (HTTPURLResponse(url: request.url!, statusCode: 201, httpVersion: nil, headerFields: nil)!, body)
             }
             let body = #"{"events":[],"latest_seq":0}"#.data(using: .utf8)!
             return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, body)
@@ -630,8 +633,8 @@ final class KiboAPITests: XCTestCase {
 
     func testSavedWatchProjectWinsOverFirstProject() throws {
         let projects = [
-            KiboProject(id: "first", name: "First", createdAt: 1),
-            KiboProject(id: "remembered", name: "Remembered", createdAt: 2),
+            KiboProject(id: "first", name: "First", created_at: 1),
+            KiboProject(id: "remembered", name: "Remembered", created_at: 2),
         ]
         XCTAssertEqual(
             ProjectSelection.preferred(in: projects, savedID: "remembered")?.id,

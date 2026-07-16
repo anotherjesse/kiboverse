@@ -1,4 +1,6 @@
-use crate::model::{Conversation, ConversationNameSource, Project, epoch, make_id, valid_id};
+use crate::model::{
+    ConversationNameSource, KiboConversation, KiboProject, epoch, make_id, valid_id,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use fs2::FileExt;
 use serde_json::{Value, json};
@@ -34,8 +36,8 @@ pub enum CreateTurnOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AutoNameOutcome {
-    Named(Conversation),
-    Unchanged(Conversation),
+    Named(KiboConversation),
+    Unchanged(KiboConversation),
 }
 
 #[derive(Debug)]
@@ -105,7 +107,7 @@ impl Store {
 
     fn ensure_starter(&self) -> Result<()> {
         if self.list_projects()?.is_empty() {
-            let project = Project {
+            let project = KiboProject {
                 id: "kibo".into(),
                 name: "Kibo".into(),
                 created_at: epoch(),
@@ -163,7 +165,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn list_projects(&self) -> Result<Vec<Project>> {
+    pub fn list_projects(&self) -> Result<Vec<KiboProject>> {
         let mut projects = Vec::new();
         for entry in fs::read_dir(self.root.join("projects"))? {
             let path = entry?.path().join("project.json");
@@ -171,19 +173,19 @@ impl Store {
                 projects.push(read_json(&path)?);
             }
         }
-        projects.sort_by_key(|project: &Project| project.created_at);
+        projects.sort_by_key(|project: &KiboProject| project.created_at);
         Ok(projects)
     }
 
-    pub fn project(&self, id: &str) -> Result<Project> {
+    pub fn project(&self, id: &str) -> Result<KiboProject> {
         self.check_id(id)?;
         read_json(&self.project_dir(id).join("project.json"))
             .with_context(|| format!("project {id} does not exist"))
     }
 
-    pub fn create_project(&self, name: &str) -> Result<Project> {
+    pub fn create_project(&self, name: &str) -> Result<KiboProject> {
         let name = clean_name(name)?;
-        let project = Project {
+        let project = KiboProject {
             id: make_id(name),
             name: name.into(),
             created_at: epoch(),
@@ -192,7 +194,7 @@ impl Store {
         Ok(project)
     }
 
-    fn write_project(&self, project: &Project) -> Result<()> {
+    fn write_project(&self, project: &KiboProject) -> Result<()> {
         let directory = self.project_dir(&project.id);
         fs::create_dir_all(directory.join("conversations"))?;
         sync_parent(&directory)?;
@@ -200,9 +202,9 @@ impl Store {
         write_json_atomic(&directory.join("project.json"), project)
     }
 
-    pub fn list_conversations(&self, project_id: &str) -> Result<Vec<Conversation>> {
+    pub fn list_conversations(&self, project_id: &str) -> Result<Vec<KiboConversation>> {
         self.project(project_id)?;
-        let mut conversations: Vec<Conversation> = Vec::new();
+        let mut conversations: Vec<KiboConversation> = Vec::new();
         for entry in fs::read_dir(self.project_dir(project_id).join("conversations"))? {
             let path = entry?.path().join("conversation.json");
             if path.exists() {
@@ -219,9 +221,9 @@ impl Store {
         Ok(conversations)
     }
 
-    pub fn conversation(&self, project_id: &str, id: &str) -> Result<Conversation> {
+    pub fn conversation(&self, project_id: &str, id: &str) -> Result<KiboConversation> {
         self.check_pair(project_id, id)?;
-        let conversation: Conversation = read_json(
+        let conversation: KiboConversation = read_json(
             &self
                 .conversation_dir(project_id, id)
                 .join("conversation.json"),
@@ -237,14 +239,14 @@ impl Store {
         &self,
         project_id: &str,
         name: Option<&str>,
-    ) -> Result<Conversation> {
+    ) -> Result<KiboConversation> {
         self.project(project_id)?;
         let (name, name_source) = match name {
             Some(name) => (clean_name(name)?, ConversationNameSource::Manual),
             None => ("New conversation", ConversationNameSource::Placeholder),
         };
         let created_at = epoch();
-        let conversation = Conversation {
+        let conversation = KiboConversation {
             id: make_id(name),
             project_id: project_id.into(),
             name: name.into(),
@@ -286,7 +288,7 @@ impl Store {
         Ok(AutoNameOutcome::Named(conversation))
     }
 
-    fn write_conversation(&self, conversation: &Conversation) -> Result<()> {
+    fn write_conversation(&self, conversation: &KiboConversation) -> Result<()> {
         let directory = self.conversation_dir(&conversation.project_id, &conversation.id);
         fs::create_dir_all(directory.join("clips"))?;
         fs::create_dir_all(directory.join("tts"))?;
@@ -780,7 +782,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let store = Store::open(temporary.path()).unwrap();
         store
-            .write_conversation(&Conversation {
+            .write_conversation(&KiboConversation {
                 id: "general".into(),
                 project_id: "kibo".into(),
                 name: "General".into(),

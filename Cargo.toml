@@ -1,4 +1,3 @@
 [workspace]
-members = ["kibod", "recplay"]
+members = ["kibod", "recplay", "tools/typegen"]
 resolver = "3"
-

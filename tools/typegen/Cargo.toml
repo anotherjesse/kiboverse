@@ -1,0 +1,8 @@
+[package]
+name = "kibo-typegen"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+typeshare-core = "1.13.4"

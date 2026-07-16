@@ -1,5 +1,7 @@
 use crate::model::{
-    CreateConversation, CreateNamed, CreateTurn, EventsQuery, SpeechQuery, epoch, valid_id,
+    ConversationsEnvelope, CreateConversation, CreateNamed, CreateTurn, EventsEnvelope,
+    EventsQuery, KiboConversation, KiboEvent, KiboProject, ProjectsEnvelope, PutClipResponse,
+    SpeechQuery, TurnResponse, epoch, valid_id,
 };
 use crate::state::AppState;
 use crate::store::{ClipConflict, ClipUpload, CreateTurnOutcome, NoPendingClips, PutClip};
@@ -12,7 +14,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -44,43 +46,43 @@ pub fn router() -> Router<AppState> {
         .layer(DefaultBodyLimit::max(20 * 1024 * 1024))
 }
 
-async fn list_projects(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+async fn list_projects(State(state): State<AppState>) -> Result<Json<ProjectsEnvelope>, ApiError> {
     let projects = state.store().list_projects()?;
-    Ok(Json(json!({"projects": projects})))
+    Ok(Json(ProjectsEnvelope { projects }))
 }
 
 async fn create_project(
     State(state): State<AppState>,
     Json(request): Json<CreateNamed>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
+) -> Result<(StatusCode, Json<KiboProject>), ApiError> {
     let project = state
         .store()
         .create_project(&request.name)
         .map_err(ApiError::bad_request)?;
-    Ok((StatusCode::CREATED, Json(json!(project))))
+    Ok((StatusCode::CREATED, Json(project)))
 }
 
 async fn list_conversations(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ConversationsEnvelope>, ApiError> {
     let conversations = state
         .store()
         .list_conversations(&project_id)
         .map_err(ApiError::not_found)?;
-    Ok(Json(json!({"conversations": conversations})))
+    Ok(Json(ConversationsEnvelope { conversations }))
 }
 
 async fn create_conversation(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
     Json(request): Json<CreateConversation>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
+) -> Result<(StatusCode, Json<KiboConversation>), ApiError> {
     let conversation = state
         .store()
         .create_conversation(&project_id, request.name.as_deref())
         .map_err(ApiError::bad_request)?;
-    Ok((StatusCode::CREATED, Json(json!(conversation))))
+    Ok((StatusCode::CREATED, Json(conversation)))
 }
 
 async fn put_clip(
@@ -88,7 +90,7 @@ async fn put_clip(
     Path((project_id, conversation_id, clip_id)): Path<(String, String, String)>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
+) -> Result<(StatusCode, Json<PutClipResponse>), ApiError> {
     if body.len() < 44 || &body[..4] != b"RIFF" || &body[8..12] != b"WAVE" {
         return Err(ApiError::bad_request("body must be a WAV file"));
     }
@@ -126,7 +128,10 @@ async fn put_clip(
     };
     Ok((
         status,
-        Json(json!({"clip_id":clip_id, "created":outcome == PutClip::Created})),
+        Json(PutClipResponse {
+            clip_id,
+            created: outcome == PutClip::Created,
+        }),
     ))
 }
 
@@ -134,7 +139,7 @@ async fn create_turn(
     State(state): State<AppState>,
     Path((project_id, conversation_id)): Path<(String, String)>,
     Json(request): Json<CreateTurn>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
+) -> Result<(StatusCode, Json<TurnResponse>), ApiError> {
     if !valid_id(&request.turn_id) {
         return Err(ApiError::bad_request("invalid turn_id"));
     }
@@ -158,7 +163,11 @@ async fn create_turn(
     state.start_turn(project_id, conversation_id, request.turn_id.clone());
     Ok((
         status,
-        Json(json!({"turn_id":request.turn_id, "clips":clips, "created":created})),
+        Json(TurnResponse {
+            turn_id: request.turn_id,
+            clips,
+            created,
+        }),
     ))
 }
 
@@ -280,17 +289,15 @@ async fn events(
             })
             .into_response());
     }
-    let events: Vec<Value> = state
+    let events: Vec<KiboEvent> = state
         .store()
         .records(&project_id, &conversation_id)?
         .into_iter()
         .filter(|event| event["seq"].as_u64().unwrap_or(0) > query.after)
-        .collect();
-    let latest_seq = events
-        .last()
-        .and_then(|event| event["seq"].as_u64())
-        .unwrap_or(query.after);
-    Ok(Json(json!({"events":events, "latest_seq":latest_seq})).into_response())
+        .map(decode_event)
+        .collect::<Result<_, _>>()?;
+    let latest_seq = events.last().map(|event| event.seq).unwrap_or(query.after);
+    Ok(Json(EventsEnvelope { events, latest_seq }).into_response())
 }
 
 async fn event_socket(
@@ -314,22 +321,14 @@ async fn event_socket(
             continue;
         }
         cursor = event["seq"].as_u64().unwrap_or(cursor);
-        if socket
-            .send(Message::Text(event.to_string().into()))
-            .await
-            .is_err()
-        {
+        if send_event(&mut socket, event).await.is_err() {
             return;
         }
     }
     loop {
         match receiver.recv().await {
             Ok(event) => {
-                if socket
-                    .send(Message::Text(event.to_string().into()))
-                    .await
-                    .is_err()
-                {
+                if send_event(&mut socket, event).await.is_err() {
                     return;
                 }
             }
@@ -339,6 +338,19 @@ async fn event_socket(
             }
         }
     }
+}
+
+fn decode_event(event: Value) -> Result<KiboEvent, ApiError> {
+    serde_json::from_value(event).map_err(ApiError::internal)
+}
+
+async fn send_event(socket: &mut WebSocket, event: Value) -> Result<(), ApiError> {
+    let event = decode_event(event)?;
+    let text = serde_json::to_string(&event).map_err(ApiError::internal)?;
+    socket
+        .send(Message::Text(text.into()))
+        .await
+        .map_err(ApiError::internal)
 }
 
 fn required_header(headers: &HeaderMap, name: &'static str) -> Result<String, ApiError> {

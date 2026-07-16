@@ -23,6 +23,15 @@ Start it locally:
 cargo run -p kibod
 ```
 
+The Rust API models are the source of truth for the iPhone and Watch wire
+types. Regenerate the checked-in Swift definitions after changing them:
+
+```sh
+just generate-types
+```
+
+`just check-generated-types` fails when the generated file is stale.
+
 Then open <http://127.0.0.1:3000>. Without `GEMINI_API_KEY`, kibod deliberately
 runs in mock mode so the full record → upload → turn → streamed-audio path can
 be exercised without credentials. Set these environment variables as needed:

@@ -77,6 +77,7 @@ sample rate in `X-Audio-Sample-Rate`; `from_sample` resumes at a stable offset.
 ## Checks
 
 ```sh
+just check-generated-types
 cargo test -p kibod
 cargo clippy -p kibod --all-targets -- -D warnings
 ```

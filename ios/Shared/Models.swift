@@ -1,71 +1,8 @@
 import Foundation
 
-struct KiboProject: Codable, Identifiable, Hashable {
-    let id: String
-    let name: String
-    let createdAt: UInt64
-
-    enum CodingKeys: String, CodingKey {
-        case id, name
-        case createdAt = "created_at"
-    }
-}
-
 enum ProjectSelection {
     static func preferred(in projects: [KiboProject], savedID: String?) -> KiboProject? {
         projects.first { $0.id == savedID } ?? projects.first
-    }
-}
-
-struct KiboConversation: Codable, Identifiable, Hashable {
-    let id: String
-    let projectId: String
-    let name: String
-    let nameSource: String?
-    let createdAt: UInt64
-
-    enum CodingKeys: String, CodingKey {
-        case id, name
-        case projectId = "project_id"
-        case nameSource = "name_source"
-        case createdAt = "created_at"
-    }
-}
-
-struct KiboEvent: Codable, Identifiable, Hashable {
-    let seq: UInt64
-    let kind: String
-    let idValue: String?
-    let clip: String?
-    let turn: String?
-    let text: String?
-    let error: String?
-    let audio: String?
-    let clips: [String]?
-    let durationMs: UInt64?
-    let peakPct: UInt64?
-    let createdAt: UInt64?
-
-    var id: UInt64 { seq }
-
-    enum CodingKeys: String, CodingKey {
-        case seq, kind, clip, turn, text, error, audio, clips
-        case idValue = "id"
-        case durationMs = "ms"
-        case peakPct = "peak"
-        case createdAt = "at"
-    }
-}
-
-struct ProjectsEnvelope: Codable { let projects: [KiboProject] }
-struct ConversationsEnvelope: Codable { let conversations: [KiboConversation] }
-struct EventsEnvelope: Codable {
-    let events: [KiboEvent]
-    let latestSeq: UInt64
-
-    enum CodingKeys: String, CodingKey {
-        case events
-        case latestSeq = "latest_seq"
     }
 }
 
@@ -83,7 +20,7 @@ struct TimelineItem: Identifiable, Hashable {
 
 extension Array where Element == KiboEvent {
     var pendingTurnIDs: Set<String> {
-        let turns = Set(compactMap { $0.kind == "turn" ? $0.idValue : nil })
+        let turns = Set(compactMap { $0.kind == "turn" ? $0.id : nil })
         let finished = Set(compactMap { event in
             (event.kind == "reply" || event.kind == "reply_error") ? event.turn : nil
         })
@@ -98,8 +35,8 @@ extension Array where Element == KiboEvent {
         var replyErrors: [String: String] = [:]
         var speechState: [String: SpeechStatus] = [:]
         for event in sorted(by: { $0.seq < $1.seq }) {
-            if event.kind == "clip", let clip = event.idValue {
-                durations[clip] = event.durationMs
+            if event.kind == "clip", let clip = event.id {
+                durations[clip] = event.ms
             } else if event.kind == "transcript", let clip = event.clip {
                 transcripts[clip] = event.text ?? "Transcribing…"
             } else if event.kind == "transcript_error", let clip = event.clip {
@@ -126,7 +63,7 @@ extension Array where Element == KiboEvent {
         }
 
         for event in self where event.kind == "turn" {
-            guard let turnID = event.idValue else { continue }
+            guard let turnID = event.id else { continue }
             let clipIDs = event.clips ?? []
             claimed.formUnion(clipIDs)
             // One card per recording, not one clump per turn.
@@ -156,7 +93,7 @@ extension Array where Element == KiboEvent {
         }
 
         for event in self where event.kind == "clip" {
-            guard let clipID = event.idValue, !claimed.contains(clipID) else { continue }
+            guard let clipID = event.id, !claimed.contains(clipID) else { continue }
             result.append(personCard(clipID: clipID, title: "You · not asked yet"))
         }
         return result

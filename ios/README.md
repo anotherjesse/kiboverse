@@ -89,6 +89,8 @@ and recreate audio objects after a [media-services reset](https://developer.appl
 Generate the Xcode project and run the checks:
 
 ```sh
+cd ..
+just generate-types
 cd ios
 xcodegen generate
 xcodebuild -project Kibo.xcodeproj -scheme Kibo \

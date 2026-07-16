@@ -79,11 +79,15 @@ enum StreamingSpeechError: LocalizedError, Equatable {
 final class PCMStreamingPlayer {
     typealias RendererFactory = @MainActor (_ sampleRate: Int, _ startSample: Int) throws -> any SpeechRendering
     typealias SessionActivator = @MainActor (_ intent: PlaybackSessionIntent) throws -> Void
-    typealias StreamLoader = @MainActor (_ fromSample: Int) async throws -> SpeechResponseStream
+    typealias StreamLoader = @MainActor (
+        _ fromSample: Int,
+        _ expectedGeneration: String?
+    ) async throws -> SpeechResponseStream
     typealias RetryDelay = @MainActor (_ failureCount: Int) async -> Void
 
     private struct StreamAsset {
         let id: String
+        var speechGeneration: String? = nil
         var ledger = PCMStreamLedger()
         var sampleRate: Int?
         var scheduledSample = 0
@@ -217,8 +221,15 @@ final class PCMStreamingPlayer {
         while !Task.isCancelled, self.generation == generation {
             do {
                 guard let loader = streamLoader, let asset = streamAsset else { return }
-                let response = try await loader(asset.ledger.receivedSample)
-                try validate(response: response, generation: generation)
+                let response = try await loader(
+                    asset.ledger.receivedSample,
+                    asset.speechGeneration
+                )
+                if try validate(response: response, generation: generation) == .restartFromZero {
+                    restartForSpeechGeneration(response.generation)
+                    failures = 0
+                    continue
+                }
                 for try await data in response.chunks {
                     try Task.checkCancellation()
                     guard self.generation == generation, var current = streamAsset else { return }
@@ -242,6 +253,17 @@ final class PCMStreamingPlayer {
                 return
             } catch is CancellationError {
                 return
+            } catch APIError.requestDestinationChanged {
+                guard self.generation == generation else { return }
+                // A selection transition invalidates this playback request;
+                // it is teardown, not a transport failure to retry or surface
+                // in the newly selected conversation.
+                stopPlayback(notify: true)
+                return
+            } catch APIError.speechGenerationChanged {
+                guard self.generation == generation else { return }
+                restartForSpeechGeneration(nil)
+                failures = 0
             } catch {
                 guard self.generation == generation, var current = streamAsset else { return }
                 current.ledger.discardPartialSample()
@@ -261,7 +283,15 @@ final class PCMStreamingPlayer {
         }
     }
 
-    private func validate(response: SpeechResponseStream, generation: UUID) throws {
+    private enum ResponseDisposition {
+        case consume
+        case restartFromZero
+    }
+
+    private func validate(
+        response: SpeechResponseStream,
+        generation: UUID
+    ) throws -> ResponseDisposition {
         try Task.checkCancellation()
         guard self.generation == generation, var asset = streamAsset else {
             throw CancellationError()
@@ -271,13 +301,40 @@ final class PCMStreamingPlayer {
               response.encoding == .signed16LittleEndian else {
             throw StreamingSpeechError.unsupportedFormat
         }
+        if let currentGeneration = asset.speechGeneration {
+            if currentGeneration != response.generation {
+                return .restartFromZero
+            }
+        } else if asset.ledger.receivedSample > 0 {
+            // A generation token appearing after unversioned bytes is not a
+            // provable continuation. Prefer replaying one prefix to splicing
+            // two potentially different syntheses.
+            return .restartFromZero
+        }
+        asset.speechGeneration = response.generation
         if let rate = asset.sampleRate, rate != response.sampleRate {
             throw StreamingSpeechError.unsupportedFormat
         }
         if asset.sampleRate == nil {
             asset.sampleRate = response.sampleRate
-            streamAsset = asset
         }
+        streamAsset = asset
+        return .consume
+    }
+
+    private func restartForSpeechGeneration(_ speechGeneration: String?) {
+        guard let asset = streamAsset else { return }
+        let hadAudiblePlayback = renderer != nil || playingID == asset.id
+        rendererEpoch = UUID()
+        renderer?.stop()
+        renderer = nil
+        streamAsset = StreamAsset(id: asset.id, speechGeneration: speechGeneration)
+        interruptionSample = nil
+        pendingPlaybackIntent = hadAudiblePlayback ? .rebuildPlayback : nil
+        playingID = nil
+        loadingID = asset.id
+        lastFinishedID = nil
+        notifyChange()
     }
 
     private func pumpRenderer(sessionIntent: PlaybackSessionIntent) {

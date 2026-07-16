@@ -42,6 +42,7 @@ final class SpeechPlayer: ObservableObject {
     typealias RendererFactory = @MainActor (_ sampleRate: Int, _ startSample: Int) throws -> any SpeechRendering
     typealias SessionActivator = @MainActor (_ intent: AudioSessionIntent) throws -> Void
     typealias StreamLoader = PCMStreamingPlayer.StreamLoader
+    typealias RetryDelay = PCMStreamingPlayer.RetryDelay
 
     private struct ClipAsset {
         let id: String
@@ -50,6 +51,7 @@ final class SpeechPlayer: ObservableObject {
 
     @Published private(set) var playingID: String?
     @Published private(set) var loadingID: String?
+    @Published private(set) var lastFinishedID: String?
     @Published var errorMessage: String?
 
     private var clipPlayer: (any SpeechAudioPlaying)?
@@ -65,7 +67,10 @@ final class SpeechPlayer: ObservableObject {
     init(
         makePlayer: @escaping PlayerFactory = { try SystemSpeechAudioPlayer(data: $0) },
         makeRenderer: @escaping RendererFactory = { try EngineSpeechRenderer(sampleRate: $0, startingAt: $1) },
-        activateSession: @escaping SessionActivator
+        activateSession: @escaping SessionActivator,
+        retryDelay: @escaping RetryDelay = { failures in
+            try? await Task.sleep(for: .milliseconds(250 * failures))
+        }
     ) {
         self.makePlayer = makePlayer
         self.activateSession = activateSession
@@ -73,20 +78,26 @@ final class SpeechPlayer: ObservableObject {
             makeRenderer: makeRenderer,
             activateSession: { intent in
                 try activateSession(intent == .beginPlayback ? .beginPlayback : .rebuildPlayback)
-            }
+            },
+            retryDelay: retryDelay
         )
         streamPlayer.didChange = { [weak self] in self?.syncStreamingState() }
     }
 
-    func toggleReply(turnID: String, store: AppStore) {
+    func toggleReply(turnID: String, destination: KiboDestination, store: AppStore) {
         let id = "reply-\(turnID)"
         if playingID == id || loadingID == id { stop(); return }
-        playReply(turnID: turnID, store: store)
+        playReply(turnID: turnID, destination: destination, store: store)
     }
 
-    func playReply(turnID: String, store: AppStore) {
-        playReply(id: "reply-\(turnID)") { fromSample in
-            try await store.speechStream(turnID: turnID, fromSample: fromSample)
+    func playReply(turnID: String, destination: KiboDestination, store: AppStore) {
+        playReply(id: "reply-\(turnID)") { fromSample, generation in
+            try await store.speechStream(
+                destination: destination,
+                turnID: turnID,
+                fromSample: fromSample,
+                generation: generation
+            )
         }
     }
 
@@ -210,6 +221,7 @@ final class SpeechPlayer: ObservableObject {
     private func syncStreamingState() {
         playingID = streamPlayer.playingID
         loadingID = streamPlayer.loadingID
+        lastFinishedID = streamPlayer.lastFinishedID
         errorMessage = streamPlayer.errorMessage
     }
 

@@ -7,6 +7,18 @@ final class AppStore: ObservableObject {
         let attemptedIDs: Set<String>
     }
 
+    /// Snapshot of the mutable API endpoint and UI selection that authorized
+    /// an asynchronous command. The version fields make an away-and-back
+    /// selection change different from the original destination.
+    private struct LifecycleClaim {
+        let serverVersion: Int
+        let projectSelectionVersion: Int
+        let eventSelectionVersion: Int
+        let serverURL: String
+        let projectID: String?
+        let conversationID: String?
+    }
+
     static let defaultServerURL = "https://wideboi.stingray-nominal.ts.net/"
     private enum Key {
         static let serverURL = "serverURL"
@@ -23,6 +35,8 @@ final class AppStore: ObservableObject {
     @Published var isLoading = false
     @Published var isUploading = false
     @Published var isSubmitting = false
+    @Published private(set) var isRetryingFailedWork = false
+    @Published private(set) var isChangingServer = false
     @Published var pendingUploadCount = 0
     @Published private(set) var recoveryItemCount = 0
     @Published var status = "Connecting…"
@@ -33,6 +47,7 @@ final class AppStore: ObservableObject {
     private var uploadTask: (id: UUID, task: Task<UploadRunResult, Never>)?
     private var recordingTasks: [UUID: Task<Void, Never>] = [:]
     private let spool = PendingUploadSpool(directoryName: PendingUploadSpool.phoneDirectoryName)
+    private var isCreating = false
     private var serverVersion = 0
     private var projectSelectionVersion = 0
     private var eventSelectionVersion = 0
@@ -61,6 +76,15 @@ final class AppStore: ObservableObject {
     var selectedConversation: KiboConversation? { conversations.first { $0.id == selectedConversationID } }
     var timeline: [TimelineItem] { events.timeline() }
     var isAskingKibo: Bool { isSubmitting || !events.pendingTurnIDs.isEmpty }
+    var requestDestination: KiboDestination? {
+        guard let projectID = selectedProjectID,
+              let conversationID = selectedConversationID else { return nil }
+        return KiboDestination(
+            serverURL: serverURL,
+            projectID: projectID,
+            conversationID: conversationID
+        )
+    }
 
     func start() async {
         await reloadProjects()
@@ -138,7 +162,8 @@ final class AppStore: ObservableObject {
             updatePendingUploadCount()
             if pendingUploadCount == 0 && !isUploading { status = "Live"; errorMessage = nil }
         } catch {
-            guard version == eventSelectionVersion,
+            guard !Task.isCancelled,
+                  version == eventSelectionVersion,
                   requestVersion == eventRequestVersion,
                   project == selectedProjectID, conversation == selectedConversationID else { return }
             report(error, quiet: !events.isEmpty)
@@ -146,22 +171,46 @@ final class AppStore: ObservableObject {
     }
 
     func createProject(name: String) async {
+        guard !isCreating, !isChangingServer else { return }
+        let claim = lifecycleClaim()
+        isCreating = true
+        defer { isCreating = false }
         do {
             let project = try await api.createProject(name: name)
-            await reloadProjects()
+            guard !Task.isCancelled, accepts(claim) else { return }
+            let loaded = try await api.projects()
+            guard !Task.isCancelled, accepts(claim) else { return }
+            projects = loaded
+            updatePendingUploadCount()
+            if pendingUploadCount == 0 {
+                status = "Live"
+                errorMessage = nil
+            }
             await selectProject(project.id)
-        } catch { report(error) }
+        } catch {
+            guard !Task.isCancelled, accepts(claim) else { return }
+            report(error)
+        }
     }
 
     func createConversation(name: String? = nil) async {
-        guard let projectID = selectedProjectID else { return }
+        guard let projectID = selectedProjectID,
+              !isCreating,
+              !isChangingServer else { return }
+        let claim = lifecycleClaim()
+        isCreating = true
+        defer { isCreating = false }
         do {
             let conversation = try await api.createConversation(projectID: projectID, name: name)
+            guard !Task.isCancelled, accepts(claim) else { return }
             let loaded = try await api.conversations(projectID: projectID)
-            guard projectID == selectedProjectID else { return }
+            guard !Task.isCancelled, accepts(claim) else { return }
             conversations = loaded
             await selectConversation(conversation.id)
-        } catch { report(error) }
+        } catch {
+            guard !Task.isCancelled, accepts(claim) else { return }
+            report(error)
+        }
     }
 
     func queueRecording(_ recording: LocalRecording) {
@@ -308,7 +357,8 @@ final class AppStore: ObservableObject {
     @discardableResult
     func submitTurn() async -> String? {
         guard let projectID = selectedProjectID, let conversationID = selectedConversationID else { return nil }
-        guard !isUploading, !isSubmitting else { return nil }
+        guard !isUploading, !isSubmitting, !isChangingServer else { return nil }
+        let claim = lifecycleClaim()
         updatePendingUploadCount()
         guard recoveryItemCount == 0 else {
             status = "Resolve recording recovery in Settings before asking Kibo"
@@ -318,37 +368,43 @@ final class AppStore: ObservableObject {
         defer { isSubmitting = false }
         let destination = "\(projectID)/\(conversationID)"
         guard await retryPendingUploads(destinationKey: destination) else { return nil }
+        guard !Task.isCancelled, accepts(claim) else { return nil }
         updatePendingUploadCount()
         guard recoveryItemCount == 0 else {
             status = "Resolve recording recovery in Settings before asking Kibo"
             return nil
         }
         guard !spool.all().contains(where: {
-            $0.serverURL == serverURL && $0.destinationKey == destination
+            $0.serverURL == claim.serverURL && $0.destinationKey == destination
         }) else { return nil }
         status = "Kibo is thinking…"
-        let commandKey = "pendingTurnID.\(serverURL).\(destination)"
+        let commandKey = "pendingTurnID.\(claim.serverURL).\(destination)"
         let turnID = UserDefaults.standard.string(forKey: commandKey)
             ?? UUID().uuidString.lowercased()
         UserDefaults.standard.set(turnID, forKey: commandKey)
         do {
+            guard !Task.isCancelled, accepts(claim) else { return nil }
             try await api.submitTurn(
                 projectID: projectID, conversationID: conversationID,
                 turnID: turnID
             )
             UserDefaults.standard.removeObject(forKey: commandKey)
+            guard !Task.isCancelled, accepts(claim) else { return nil }
             await refreshEvents()
+            guard !Task.isCancelled, accepts(claim) else { return nil }
             restartPollingIfStarted()
             return turnID
         } catch {
+            guard !Task.isCancelled, accepts(claim) else { return nil }
             report(error)
             return nil
         }
     }
 
     func updateServerURL(_ value: String) async -> Bool {
-        guard !isUploading, !isSubmitting else {
-            errorMessage = "Wait for the current upload or Kibo request to finish before changing servers."
+        guard !isUploading, !isSubmitting, !isCreating,
+              !isRetryingFailedWork, !isChangingServer else {
+            errorMessage = "Wait for the current upload, create, or Kibo request to finish before changing servers."
             return false
         }
         refreshRecordingInventory()
@@ -356,20 +412,28 @@ final class AppStore: ObservableObject {
             errorMessage = "Retry or discard saved recordings before changing servers."
             return false
         }
+        guard let canonicalURL = KiboAPI.canonicalServerURL(value) else {
+            report(APIError.invalidServerURL)
+            return false
+        }
+        if canonicalURL == serverURL { return true }
+        isChangingServer = true
+        defer { isChangingServer = false }
         do {
-            guard let canonicalURL = KiboAPI.canonicalServerURL(value) else {
-                throw APIError.invalidServerURL
-            }
+            // No command may straddle the mutable API actor's base-URL
+            // change. Invalidate the selected destination before switching.
+            serverVersion += 1
+            projectSelectionVersion += 1
+            eventSelectionVersion += 1
+            selectedProjectID = nil
+            selectedConversationID = nil
+            projects = []
+            conversations = []
+            events = []
             try await api.setServerURL(canonicalURL)
             serverURL = canonicalURL
             UserDefaults.standard.set(serverURL, forKey: Key.serverURL)
             updatePendingUploadCount()
-            serverVersion += 1
-            projectSelectionVersion += 1
-            eventSelectionVersion += 1
-            projects = []
-            conversations = []
-            events = []
             await reloadProjects()
             _ = await retryPendingUploads()
             return errorMessage == nil
@@ -379,16 +443,59 @@ final class AppStore: ObservableObject {
         }
     }
 
-    func speechStream(turnID: String, fromSample: Int = 0) async throws -> SpeechResponseStream {
-        guard let projectID = selectedProjectID, let conversationID = selectedConversationID else {
-            throw APIError.invalidResponse
+    func speechStream(
+        destination: KiboDestination,
+        turnID: String,
+        fromSample: Int = 0,
+        generation: String? = nil
+    ) async throws -> SpeechResponseStream {
+        guard destination == requestDestination else {
+            throw APIError.requestDestinationChanged
         }
-        return try await api.speechStream(
-            projectID: projectID,
-            conversationID: conversationID,
+        let response = try await api.speechStream(
+            destination: destination,
             turnID: turnID,
-            fromSample: fromSample
+            fromSample: fromSample,
+            generation: generation
         )
+        guard destination == requestDestination else {
+            throw APIError.requestDestinationChanged
+        }
+        return response
+    }
+
+    func retryFailedWork(_ target: RetryTarget) async {
+        guard let projectID = selectedProjectID,
+              let conversationID = selectedConversationID,
+              !isRetryingFailedWork,
+              !isChangingServer else { return }
+        let commandServerURL = serverURL
+        isRetryingFailedWork = true
+        defer { isRetryingFailedWork = false }
+        do {
+            switch target {
+            case let .clip(clipID):
+                try await api.retryClip(
+                    projectID: projectID, conversationID: conversationID, clipID: clipID
+                )
+            case let .turn(turnID):
+                try await api.retryTurn(
+                    projectID: projectID, conversationID: conversationID, turnID: turnID
+                )
+            }
+            guard commandServerURL == serverURL,
+                  projectID == selectedProjectID,
+                  conversationID == selectedConversationID else { return }
+            status = "Retrying…"
+            errorMessage = nil
+            await refreshEvents()
+        } catch {
+            if commandServerURL == serverURL,
+               projectID == selectedProjectID,
+               conversationID == selectedConversationID {
+                report(error)
+            }
+        }
     }
 
     func clipAudio(clipID: String) async throws -> Data {
@@ -446,5 +553,25 @@ final class AppStore: ObservableObject {
     private func persist(_ value: String?, key: String) {
         if let value { UserDefaults.standard.set(value, forKey: key) }
         else { UserDefaults.standard.removeObject(forKey: key) }
+    }
+
+    private func lifecycleClaim() -> LifecycleClaim {
+        LifecycleClaim(
+            serverVersion: serverVersion,
+            projectSelectionVersion: projectSelectionVersion,
+            eventSelectionVersion: eventSelectionVersion,
+            serverURL: serverURL,
+            projectID: selectedProjectID,
+            conversationID: selectedConversationID
+        )
+    }
+
+    private func accepts(_ claim: LifecycleClaim) -> Bool {
+        claim.serverVersion == serverVersion
+            && claim.projectSelectionVersion == projectSelectionVersion
+            && claim.eventSelectionVersion == eventSelectionVersion
+            && claim.serverURL == serverURL
+            && claim.projectID == selectedProjectID
+            && claim.conversationID == selectedConversationID
     }
 }

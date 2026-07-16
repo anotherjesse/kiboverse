@@ -102,6 +102,19 @@ pub struct KiboEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[typeshare(serialized_as = "Option<U53>")]
+    pub retry_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub audio: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clips: Option<Vec<String>>,
@@ -178,6 +191,14 @@ pub fn epoch() -> u64 {
         .unwrap_or(0)
 }
 
+pub fn epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0)
+}
+
 pub fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 100
@@ -235,5 +256,25 @@ mod tests {
         assert_eq!(conversation.name_source, ConversationNameSource::Manual);
         assert_eq!(conversation.last_activity_at, 0);
         assert_eq!(conversation.activity_at(), 1);
+    }
+
+    #[test]
+    fn workflow_fields_survive_wire_serialization() {
+        let event: KiboEvent = serde_json::from_value(serde_json::json!({
+            "seq": 4,
+            "kind": "transcript_error",
+            "clip": "clip-1",
+            "error": "offline",
+            "attempt": 2,
+            "retry_at_ms": 99_500,
+            "terminal": false,
+            "stage": "transcription"
+        }))
+        .unwrap();
+        let encoded = serde_json::to_value(event).unwrap();
+        assert_eq!(encoded["attempt"], 2);
+        assert_eq!(encoded["retry_at_ms"], 99_500);
+        assert_eq!(encoded["terminal"], false);
+        assert_eq!(encoded["stage"], "transcription");
     }
 }

@@ -5,6 +5,7 @@ pub mod model;
 pub mod state;
 pub mod store;
 pub mod ui;
+mod workflow;
 
 use ai::Ai;
 use axum::Router;
@@ -16,15 +17,15 @@ use state::AppState;
 use store::Store;
 use tower_http::trace::TraceLayer;
 
-pub fn app(store: Store, ai: Ai) -> Router {
+pub fn app(store: Store, ai: Ai) -> anyhow::Result<Router> {
     let state = AppState::new(store, ai);
-    state.resume().expect("resume durable work");
-    Router::new()
+    state.resume()?;
+    Ok(Router::new()
         .merge(api::router())
         .merge(ui::router())
         .layer(from_fn(same_origin_browser_requests))
         .layer(TraceLayer::new_for_http())
-        .with_state(state)
+        .with_state(state))
 }
 
 async fn same_origin_browser_requests(request: Request, next: Next) -> Response {
@@ -68,7 +69,7 @@ mod tests {
     #[tokio::test]
     async fn cross_origin_browser_mutation_is_rejected() {
         let temporary = tempfile::tempdir().unwrap();
-        let service = app(Store::open(temporary.path()).unwrap(), Ai::mock());
+        let service = app(Store::open(temporary.path()).unwrap(), Ai::mock()).unwrap();
         let response = service
             .oneshot(
                 Request::builder()

@@ -77,6 +77,7 @@ final class AudioCoordinator: ObservableObject {
     private var configurationRebuildTask: Task<Void, Never>?
     private var cancellables: Set<AnyCancellable> = []
     private var notificationTokens: [NSObjectProtocol] = []
+    @Published private(set) var automaticPlaybackSuspended = false
 
     init(
         recorder: (any AudioCapturing)? = nil,
@@ -113,6 +114,7 @@ final class AudioCoordinator: ObservableObject {
     var recordingErrorMessage: String? { recorder.errorMessage }
     var playingID: String? { player.playingID }
     var loadingID: String? { player.loadingID }
+    var lastFinishedID: String? { player.lastFinishedID }
     var playbackErrorMessage: String? {
         get { player.errorMessage }
         set { player.errorMessage = newValue }
@@ -127,12 +129,12 @@ final class AudioCoordinator: ObservableObject {
         }
     }
 
-    func playReply(turnID: String, store: AppStore) {
-        player.playReply(turnID: turnID, store: store)
+    func playReply(turnID: String, destination: KiboDestination, store: AppStore) {
+        player.playReply(turnID: turnID, destination: destination, store: store)
     }
 
-    func toggleReply(turnID: String, store: AppStore) {
-        player.toggleReply(turnID: turnID, store: store)
+    func toggleReply(turnID: String, destination: KiboDestination, store: AppStore) {
+        player.toggleReply(turnID: turnID, destination: destination, store: store)
     }
 
     func toggleClip(clipID: String, store: AppStore) {
@@ -201,6 +203,16 @@ final class AudioCoordinator: ObservableObject {
     func stop() {
         preserveActiveHold()
         player.stop()
+    }
+
+    func stopReply() {
+        player.stop()
+    }
+
+    /// A new explicit command may own automatic playback again. System audio
+    /// teardown keeps the gate closed until such an action occurs.
+    func resumeAutomaticPlayback() {
+        automaticPlaybackSuspended = false
     }
 
     func stopForInactivity() {
@@ -280,6 +292,7 @@ final class AudioCoordinator: ObservableObject {
     func handleSystemEvent(_ event: AudioSystemEvent) {
         switch event {
         case .outputRouteUnavailable:
+            automaticPlaybackSuspended = true
             configurationRebuildTask?.cancel()
             configurationRebuildTask = nil
             let wasHolding = activeHoldID != nil
@@ -297,6 +310,7 @@ final class AudioCoordinator: ObservableObject {
                 self.configurationRebuildTask = nil
             }
         case .interruptionBegan:
+            automaticPlaybackSuspended = true
             configurationRebuildTask?.cancel()
             configurationRebuildTask = nil
             let wasHolding = activeHoldID != nil
@@ -306,6 +320,7 @@ final class AudioCoordinator: ObservableObject {
                 recorder.errorMessage = "The recording was interrupted. Please try again."
             }
         case .mediaServicesReset:
+            automaticPlaybackSuspended = true
             configurationRebuildTask?.cancel()
             configurationRebuildTask = nil
             preserveActiveHold()

@@ -337,12 +337,29 @@
       (interruptedPlayback?.player === player && interruptedPlayback.intent === playbackIntent);
   }
 
-  function startPlayback(player, retry = false) {
+  function startPlayback(player, retry = false, intent = playbackIntent) {
     pauseNativePlayback();
-    return player.play(retry);
+    return player.play(retry, intent);
+  }
+
+  function automaticPlaybackCurrent(player) {
+    return (player.playing && player.ownsAutomaticIntent(playbackIntent)) ||
+      (deferredPlayback?.player === player && deferredPlayback.retry &&
+        deferredPlayback.intent === playbackIntent) ||
+      (interruptedPlayback?.player === player &&
+        interruptedPlayback.intent === playbackIntent &&
+        player.ownsAutomaticIntent(playbackIntent));
   }
 
   function requestPlayback(player, retry = false) {
+    if (retry && player.automaticPlaybackBlocked()) {
+      return Promise.reject(player.automaticPlaybackError());
+    }
+    // The WebSocket event can beat the matching POST continuation. Treat both
+    // as one automatic command before allocating a superseding global intent.
+    if (retry && automaticPlaybackCurrent(player)) {
+      return Promise.resolve();
+    }
     const intent = ++playbackIntent;
     const superseded = new Set([deferredPlayback?.player, interruptedPlayback?.player]);
     interruptedPlayback = null;
@@ -358,7 +375,12 @@
     for (const previous of superseded) {
       if (previous && previous !== player && !previous.playing) previous.render("paused");
     }
-    return startPlayback(player, retry);
+    return startPlayback(player, retry, intent);
+  }
+
+  function requestInitialPlayback(player) {
+    if (!player.claimInitialAutomaticPlayback()) return null;
+    return requestPlayback(player, true);
   }
 
   function cancelPlaybackIntent() {
@@ -369,6 +391,23 @@
     for (const player of pending) {
       if (player && !player.playing) player.render("paused");
     }
+  }
+
+  function cancelAutomaticPlayback(player, error) {
+    const matches = (request) => request?.player === player &&
+      (request.retry || player.ownsAutomaticIntent(request.intent));
+    let canceledCurrent = false;
+    if (matches(deferredPlayback)) {
+      canceledCurrent ||= deferredPlayback.intent === playbackIntent;
+      deferredPlayback = null;
+    }
+    if (matches(interruptedPlayback)) {
+      canceledCurrent ||= interruptedPlayback.intent === playbackIntent;
+      interruptedPlayback = null;
+    }
+    canceledCurrent = player.cancelAutomaticPlayback(playbackIntent, error) || canceledCurrent;
+    if (canceledCurrent && !player.playing) player.render("error");
+    return canceledCurrent;
   }
 
   function acquireRecordingHold(attempt) {
@@ -401,7 +440,7 @@
         ? interrupted
         : null;
     if (request) {
-      startPlayback(request.player, request.retry).catch(() => {});
+      startPlayback(request.player, request.retry, request.intent).catch(() => {});
     }
   }
 
@@ -624,10 +663,13 @@
       if (!response.ok) throw new Error((await response.text()) || `Turn failed (${response.status})`);
       try { localStorage.removeItem(turnCommandKey); } catch {}
       scheduleTimelineRefresh();
-      setStatus(recordingStatus, "Reply incoming…", "working");
-      requestPlayback(playerFor(turnId), true).catch((error) => {
-        setStatus(recordingStatus, `Speech unavailable: ${errorMessage(error)}`, "error");
-      });
+      const playback = requestInitialPlayback(playerFor(turnId));
+      if (playback) {
+        setStatus(recordingStatus, "Reply incoming…", "working");
+        playback.catch((error) => {
+          setStatus(recordingStatus, `Speech unavailable: ${errorMessage(error)}`, "error");
+        });
+      }
     } catch (error) {
       setStatus(recordingStatus, `Could not start reply: ${errorMessage(error)}`, "error");
     } finally {
@@ -654,7 +696,12 @@
       this.context = null;
       this.rate = 24000;
       this.position = 0;
+      this.generation = null;
+      this.announcedGeneration = null;
       this.session = null;
+      this.automaticIntent = null;
+      this.automaticTerminalError = null;
+      this.initialAutomaticPlaybackClaimed = false;
     }
 
     get playing() {
@@ -696,8 +743,9 @@
       return sample;
     }
 
-    async play(retry = false) {
+    async play(retry = false, intent = playbackIntent) {
       if (this.session) return;
+      if (retry && this.automaticTerminalError) throw this.automaticPlaybackError();
       if (activePlayer && activePlayer !== this) activePlayer.pause();
       const AudioContext = window.AudioContext || window.webkitAudioContext;
       try {
@@ -711,7 +759,15 @@
         playedThrough: this.position,
         nextStart: 0,
         streamOpen: true,
+        intent,
+        generationReset: false,
       };
+      if (retry) {
+        this.automaticIntent = intent;
+      } else if (this.automaticIntent !== intent) {
+        this.automaticIntent = null;
+        this.announcedGeneration = null;
+      }
       this.session = session;
       activePlayer = this;
       this.render("loading");
@@ -734,17 +790,42 @@
       const attempts = retry ? 20 : 1;
       for (let attempt = 0; attempt < attempts; attempt += 1) {
         if (this.session !== session) return;
+        const headers = this.generation
+          ? { "X-Speech-Generation": this.generation }
+          : {};
         response = await fetch(`${endpoint("speech", this.turnId)}?from_sample=${fromSample}`, {
+          headers,
           signal: session.controller.signal,
         });
         if (this.session !== session) return;
         if (response.ok) break;
+        if (response.status === 412) {
+          if (session.generationReset) {
+            throw new Error("Speech generation changed more than once");
+          }
+          session.generationReset = true;
+          this.position = 0;
+          session.playedThrough = 0;
+          this.generation = null;
+          await this.streamFrom(0, session, retry);
+          return;
+        }
         if (attempt + 1 === attempts || ![404, 409, 425, 503].includes(response.status)) {
           throw new Error((await response.text()) || `Speech failed (${response.status})`);
         }
         await new Promise((resolve) => setTimeout(resolve, 500));
       }
       if (this.session !== session) return;
+      const responseGeneration = response.headers.get("X-Speech-Generation") || "legacy";
+      const expectedAnnouncement = this.automaticIntent === session.intent
+        ? this.announcedGeneration
+        : null;
+      if ((this.generation && this.generation !== responseGeneration) ||
+          (expectedAnnouncement && expectedAnnouncement !== responseGeneration)) {
+        this.generation = null;
+        throw new Error("Speech generation disagreed with its update");
+      }
+      this.generation = responseGeneration;
       this.rate = Number(response.headers.get("X-Audio-Sample-Rate") || response.headers.get("X-Sample-Rate") || 24000);
       const reader = response.body?.getReader();
       if (!reader) throw new Error("This browser cannot stream response audio");
@@ -778,6 +859,67 @@
       }
       session.streamOpen = false;
       this.finishIfComplete(session);
+    }
+
+    restartForSpeechGeneration(generation, intent) {
+      const announced = typeof generation === "string" && generation.length > 0
+        ? generation
+        : null;
+      const changedAnnouncement = announced !== null && this.announcedGeneration !== null &&
+        this.announcedGeneration !== announced;
+      const changedTransport = announced !== null && this.generation !== null &&
+        this.generation !== announced;
+      if (announced) {
+        this.announcedGeneration = announced;
+        this.automaticTerminalError = null;
+      }
+      if (this.automaticIntent !== intent) return false;
+      // The initial retrying request is already waiting for the first
+      // generation. A later generation must replace an active old stream, and
+      // a failed stream must restart when its successor begins.
+      if (this.session && !changedAnnouncement && !changedTransport) return false;
+      const session = this.session;
+      this.position = 0;
+      this.generation = null;
+      this.session = null;
+      if (activePlayer === this) activePlayer = null;
+      if (session) this.stopSession(session);
+      return true;
+    }
+
+    ownsAutomaticIntent(intent) {
+      return this.automaticIntent === intent;
+    }
+
+    claimInitialAutomaticPlayback() {
+      if (this.initialAutomaticPlaybackClaimed) return false;
+      this.initialAutomaticPlaybackClaimed = true;
+      return true;
+    }
+
+    automaticPlaybackBlocked() {
+      return this.automaticTerminalError !== null;
+    }
+
+    automaticPlaybackError() {
+      return new Error(this.automaticTerminalError || "Speech synthesis failed");
+    }
+
+    cancelAutomaticPlayback(currentIntent, error) {
+      const session = this.session;
+      const ownsSession = session !== null && this.ownsAutomaticIntent(session.intent);
+      const ownedCurrentIntent = this.ownsAutomaticIntent(currentIntent);
+      const position = ownsSession ? this.currentSample() : this.position;
+      this.automaticTerminalError = error || "Speech synthesis failed";
+      this.automaticIntent = null;
+      this.announcedGeneration = null;
+      if (!ownsSession) return ownedCurrentIntent;
+      this.position = position;
+      this.session = null;
+      if (activePlayer === this) activePlayer = null;
+      this.stopSession(session);
+      this.render("error");
+      return ownedCurrentIntent;
     }
 
     schedule(samples, startSample, session) {
@@ -818,10 +960,16 @@
         this.render(session.sources.size ? "playing" : "loading");
         return;
       }
+      const completedAutomaticPlayback = this.automaticIntent !== null;
       this.position = Math.max(this.position, session.playedThrough);
       this.session = null;
+      this.automaticIntent = null;
+      this.announcedGeneration = null;
       if (activePlayer === this) activePlayer = null;
       this.render("ended");
+      if (completedAutomaticPlayback) {
+        setStatus(recordingStatus, "Reply played", "success");
+      }
     }
 
     fail(session, error) {
@@ -850,9 +998,13 @@
 
     toggle() {
       if (this.playing || playbackPendingFor(this)) {
+        const canceledAutomatic = automaticPlaybackCurrent(this);
         cancelPlaybackIntent();
         if (this.playing) this.pause();
         else this.render("paused");
+        if (canceledAutomatic) {
+          setStatus(recordingStatus, "Reply playback canceled", "");
+        }
         return;
       }
       requestPlayback(this).catch((error) => {
@@ -949,12 +1101,32 @@
     refreshTimer = setTimeout(refreshTimeline, 80);
   }
 
-  function autoPlayReply(event) {
-    if (event?.kind !== "reply") return;
+  function followReplyPlayback(event) {
     const turnId = event.turn;
-    const text = typeof event.text === "string" ? event.text.trim() : "";
+    if (!turnId) return;
+    if (event.kind === "speech_started") {
+      const player = playerFor(turnId);
+      if (!player.restartForSpeechGeneration(event.generation, playbackIntent)) return;
+      setStatus(recordingStatus, "Retrying speech…", "working");
+      requestPlayback(player, true).catch((error) => {
+        setStatus(recordingStatus, `Reply ready — press play (${errorMessage(error)})`, "error");
+      });
+      return;
+    }
+    if (event.kind === "tts_error" && event.terminal === true) {
+      const player = playerFor(turnId);
+      if (cancelAutomaticPlayback(player, event.error)) {
+        setStatus(
+          recordingStatus,
+          `Speech unavailable: ${event.error || "Speech synthesis failed"}`,
+          "error",
+        );
+      }
+      return;
+    }
+    if (event.kind !== "reply") return;
     const hasAudio = typeof event.audio === "string" && event.audio.length > 0;
-    if (!turnId || !hasAudio || !text || text.startsWith("[")) return;
+    if (!hasAudio) return;
     const player = playerFor(turnId);
     if (player.playing) return;
     if (navigator.userActivation && !navigator.userActivation.hasBeenActive) {
@@ -963,7 +1135,10 @@
     }
     // play() is intentionally idempotent while active, so the local POST path
     // and a matching event never create two streams.
-    requestPlayback(player, true).catch((error) => {
+    const playback = requestInitialPlayback(player);
+    if (!playback) return;
+    setStatus(recordingStatus, "Reply incoming…", "working");
+    playback.catch((error) => {
       setStatus(recordingStatus, `Reply ready — press play (${errorMessage(error)})`, "error");
     });
   }
@@ -1004,7 +1179,7 @@
             }
           }
         }
-        autoPlayReply(event);
+        followReplyPlayback(event);
         changed = true;
       }
     }

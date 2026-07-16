@@ -4,7 +4,13 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::f32::consts::TAU;
 use std::fmt;
+#[cfg(test)]
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+#[cfg(test)]
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
 
 const INTERACTIONS_URL: &str = "https://generativelanguage.googleapis.com/v1beta/interactions";
@@ -32,11 +38,108 @@ pub struct ChatReply {
     pub interaction_id: Option<String>,
 }
 
+#[derive(Debug)]
+pub struct StreamFailure {
+    message: String,
+    retryable: bool,
+}
+
+impl StreamFailure {
+    pub fn retryable(&self) -> bool {
+        self.retryable
+    }
+}
+
+impl fmt::Display for StreamFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for StreamFailure {}
+
+#[derive(Debug)]
+struct ProviderStreamFailure {
+    code: String,
+    message: String,
+}
+
+impl ProviderStreamFailure {
+    fn retryable(&self) -> bool {
+        let code = self.code.trim().trim_end_matches('/');
+        if let Ok(raw_status) = code.parse::<u16>()
+            && let Ok(status) = reqwest::StatusCode::from_u16(raw_status)
+        {
+            return http_status_is_retryable(status);
+        }
+
+        // The Interactions API defines this field as a URI identifying the
+        // error type, while its examples currently use bare snake-case names.
+        // Match only the documented transient categories and conservatively
+        // leave unknown provider rejections terminal.
+        let kind = code.rsplit(['/', '#']).next().unwrap_or(code);
+        matches!(
+            kind.to_ascii_lowercase().as_str(),
+            "gateway_timeout"
+                | "deadline_exceeded"
+                | "request_timeout"
+                | "resource_exhausted"
+                | "internal"
+                | "unavailable"
+        )
+    }
+}
+
+impl fmt::Display for ProviderStreamFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Gemini TTS error ({}): {}",
+            self.code, self.message
+        )
+    }
+}
+
+impl std::error::Error for ProviderStreamFailure {}
+
+#[derive(Debug)]
+struct ProviderCompletionFailure {
+    status: Option<String>,
+    interaction_id: Option<String>,
+}
+
+impl fmt::Display for ProviderCompletionFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let status = self.status.as_deref().unwrap_or("<missing>");
+        if let Some(interaction_id) = &self.interaction_id {
+            write!(
+                formatter,
+                "Gemini TTS interaction {interaction_id} ended with status {status}"
+            )
+        } else {
+            write!(
+                formatter,
+                "Gemini TTS interaction ended with status {status}"
+            )
+        }
+    }
+}
+
+impl std::error::Error for ProviderCompletionFailure {}
+
 #[derive(Clone)]
 pub struct Ai {
     client: reqwest::Client,
     api_key: Option<String>,
     mock: bool,
+    #[cfg(test)]
+    transcription_failures: Arc<AtomicUsize>,
+    #[cfg(test)]
+    transcription_blocks: Arc<AtomicUsize>,
+    #[cfg(test)]
+    transcription_started: Option<Arc<Notify>>,
+    #[cfg(test)]
+    transcription_release: Option<Arc<Notify>>,
 }
 
 impl Ai {
@@ -53,6 +156,14 @@ impl Ai {
             client: reqwest::Client::new(),
             mock: mock_requested || api_key.is_none(),
             api_key,
+            #[cfg(test)]
+            transcription_failures: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            transcription_blocks: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            transcription_started: None,
+            #[cfg(test)]
+            transcription_release: None,
         }
     }
 
@@ -61,7 +172,33 @@ impl Ai {
             client: reqwest::Client::new(),
             api_key: None,
             mock: true,
+            #[cfg(test)]
+            transcription_failures: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            transcription_blocks: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            transcription_started: None,
+            #[cfg(test)]
+            transcription_release: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mock_failing_transcriptions(count: usize) -> Self {
+        let ai = Self::mock();
+        ai.transcription_failures.store(count, Ordering::SeqCst);
+        ai
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mock_blocking_transcription() -> (Self, Arc<Notify>, Arc<Notify>) {
+        let mut ai = Self::mock();
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        ai.transcription_blocks.store(1, Ordering::SeqCst);
+        ai.transcription_started = Some(started.clone());
+        ai.transcription_release = Some(release.clone());
+        (ai, started, release)
     }
 
     pub fn is_mock(&self) -> bool {
@@ -70,6 +207,31 @@ impl Ai {
 
     /// Transcribe an entire WAV file using the interactions API.
     pub async fn transcribe(&self, wav: &[u8]) -> Result<String> {
+        #[cfg(test)]
+        if self
+            .transcription_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            bail!("injected transcription failure");
+        }
+        #[cfg(test)]
+        if self
+            .transcription_blocks
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            if let Some(started) = &self.transcription_started {
+                started.notify_one();
+            }
+            if let Some(release) = &self.transcription_release {
+                release.notified().await;
+            }
+        }
         if self.mock {
             return Ok("Mock voice transcript".into());
         }
@@ -157,7 +319,7 @@ impl Ai {
     /// Start TTS in the background. Each successful receive is the next
     /// contiguous block of 24 kHz mono signed-16 PCM samples. The sender
     /// closes at EOF; a terminal synthesis/parsing failure is sent as `Err`.
-    pub fn tts_stream(&self, text: String) -> mpsc::Receiver<Result<Vec<i16>, String>> {
+    pub fn tts_stream(&self, text: String) -> mpsc::Receiver<Result<Vec<i16>, StreamFailure>> {
         let (sender, receiver) = mpsc::channel(16);
         if self.mock {
             tokio::spawn(mock_tts(sender));
@@ -165,11 +327,50 @@ impl Ai {
             let ai = self.clone();
             tokio::spawn(async move {
                 if let Err(error) = ai.stream_tts(text, &sender).await {
-                    let _ = sender.send(Err(format!("{error:#}"))).await;
+                    let retryable = ai.failure_is_retryable(&error);
+                    let _ = sender
+                        .send(Err(StreamFailure {
+                            message: format!("{error:#}"),
+                            retryable,
+                        }))
+                        .await;
                 }
             });
         }
         receiver
+    }
+
+    /// Permanent provider rejections should not consume an arbitrary retry
+    /// budget. Network failures, rate limits, timeouts, and 5xx responses are
+    /// retryable; other 4xx responses require changed input or credentials.
+    pub fn failure_is_retryable(&self, error: &anyhow::Error) -> bool {
+        if let Some(failure) = error.downcast_ref::<StreamFailure>() {
+            return failure.retryable();
+        }
+        if let Some(failure) = error.downcast_ref::<ProviderStreamFailure>() {
+            return failure.retryable();
+        }
+        // None of the terminal completion statuses documented by the
+        // Interactions API are transient: incomplete can mean max_tokens,
+        // requires_action needs new input, and failed/cancelled need an
+        // explicit provider error before they can be classified otherwise.
+        if error.downcast_ref::<ProviderCompletionFailure>().is_some() {
+            return false;
+        }
+        if let Some(failure) = error.downcast_ref::<std::io::Error>()
+            && matches!(
+                failure.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::InvalidData
+                    | std::io::ErrorKind::InvalidInput
+            )
+        {
+            return false;
+        }
+        error
+            .downcast_ref::<HttpFailure>()
+            .is_none_or(|failure| http_status_is_retryable(failure.status))
     }
 
     async fn interaction(&self, body: &Value) -> Result<Value> {
@@ -201,7 +402,7 @@ impl Ai {
     async fn stream_tts(
         &self,
         text: String,
-        sender: &mpsc::Sender<Result<Vec<i16>, String>>,
+        sender: &mpsc::Sender<Result<Vec<i16>, StreamFailure>>,
     ) -> Result<()> {
         let key = self
             .api_key
@@ -226,16 +427,18 @@ impl Ai {
         let status = response.status();
         if !status.is_success() {
             let message = response.text().await.unwrap_or_default();
-            bail!(
-                "Gemini TTS returned {status}: {}",
-                message.chars().take(500).collect::<String>()
-            );
+            return Err(HttpFailure {
+                status,
+                body: message.chars().take(500).collect(),
+            }
+            .into());
         }
 
         let mut bytes = response.bytes_stream();
         let mut lines = Vec::<u8>::new();
         let mut odd_byte = None;
         let mut produced = false;
+        let mut completed = false;
         loop {
             let next = tokio::time::timeout(Duration::from_secs(30), bytes.next())
                 .await
@@ -249,15 +452,17 @@ impl Ai {
                 }
                 match parse_audio_event(&line, &mut odd_byte)? {
                     AudioEvent::Samples(samples) if !samples.is_empty() => {
+                        if completed {
+                            bail!("Gemini TTS emitted audio after interaction completion");
+                        }
                         produced = true;
                         if sender.send(Ok(samples)).await.is_err() {
                             return Ok(()); // HTTP client stopped listening
                         }
                     }
+                    AudioEvent::Completed => completed = true,
                     AudioEvent::Done => {
-                        if !produced {
-                            bail!("Gemini TTS stream produced no audio");
-                        }
+                        validate_audio_completion(odd_byte, produced, completed, true)?;
                         return Ok(());
                     }
                     _ => {}
@@ -265,20 +470,24 @@ impl Ai {
             }
         }
 
-        if !lines.is_empty()
-            && let AudioEvent::Samples(samples) = parse_audio_event(&lines, &mut odd_byte)?
-            && !samples.is_empty()
-        {
-            produced = true;
-            let _ = sender.send(Ok(samples)).await;
+        if !lines.is_empty() {
+            match parse_audio_event(&lines, &mut odd_byte)? {
+                AudioEvent::Samples(samples) if !samples.is_empty() => {
+                    if completed {
+                        bail!("Gemini TTS emitted audio after interaction completion");
+                    }
+                    produced = true;
+                    let _ = sender.send(Ok(samples)).await;
+                }
+                AudioEvent::Completed => completed = true,
+                AudioEvent::Done => {
+                    validate_audio_completion(odd_byte, produced, completed, true)?;
+                    return Ok(());
+                }
+                _ => {}
+            }
         }
-        if odd_byte.is_some() {
-            bail!("Gemini TTS stream ended midway through a PCM sample");
-        }
-        if !produced {
-            bail!("Gemini TTS stream produced no audio");
-        }
-        Ok(())
+        validate_audio_completion(odd_byte, produced, completed, false)
     }
 }
 
@@ -296,6 +505,14 @@ impl fmt::Display for HttpFailure {
 
 impl std::error::Error for HttpFailure {}
 
+fn http_status_is_retryable(status: reqwest::StatusCode) -> bool {
+    status.is_server_error()
+        || matches!(
+            status,
+            reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_MANY_REQUESTS
+        )
+}
+
 fn previous_interaction_rejected(error: &anyhow::Error) -> bool {
     error.downcast_ref::<HttpFailure>().is_some_and(|failure| {
         failure.status == reqwest::StatusCode::BAD_REQUEST
@@ -308,6 +525,7 @@ fn previous_interaction_rejected(error: &anyhow::Error) -> bool {
 
 enum AudioEvent {
     Ignore,
+    Completed,
     Done,
     Samples(Vec<i16>),
 }
@@ -317,24 +535,52 @@ fn parse_audio_event(line: &[u8], odd_byte: &mut Option<u8>) -> Result<AudioEven
         return Ok(AudioEvent::Ignore);
     };
     let payload = payload.strip_prefix(b" ").unwrap_or(payload);
+    if payload.is_empty() {
+        return Ok(AudioEvent::Ignore);
+    }
     if payload == b"[DONE]" {
         return Ok(AudioEvent::Done);
     }
-    let value: Value = match serde_json::from_slice(payload) {
-        Ok(value) => value,
-        // Ignore SSE keepalive/metadata lines, but malformed audio events are
-        // surfaced once they identify themselves as audio below.
-        Err(_) => return Ok(AudioEvent::Ignore),
-    };
-    let Some(encoded) = value["delta"]["data"]
-        .as_str()
-        .filter(|_| value["delta"]["type"] == "audio")
-    else {
+    let value: Value =
+        serde_json::from_slice(payload).context("invalid JSON in Gemini TTS SSE data")?;
+    match value["event_type"].as_str() {
+        Some("error") => {
+            let code = value["error"]["code"].as_str().unwrap_or("provider_error");
+            let message = value["error"]["message"]
+                .as_str()
+                .unwrap_or("Gemini TTS interaction failed");
+            return Err(ProviderStreamFailure {
+                code: code.to_owned(),
+                message: message.to_owned(),
+            }
+            .into());
+        }
+        Some("interaction.completed") => {
+            let status = value["interaction"]["status"].as_str();
+            if status != Some("completed") {
+                return Err(ProviderCompletionFailure {
+                    status: status.map(str::to_owned),
+                    interaction_id: value["interaction"]["id"].as_str().map(str::to_owned),
+                }
+                .into());
+            }
+            return Ok(AudioEvent::Completed);
+        }
+        _ => {}
+    }
+    if value["delta"]["type"] != "audio" {
         return Ok(AudioEvent::Ignore);
-    };
+    }
+    let encoded = value["delta"]["data"]
+        .as_str()
+        .filter(|encoded| !encoded.is_empty())
+        .context("Gemini TTS audio delta omitted audio data")?;
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(encoded)
         .context("invalid base64 in Gemini TTS audio delta")?;
+    if decoded.is_empty() {
+        bail!("Gemini TTS audio delta decoded to no bytes");
+    }
     let mut samples = Vec::with_capacity((decoded.len() + usize::from(odd_byte.is_some())) / 2);
     let mut data = decoded.as_slice();
     if let Some(low) = odd_byte.take() {
@@ -354,6 +600,27 @@ fn parse_audio_event(line: &[u8], odd_byte: &mut Option<u8>) -> Result<AudioEven
         *odd_byte = data.last().copied();
     }
     Ok(AudioEvent::Samples(samples))
+}
+
+fn validate_audio_completion(
+    odd_byte: Option<u8>,
+    produced: bool,
+    completed: bool,
+    done: bool,
+) -> Result<()> {
+    if odd_byte.is_some() {
+        bail!("Gemini TTS stream ended midway through a PCM sample");
+    }
+    if !produced {
+        bail!("Gemini TTS stream produced no audio");
+    }
+    if !completed {
+        bail!("Gemini TTS stream omitted successful interaction completion");
+    }
+    if !done {
+        bail!("Gemini TTS stream ended before data: [DONE]");
+    }
+    Ok(())
 }
 
 fn output_text(response: &Value, purpose: &str) -> Result<String> {
@@ -402,7 +669,7 @@ fn durable_prompt(user_text: &str, history: &[HistoryTurn]) -> String {
     prompt
 }
 
-async fn mock_tts(sender: mpsc::Sender<Result<Vec<i16>, String>>) {
+async fn mock_tts(sender: mpsc::Sender<Result<Vec<i16>, StreamFailure>>) {
     // A short two-tone acknowledgement makes the streaming/playback path
     // audibly testable without pretending mock mode can synthesize speech.
     const CHUNK: usize = 2_400; // 100 ms
@@ -459,5 +726,201 @@ mod tests {
             AudioEvent::Samples(samples) if samples == vec![513, 1027]
         ));
         assert_eq!(odd, None);
+    }
+
+    #[test]
+    fn audio_completion_rejects_a_partial_final_sample() {
+        assert!(validate_audio_completion(Some(1), true, true, true).is_err());
+        assert!(validate_audio_completion(None, false, true, true).is_err());
+        assert!(validate_audio_completion(None, true, false, true).is_err());
+        assert!(validate_audio_completion(None, true, true, false).is_err());
+        assert!(validate_audio_completion(None, true, true, true).is_ok());
+    }
+
+    #[test]
+    fn audio_parser_requires_well_formed_nonempty_audio_deltas() {
+        let mut odd = None;
+        assert!(parse_audio_event(b"data: {", &mut odd).is_err());
+        assert!(
+            parse_audio_event(
+                br#"data: {"event_type":"step.delta","delta":{"type":"audio"}}"#,
+                &mut odd,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_audio_event(
+                br#"data: {"event_type":"step.delta","delta":{"type":"audio","data":""}}"#,
+                &mut odd,
+            )
+            .is_err()
+        );
+        assert!(matches!(
+            parse_audio_event(b"data:", &mut odd).unwrap(),
+            AudioEvent::Ignore
+        ));
+        assert!(matches!(
+            parse_audio_event(
+                br#"data: {"event_type":"interaction.created","interaction":{"status":"in_progress"}}"#,
+                &mut odd,
+            )
+            .unwrap(),
+            AudioEvent::Ignore
+        ));
+    }
+
+    #[test]
+    fn audio_parser_requires_successful_semantic_completion() {
+        let mut odd = None;
+        assert!(parse_audio_event(
+            br#"data: {"event_type":"error","error":{"code":"gateway_timeout","message":"expired"}}"#,
+            &mut odd,
+        )
+        .is_err());
+        assert!(parse_audio_event(
+            br#"data: {"event_type":"interaction.completed","interaction":{"status":"incomplete"}}"#,
+            &mut odd,
+        )
+        .is_err());
+        assert!(matches!(
+            parse_audio_event(
+                br#"data: {"event_type":"interaction.completed","interaction":{"status":"completed"}}"#,
+                &mut odd,
+            )
+            .unwrap(),
+            AudioEvent::Completed
+        ));
+        assert!(matches!(
+            parse_audio_event(b"data: [DONE]", &mut odd).unwrap(),
+            AudioEvent::Done
+        ));
+    }
+
+    #[test]
+    fn provider_stream_errors_preserve_details_and_retry_semantics() {
+        let ai = Ai::mock();
+        let parse_failure = |code: &str, message: &str| {
+            let line = format!(
+                "data: {}",
+                json!({
+                    "event_type": "error",
+                    "error": {"code": code, "message": message},
+                })
+            );
+            let mut odd = None;
+            match parse_audio_event(line.as_bytes(), &mut odd) {
+                Err(error) => error,
+                Ok(_) => panic!("provider error event was accepted"),
+            }
+        };
+
+        let timeout = parse_failure("gateway_timeout", "deadline expired");
+        let typed = timeout
+            .downcast_ref::<ProviderStreamFailure>()
+            .expect("provider error should retain its type");
+        assert_eq!(typed.code, "gateway_timeout");
+        assert_eq!(typed.message, "deadline expired");
+        assert_eq!(
+            typed.to_string(),
+            "Gemini TTS error (gateway_timeout): deadline expired"
+        );
+        assert!(ai.failure_is_retryable(&timeout));
+
+        assert!(ai.failure_is_retryable(&parse_failure(
+            "https://generativelanguage.googleapis.com/errors/resource_exhausted",
+            "try later",
+        )));
+        assert!(ai.failure_is_retryable(&parse_failure("503", "unavailable")));
+
+        for code in [
+            "invalid_argument",
+            "permission_denied",
+            "unauthenticated",
+            "not_found",
+            "future_provider_rejection",
+        ] {
+            assert!(
+                !ai.failure_is_retryable(&parse_failure(code, "request rejected")),
+                "{code} should be terminal"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_completion_failures_preserve_status_and_are_terminal() {
+        let ai = Ai::mock();
+        let parse_failure = |status: Option<&str>, interaction_id: Option<&str>| {
+            let mut interaction = json!({});
+            if let Some(status) = status {
+                interaction["status"] = json!(status);
+            }
+            if let Some(interaction_id) = interaction_id {
+                interaction["id"] = json!(interaction_id);
+            }
+            let line = format!(
+                "data: {}",
+                json!({
+                    "event_type": "interaction.completed",
+                    "interaction": interaction,
+                })
+            );
+            let mut odd = None;
+            match parse_audio_event(line.as_bytes(), &mut odd) {
+                Err(error) => error,
+                Ok(_) => panic!("non-successful completion event was accepted"),
+            }
+        };
+
+        let incomplete = parse_failure(Some("incomplete"), Some("interaction-123"));
+        let typed = incomplete
+            .downcast_ref::<ProviderCompletionFailure>()
+            .expect("completion failure should retain its type");
+        assert_eq!(typed.status.as_deref(), Some("incomplete"));
+        assert_eq!(typed.interaction_id.as_deref(), Some("interaction-123"));
+        assert_eq!(
+            typed.to_string(),
+            "Gemini TTS interaction interaction-123 ended with status incomplete"
+        );
+        assert!(!ai.failure_is_retryable(&incomplete));
+
+        for status in [
+            "requires_action",
+            "failed",
+            "cancelled",
+            "budget_exceeded",
+            "future_terminal_status",
+        ] {
+            assert!(
+                !ai.failure_is_retryable(&parse_failure(Some(status), None)),
+                "{status} should be terminal"
+            );
+        }
+
+        let missing = parse_failure(None, None);
+        let typed = missing
+            .downcast_ref::<ProviderCompletionFailure>()
+            .expect("missing completion status should retain its type");
+        assert_eq!(typed.status, None);
+        assert_eq!(
+            typed.to_string(),
+            "Gemini TTS interaction ended with status <missing>"
+        );
+        assert!(!ai.failure_is_retryable(&missing));
+    }
+
+    #[test]
+    fn provider_failures_distinguish_retryable_from_permanent_rejections() {
+        let ai = Ai::mock();
+        let failure = |status| {
+            anyhow::Error::new(HttpFailure {
+                status,
+                body: "test".into(),
+            })
+        };
+        assert!(!ai.failure_is_retryable(&failure(reqwest::StatusCode::BAD_REQUEST)));
+        assert!(!ai.failure_is_retryable(&failure(reqwest::StatusCode::UNAUTHORIZED)));
+        assert!(ai.failure_is_retryable(&failure(reqwest::StatusCode::TOO_MANY_REQUESTS)));
+        assert!(ai.failure_is_retryable(&failure(reqwest::StatusCode::BAD_GATEWAY)));
+        assert!(ai.failure_is_retryable(&anyhow!("connection reset")));
     }
 }

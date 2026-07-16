@@ -54,7 +54,10 @@ fn main() -> std::io::Result<()> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()?;
-    curl.stdin.take().unwrap().write_all(body.to_string().as_bytes())?;
+    curl.stdin
+        .take()
+        .unwrap()
+        .write_all(body.to_string().as_bytes())?;
 
     let reader = BufReader::new(curl.stdout.take().unwrap());
     let mut aplay: Option<std::process::Child> = None;
@@ -90,7 +93,13 @@ fn main() -> std::io::Result<()> {
             );
         }
         samples += pcm.len() / 2;
-        aplay.as_mut().unwrap().stdin.as_mut().unwrap().write_all(&pcm)?;
+        aplay
+            .as_mut()
+            .unwrap()
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(&pcm)?;
     }
     println!(
         "stream done at {:?} ({:.1}s of audio)",

@@ -10,7 +10,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
@@ -20,11 +20,16 @@ pub struct Store {
     _writer_lock: Arc<File>,
     #[cfg(test)]
     fail_activity_writes: Arc<AtomicBool>,
+    #[cfg(test)]
+    fail_appends: Arc<AtomicUsize>,
+    #[cfg(test)]
+    fail_record_reads: Arc<AtomicUsize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PutClip {
     Created,
+    Repaired,
     AlreadyExists,
 }
 
@@ -95,6 +100,10 @@ impl Store {
             _writer_lock: Arc::new(writer_lock),
             #[cfg(test)]
             fail_activity_writes: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_appends: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            fail_record_reads: Arc::new(AtomicUsize::new(0)),
         };
         store.ensure_starter()?;
         store.reconcile_activity_caches();
@@ -298,6 +307,16 @@ impl Store {
     }
 
     pub fn records(&self, project_id: &str, conversation_id: &str) -> Result<Vec<Value>> {
+        #[cfg(test)]
+        if self
+            .fail_record_reads
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            bail!("injected journal read failure");
+        }
         self.conversation(project_id, conversation_id)?;
         let lock = self.conversation_lock(project_id, conversation_id);
         let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -311,15 +330,54 @@ impl Store {
         read_jsonl(&path)
     }
 
-    pub fn append(
+    pub fn append(&self, project_id: &str, conversation_id: &str, record: Value) -> Result<Value> {
+        self.conversation(project_id, conversation_id)?;
+        let lock = self.conversation_lock(project_id, conversation_id);
+        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.append_unlocked(project_id, conversation_id, record)
+    }
+
+    /// Append only while a predicate over the current durable journal still
+    /// holds. The read, decision, and append share the conversation lock, so a
+    /// dependent worker cannot publish a stale terminal event after the event
+    /// that invalidated it.
+    pub fn append_if<F>(
+        &self,
+        project_id: &str,
+        conversation_id: &str,
+        record: Value,
+        predicate: F,
+    ) -> Result<Option<Value>>
+    where
+        F: FnOnce(&[Value]) -> bool,
+    {
+        self.conversation(project_id, conversation_id)?;
+        let lock = self.conversation_lock(project_id, conversation_id);
+        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let records = self.records_unlocked(project_id, conversation_id)?;
+        if !predicate(&records) {
+            return Ok(None);
+        }
+        self.append_unlocked(project_id, conversation_id, record)
+            .map(Some)
+    }
+
+    fn append_unlocked(
         &self,
         project_id: &str,
         conversation_id: &str,
         mut record: Value,
     ) -> Result<Value> {
-        self.conversation(project_id, conversation_id)?;
-        let lock = self.conversation_lock(project_id, conversation_id);
-        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        #[cfg(test)]
+        if self
+            .fail_appends
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                (remaining > 0).then(|| remaining - 1)
+            })
+            == Ok(1)
+        {
+            bail!("injected journal append failure");
+        }
         let path = self
             .conversation_dir(project_id, conversation_id)
             .join("turns.jsonl");
@@ -333,6 +391,22 @@ impl Store {
         append_jsonl(&path, &record)?;
         self.record_activity_best_effort(project_id, conversation_id, record["at"].as_u64());
         Ok(record)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_append_after(&self, successful_appends: usize) {
+        self.fail_appends
+            .store(successful_appends.saturating_add(1), Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_record_reads(&self, count: usize) {
+        self.fail_record_reads.store(count, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_read_failures_remaining(&self) -> usize {
+        self.fail_record_reads.load(Ordering::SeqCst)
     }
 
     pub fn put_clip(&self, upload: ClipUpload<'_>) -> Result<(PutClip, Option<Value>)> {
@@ -354,9 +428,21 @@ impl Store {
         if let Some(existing) = existing {
             if existing["sha256"].as_str() == Some(&actual_sha) {
                 // Restore a missing/corrupt payload after an interrupted write or
-                // external damage while keeping the event idempotent.
+                // external damage. Persist the reopen intent before replacing
+                // the bytes: a crash or append failure must not turn a completed
+                // repair into an indistinguishable, workflow-inert replay.
                 if file_sha256(&final_path).as_deref() != Some(actual_sha.as_str()) {
+                    let event = self.append_unlocked(
+                        upload.project_id,
+                        upload.conversation_id,
+                        json!({
+                            "kind":"transcript_retry_requested",
+                            "clip":upload.clip_id,
+                            "reason":"payload_repaired"
+                        }),
+                    )?;
                     write_clip_atomic(&directory, upload.clip_id, upload.bytes)?;
+                    return Ok((PutClip::Repaired, Some(event)));
                 }
                 return Ok((PutClip::AlreadyExists, None));
             }
@@ -478,22 +564,6 @@ impl Store {
             clips: turn_clips(&record)?,
             record,
         })
-    }
-
-    pub fn untranscribed(&self, project_id: &str, conversation_id: &str) -> Result<Vec<String>> {
-        let records = self.records(project_id, conversation_id)?;
-        let finished: HashSet<String> = records
-            .iter()
-            .filter(|record| record["kind"] == "transcript")
-            .filter_map(|record| record["clip"].as_str().map(str::to_string))
-            .collect();
-        Ok(records
-            .iter()
-            .filter(|record| record["kind"] == "clip")
-            .filter_map(|record| record["id"].as_str())
-            .filter(|id| !finished.contains(*id))
-            .map(str::to_string)
-            .collect())
     }
 
     pub fn conversation_keys(&self) -> Result<Vec<(String, String)>> {
@@ -848,6 +918,67 @@ mod tests {
     }
 
     #[test]
+    fn matching_upload_distinguishes_payload_repair_from_an_inert_replay() {
+        let (_temporary, store) = store_with_general();
+        let bytes = b"RIFF tiny fake wav";
+        let sha = hex_sha256(bytes);
+        let upload = || ClipUpload {
+            project_id: "kibo",
+            conversation_id: "general",
+            clip_id: "clip-1",
+            bytes,
+            expected_sha256: &sha,
+            duration_ms: 1000,
+            peak_pct: 10,
+            recorded_at: 1,
+        };
+        assert_eq!(store.put_clip(upload()).unwrap().0, PutClip::Created);
+        let path = store.clip_path("kibo", "general", "clip-1").unwrap();
+        fs::write(&path, b"damaged").unwrap();
+
+        let (outcome, repair) = store.put_clip(upload()).unwrap();
+        assert_eq!(outcome, PutClip::Repaired);
+        assert_eq!(
+            repair.as_ref().unwrap()["kind"],
+            "transcript_retry_requested"
+        );
+        assert_eq!(repair.as_ref().unwrap()["reason"], "payload_repaired");
+        assert_eq!(fs::read(path).unwrap(), bytes);
+        assert_eq!(store.put_clip(upload()).unwrap().0, PutClip::AlreadyExists);
+        assert_eq!(store.records("kibo", "general").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn payload_repair_persists_retry_intent_before_replacing_bytes() {
+        let (_temporary, store) = store_with_general();
+        let bytes = b"RIFF tiny fake wav";
+        let sha = hex_sha256(bytes);
+        let upload = || ClipUpload {
+            project_id: "kibo",
+            conversation_id: "general",
+            clip_id: "clip-1",
+            bytes,
+            expected_sha256: &sha,
+            duration_ms: 1000,
+            peak_pct: 10,
+            recorded_at: 1,
+        };
+        store.put_clip(upload()).unwrap();
+        let path = store.clip_path("kibo", "general", "clip-1").unwrap();
+        fs::write(&path, b"damaged").unwrap();
+
+        store.fail_append_after(0);
+        assert!(store.put_clip(upload()).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"damaged");
+        assert_eq!(store.records("kibo", "general").unwrap().len(), 1);
+
+        let (outcome, event) = store.put_clip(upload()).unwrap();
+        assert_eq!(outcome, PutClip::Repaired);
+        assert_eq!(event.unwrap()["reason"], "payload_repaired");
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+
+    #[test]
     fn append_recovers_an_incomplete_final_jsonl_record() {
         let (_temporary, store) = store_with_general();
         store
@@ -934,6 +1065,57 @@ mod tests {
         assert_eq!(sequences.len(), 20);
         assert_eq!(sequences.iter().min(), Some(&1));
         assert_eq!(sequences.iter().max(), Some(&20));
+    }
+
+    #[test]
+    fn concurrent_conditional_appends_commit_one_reopen_transition() {
+        let (_temporary, store) = store_with_general();
+        store
+            .append(
+                "kibo",
+                "general",
+                json!({"kind":"transcript_error", "clip":"clip-1", "terminal":true}),
+            )
+            .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(5));
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let store = store.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store
+                        .append_if(
+                            "kibo",
+                            "general",
+                            json!({"kind":"transcript_retry_requested", "clip":"clip-1"}),
+                            |records| {
+                                !records.iter().any(|event| {
+                                    event["kind"] == "transcript_retry_requested"
+                                        && event["clip"] == "clip-1"
+                                })
+                            },
+                        )
+                        .unwrap()
+                })
+            })
+            .collect();
+        barrier.wait();
+        let committed = threads
+            .into_iter()
+            .filter_map(|thread| thread.join().unwrap())
+            .count();
+
+        assert_eq!(committed, 1);
+        assert_eq!(
+            store
+                .records("kibo", "general")
+                .unwrap()
+                .iter()
+                .filter(|event| event["kind"] == "transcript_retry_requested")
+                .count(),
+            1
+        );
     }
 
     #[test]

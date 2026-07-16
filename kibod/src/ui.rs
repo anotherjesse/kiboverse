@@ -1,6 +1,7 @@
 use crate::knowledge::{self, DocumentKind, SourceStatus};
 use crate::model::CreateNamed;
 use crate::state::{AppState, IngestOutcome};
+use crate::workflow::{AttemptState, ConversationWorkflow, SpeechState, TurnWork};
 use axum::Router;
 use axum::extract::{Form, Path, Query, State};
 use axum::http::{StatusCode, header};
@@ -287,7 +288,7 @@ fn render_page(
 <html lang=\"en\"><head>
 <meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\">
 <title>{conversation} · Kibo</title><meta name=\"description\" content=\"A durable voice conversation with Kibo\">
-	<link rel=\"stylesheet\" href=\"/assets/app.css?v=3\"><script src=\"/assets/htmx.min.js\" defer></script><script src=\"/assets/app.js?v=3\" defer></script>
+	<link rel=\"stylesheet\" href=\"/assets/app.css?v=3\"><script src=\"/assets/htmx.min.js\" defer></script><script src=\"/assets/app.js?v=4\" defer></script>
 	</head><body data-project-id=\"{project_id}\" data-conversation-id=\"{conversation_id}\" data-last-seq=\"{last_seq}\" data-conversation-url=\"{base}\" data-timeline-url=\"{page_url}/timeline\" data-events-url=\"{base}/events\">
 	<div class=\"app-shell\"><aside class=\"sidebar\"><div class=\"brand\"><span class=\"brand-mark\">k</span>Kibo</div>{navigation}
 	<details class=\"new-item\"><summary>New project</summary><form method=\"post\" action=\"/ui/projects\"><label>Name<input name=\"name\" maxlength=\"100\" required></label><button> create </button></form></details>
@@ -341,7 +342,7 @@ fn render_project_page(state: &AppState, project_id: &str) -> anyhow::Result<Str
 <html lang=\"en\"><head>
 <meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\">
 <title>{project} · Kibo</title><meta name=\"description\" content=\"Voice chats organized in Kibo projects\">
-<link rel=\"stylesheet\" href=\"/assets/app.css?v=3\"><script src=\"/assets/htmx.min.js\" defer></script><script src=\"/assets/app.js?v=3\" defer></script>
+<link rel=\"stylesheet\" href=\"/assets/app.css?v=3\"><script src=\"/assets/htmx.min.js\" defer></script><script src=\"/assets/app.js?v=4\" defer></script>
 </head><body data-project-id=\"{project_id}\">
 <div class=\"app-shell\"><aside class=\"sidebar\"><div class=\"brand\"><span class=\"brand-mark\">k</span>Kibo</div>{navigation}
 <details class=\"new-item\"><summary>New project</summary><form method=\"post\" action=\"/ui/projects\"><label>Name<input name=\"name\" maxlength=\"100\" required></label><button> create </button></form></details>
@@ -411,7 +412,7 @@ fn render_knowledge_page(
 <html lang=\"en\"><head>
 <meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
 <title>Knowledge · {project}</title><meta name=\"description\" content=\"Ingest conversations and web sources into project Markdown\">
-<link rel=\"stylesheet\" href=\"/assets/app.css?v=3\"><script src=\"/assets/app.js?v=3\" defer></script>
+<link rel=\"stylesheet\" href=\"/assets/app.css?v=3\"><script src=\"/assets/app.js?v=4\" defer></script>
 </head><body data-project-id=\"{project_id}\"><div class=\"app-shell\"><aside class=\"sidebar\"><div class=\"brand\"><span class=\"brand-mark\">k</span>Kibo</div>{navigation}
 <details class=\"new-item\"><summary>New project</summary><form method=\"post\" action=\"/ui/projects\"><label>Name<input name=\"name\" maxlength=\"100\" required></label><button> create </button></form></details>
 </aside><main class=\"main knowledge-main\"><div class=\"knowledge-wrap\">
@@ -634,45 +635,11 @@ fn render_timeline(project_id: &str, conversation_id: &str, records: &[Value]) -
     if records.is_empty() {
         return "<div class=\"empty-state\"><p><strong>No conversation yet.</strong></p><p>Hold the coral button to record a thought, then ask Kibo.</p></div>".into();
     }
-    let transcripts: HashMap<&str, &Value> = records
+    let workflow = ConversationWorkflow::from_records(records);
+    let claimed: HashSet<&str> = workflow
+        .turns()
         .iter()
-        .filter(|event| event["kind"] == "transcript")
-        .filter_map(|event| Some((event["clip"].as_str()?, event)))
-        .collect();
-    let transcript_errors: HashMap<&str, &Value> = records
-        .iter()
-        .filter(|event| event["kind"] == "transcript_error")
-        .filter_map(|event| Some((event["clip"].as_str()?, event)))
-        .collect();
-    let replies: HashMap<&str, &Value> = records
-        .iter()
-        .filter(|event| event["kind"] == "reply")
-        .filter_map(|event| Some((event["turn"].as_str()?, event)))
-        .collect();
-    let reply_errors: HashMap<&str, &Value> = records
-        .iter()
-        .filter(|event| event["kind"] == "reply_error")
-        .filter_map(|event| Some((event["turn"].as_str()?, event)))
-        .collect();
-    let mut speech_failed: HashMap<&str, bool> = HashMap::new();
-    for event in records {
-        if let Some(turn_id) = event["turn"].as_str() {
-            match event["kind"].as_str() {
-                Some("tts_error") => {
-                    speech_failed.insert(turn_id, true);
-                }
-                Some("speech_ready") => {
-                    speech_failed.insert(turn_id, false);
-                }
-                _ => {}
-            }
-        }
-    }
-    let claimed: HashSet<&str> = records
-        .iter()
-        .filter(|event| event["kind"] == "turn")
-        .flat_map(|event| event["clips"].as_array().into_iter().flatten())
-        .filter_map(Value::as_str)
+        .flat_map(|turn| turn.clips.iter().map(String::as_str))
         .collect();
     let clips: HashMap<&str, &Value> = records
         .iter()
@@ -681,37 +648,27 @@ fn render_timeline(project_id: &str, conversation_id: &str, records: &[Value]) -
         .collect();
 
     let mut html = String::new();
-    for turn in records.iter().filter(|event| event["kind"] == "turn") {
-        let Some(turn_id) = turn["id"].as_str() else {
-            continue;
-        };
-        let clip_ids: Vec<&str> = turn["clips"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .collect();
+    for turn in workflow.turns() {
+        let clip_ids: Vec<&str> = turn.clips.iter().map(String::as_str).collect();
         html.push_str(&render_user_message(
             project_id,
             conversation_id,
             &clip_ids,
             &clips,
-            &transcripts,
-            &transcript_errors,
+            &workflow,
         ));
-        if let Some(reply) = replies.get(turn_id) {
-            html.push_str(&render_reply(
-                turn_id,
-                reply,
-                speech_failed.get(turn_id) == Some(&true),
-            ));
-        } else if let Some(error) = reply_errors.get(turn_id) {
-            html.push_str(&format!(
+        match &turn.reply {
+            AttemptState::Succeeded(reply) => html.push_str(&render_reply(turn, reply)),
+            AttemptState::TerminalFailure(failure) => html.push_str(&format!(
                 "<article class=\"message assistant\"><p class=\"error-text\">{}</p></article>",
-                escape(error["error"].as_str().unwrap_or("Unknown error"))
-            ));
-        } else {
-            html.push_str("<article class=\"message assistant\"><p class=\"thinking\">Thinking…</p></article>");
+                escape(failure.error())
+            )),
+            AttemptState::RetryScheduled { .. } => html.push_str(
+                "<article class=\"message assistant\"><p class=\"thinking\">Retrying…</p></article>",
+            ),
+            AttemptState::Due { .. } | AttemptState::Attempting { .. } => html.push_str(
+                "<article class=\"message assistant\"><p class=\"thinking\">Thinking…</p></article>",
+            ),
         }
     }
 
@@ -726,8 +683,7 @@ fn render_timeline(project_id: &str, conversation_id: &str, records: &[Value]) -
             conversation_id,
             &[clip_id],
             &clips,
-            &transcripts,
-            &transcript_errors,
+            &workflow,
         ));
     }
     html
@@ -738,20 +694,22 @@ fn render_user_message(
     conversation_id: &str,
     clip_ids: &[&str],
     clips: &HashMap<&str, &Value>,
-    transcripts: &HashMap<&str, &Value>,
-    transcript_errors: &HashMap<&str, &Value>,
+    workflow: &ConversationWorkflow,
 ) -> String {
     let mut html = String::new();
     for clip_id in clip_ids {
-        let text = if let Some(transcript) = transcripts.get(clip_id) {
-            escape(transcript["text"].as_str().unwrap_or(""))
-        } else if let Some(error) = transcript_errors.get(clip_id) {
-            format!(
+        let text = match workflow.clip(clip_id).map(|clip| &clip.transcript) {
+            Some(AttemptState::Succeeded(transcript)) => escape(transcript),
+            Some(AttemptState::TerminalFailure(failure)) => format!(
                 "<span class=\"error-text\">Transcription failed: {}</span>",
-                escape(error["error"].as_str().unwrap_or("unknown error"))
-            )
-        } else {
-            "<span class=\"thinking\">Transcribing…</span>".into()
+                escape(&failure.error)
+            ),
+            Some(AttemptState::RetryScheduled { .. }) => {
+                "<span class=\"thinking\">Retrying transcription…</span>".into()
+            }
+            Some(AttemptState::Due { .. } | AttemptState::Attempting { .. }) | None => {
+                "<span class=\"thinking\">Transcribing…</span>".into()
+            }
         };
         if clips.contains_key(clip_id) {
             html.push_str(&format!(
@@ -769,15 +727,28 @@ fn render_user_message(
     html
 }
 
-fn render_reply(turn_id: &str, reply: &Value, tts_failed: bool) -> String {
-    let text = escape(reply["text"].as_str().unwrap_or(""));
-    if tts_failed {
-        return format!(
-            "<article class=\"message assistant\"><p>{}</p><span class=\"error-text\">Speech unavailable</span></article>",
-            text
-        );
+fn render_reply(turn: &TurnWork, reply: &crate::workflow::ReplyRecord) -> String {
+    let text = escape(&reply.text);
+    match &turn.speech {
+        Some(SpeechState::TerminalFailure(failure)) => {
+            return format!(
+                "<article class=\"message assistant\"><p>{}</p><span class=\"error-text\">Speech unavailable: {}</span></article>",
+                text,
+                escape(&failure.error)
+            );
+        }
+        Some(SpeechState::RetryScheduled { .. }) => {
+            return format!(
+                "<article class=\"message assistant\"><p>{}</p><span class=\"thinking\">Retrying speech…</span></article>",
+                text
+            );
+        }
+        Some(
+            SpeechState::Due { .. } | SpeechState::Attempting { .. } | SpeechState::Succeeded(()),
+        )
+        | None => {}
     }
-    if reply["audio"].is_null() {
+    if reply.audio.is_none() || turn.speech.is_none() {
         return format!(
             "<article class=\"message assistant\"><p>{}</p></article>",
             text
@@ -785,7 +756,7 @@ fn render_reply(turn_id: &str, reply: &Value, tts_failed: bool) -> String {
     }
     format!(
         "<article class=\"message assistant\" data-speech-player data-turn-id=\"{}\" role=\"button\" tabindex=\"0\" aria-label=\"Play reply\"><p>{}</p></article>",
-        escape_attr(turn_id),
+        escape_attr(&turn.id),
         text
     )
 }
@@ -917,5 +888,57 @@ mod tests {
             response.headers()[header::LOCATION],
             format!("/app/kibo/{}", conversations[0].id)
         );
+    }
+
+    #[test]
+    fn timeline_presents_nonterminal_failures_as_retrying() {
+        let records = vec![
+            serde_json::json!({"kind":"clip", "id":"clip-1"}),
+            serde_json::json!({"kind":"transcript_error", "clip":"clip-1", "error":"temporary", "terminal":false}),
+            serde_json::json!({"kind":"turn", "id":"turn-1", "clips":["clip-1"]}),
+            serde_json::json!({"kind":"reply_error", "turn":"turn-1", "error":"temporary", "terminal":false}),
+        ];
+
+        let html = render_timeline("kibo", "conversation", &records);
+
+        assert!(html.contains("Retrying transcription…"));
+        assert!(html.contains(">Retrying…<"));
+        assert!(!html.contains("Transcription failed"));
+        assert!(!html.contains(">temporary<"));
+    }
+
+    #[test]
+    fn timeline_allows_durable_retry_events_to_supersede_terminal_errors() {
+        let records = vec![
+            serde_json::json!({"kind":"clip", "id":"clip-1"}),
+            serde_json::json!({"kind":"transcript_error", "clip":"clip-1", "error":"broken", "terminal":true}),
+            serde_json::json!({"kind":"transcript_retry_requested", "clip":"clip-1"}),
+            serde_json::json!({"kind":"transcript", "clip":"clip-1", "text":"recovered"}),
+            serde_json::json!({"kind":"turn", "id":"turn-1", "clips":["clip-1"]}),
+            serde_json::json!({"kind":"reply_error", "turn":"turn-1", "error":"broken", "terminal":true}),
+            serde_json::json!({"kind":"reply_retry_requested", "turn":"turn-1"}),
+        ];
+
+        let html = render_timeline("kibo", "conversation", &records);
+
+        assert!(html.contains("recovered"));
+        assert!(html.contains(">Thinking…<"));
+        assert!(!html.contains("broken"));
+    }
+
+    #[test]
+    fn timeline_keeps_reply_text_while_speech_retries() {
+        let records = vec![
+            serde_json::json!({"kind":"turn", "id":"turn-1", "clips":[]}),
+            serde_json::json!({"kind":"reply", "turn":"turn-1", "text":"Durable text", "audio":"tts/turn-1.wav"}),
+            serde_json::json!({"kind":"tts_error", "turn":"turn-1", "error":"temporary", "terminal":false}),
+        ];
+
+        let html = render_timeline("kibo", "conversation", &records);
+
+        assert!(html.contains("Durable text"));
+        assert!(html.contains("Retrying speech…"));
+        assert!(!html.contains("Speech unavailable"));
+        assert!(!html.contains("data-speech-player"));
     }
 }

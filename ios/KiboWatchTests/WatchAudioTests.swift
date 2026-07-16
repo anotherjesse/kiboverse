@@ -4,6 +4,337 @@ import XCTest
 
 @MainActor
 final class WatchAudioTests: XCTestCase {
+    private var session: URLSession!
+    private let destination = KiboDestination(
+        serverURL: "https://one.example/",
+        projectID: "p1",
+        conversationID: "c1"
+    )
+
+    override func setUp() {
+        super.setUp()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [WatchStubURLProtocol.self]
+        session = URLSession(configuration: configuration)
+    }
+
+    override func tearDown() {
+        session.invalidateAndCancel()
+        session = nil
+        WatchStubURLProtocol.handler = nil
+        super.tearDown()
+    }
+
+    func testSuccessfulTurnRetryRestoresReplyPlaybackOwnership() {
+        var intent = WatchReplyPlaybackIntent()
+        intent.awaitReply(to: "t1", destination: destination)
+        intent.markPlaybackAttempt(speechEventSeq: 3)
+        intent.clear()
+
+        intent.retryFinished(
+            .turn("t1"),
+            outcome: .accepted(requiredEventsRevision: 4),
+            destination: destination
+        )
+
+        XCTAssertEqual(intent.awaitedTurnID, "t1")
+        XCTAssertNil(intent.attemptedSpeechEventSeq)
+        XCTAssertFalse(intent.canEvaluate(eventsRevision: 3))
+        XCTAssertTrue(intent.canEvaluate(eventsRevision: 4))
+    }
+
+    func testAcceptedRetryWaitsForRequiredDurableRefresh() throws {
+        var intent = WatchReplyPlaybackIntent()
+
+        intent.retryFinished(
+            .turn("t1"),
+            outcome: .accepted(requiredEventsRevision: 7),
+            destination: destination
+        )
+
+        XCTAssertEqual(intent.awaitedTurnID, "t1")
+        XCTAssertFalse(intent.canEvaluate(eventsRevision: 6))
+
+        let staleData = #"[{"seq":1,"kind":"turn","id":"t1","clips":[]},{"seq":2,"kind":"reply_error","turn":"t1","terminal":true,"error":"old failure"}]"#.data(using: .utf8)!
+        let staleEvents = try JSONDecoder().decode([KiboEvent].self, from: staleData)
+        XCTAssertNil(
+            intent.autoPlayAction(
+                events: staleEvents,
+                eventsRevision: 6,
+                loadingID: nil, playingID: nil, lastFinishedID: nil
+            )
+        )
+
+        XCTAssertTrue(intent.canEvaluate(eventsRevision: 7))
+        XCTAssertEqual(
+            intent.autoPlayAction(
+                events: staleEvents,
+                eventsRevision: 7,
+                loadingID: nil, playingID: nil, lastFinishedID: nil
+            ),
+            .failed
+        )
+    }
+
+    func testRejectedOrClipRetryDoesNotClaimReplyPlayback() {
+        var intent = WatchReplyPlaybackIntent()
+        intent.awaitReply(to: "old-turn", destination: destination)
+        intent.markPlaybackAttempt(speechEventSeq: 3)
+        intent.clear()
+
+        intent.retryFinished(
+            .turn("t1"), outcome: .notAccepted, destination: destination
+        )
+        XCTAssertNil(intent.awaitedTurnID)
+
+        intent.retryFinished(
+            .clip("c1"),
+            outcome: .accepted(requiredEventsRevision: 1),
+            destination: destination
+        )
+
+        XCTAssertNil(intent.awaitedTurnID)
+    }
+
+    func testOlderSameSelectionRefreshCannotReplaceNewerEventsOrAdvanceRevision() async {
+        let savedServerURL = UserDefaults.standard.string(forKey: "watchServerURL")
+        UserDefaults.standard.set("https://refresh-order.test/", forKey: "watchServerURL")
+        defer {
+            if let savedServerURL {
+                UserDefaults.standard.set(savedServerURL, forKey: "watchServerURL")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "watchServerURL")
+            }
+        }
+
+        let firstStarted = expectation(description: "first refresh started")
+        let releaseFirst = DispatchSemaphore(value: 0)
+        defer { releaseFirst.signal() }
+        let lock = NSLock()
+        var requestCount = 0
+        WatchStubURLProtocol.handler = { request in
+            let requestNumber = lock.withLock {
+                requestCount += 1
+                return requestCount
+            }
+            let body: Data
+            if requestNumber == 1 {
+                firstStarted.fulfill()
+                _ = releaseFirst.wait(timeout: .now() + 2)
+                body = #"{"events":[{"seq":1,"kind":"reply_error","turn":"t1","terminal":true,"error":"stale"}],"latest_seq":1}"#.data(using: .utf8)!
+            } else {
+                body = #"{"events":[{"seq":2,"kind":"speech_started","turn":"t1","attempt":2}],"latest_seq":2}"#.data(using: .utf8)!
+            }
+            return (
+                HTTPURLResponse(
+                    url: request.url!, statusCode: 200,
+                    httpVersion: nil, headerFields: nil
+                )!,
+                body
+            )
+        }
+
+        let store = WatchStore(session: session)
+        store.selectedProjectID = "p1"
+        store.selectedConversationID = "c1"
+        let first = Task { await store.refreshEvents() }
+        await fulfillment(of: [firstStarted], timeout: 2)
+        let second = Task { await store.refreshEvents() }
+        let secondAccepted = await second.value
+        XCTAssertTrue(secondAccepted)
+        releaseFirst.signal()
+        let firstAccepted = await first.value
+        XCTAssertFalse(firstAccepted)
+
+        XCTAssertEqual(store.events.map(\.seq), [2])
+        XCTAssertEqual(store.eventRevision, 1)
+    }
+
+    func testReplyReconnectKeepsItsImmutableDestinationAfterSelectionChanges() async throws {
+        let savedServerURL = UserDefaults.standard.string(forKey: "watchServerURL")
+        UserDefaults.standard.set("https://watch-reply-owner.test/", forKey: "watchServerURL")
+        defer {
+            if let savedServerURL {
+                UserDefaults.standard.set(savedServerURL, forKey: "watchServerURL")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "watchServerURL")
+            }
+        }
+
+        let lock = NSLock()
+        var requestPaths: [String] = []
+        WatchStubURLProtocol.handler = { request in
+            lock.withLock { requestPaths.append(request.url!.path) }
+            return (
+                HTTPURLResponse(
+                    url: request.url!, statusCode: 500,
+                    httpVersion: nil, headerFields: nil
+                )!,
+                Data()
+            )
+        }
+
+        let firstRetry = expectation(description: "first Watch stream load failed")
+        var mayRetry = false
+        var retryFailures: [Int] = []
+        let store = WatchStore(session: session)
+        store.selectedProjectID = "project"
+        store.selectedConversationID = "old-conversation"
+        let destination = try XCTUnwrap(store.requestDestination)
+        let player = PCMStreamingPlayer(
+            makeRenderer: { WatchFakeRenderer(sampleRate: $0, startSample: $1) },
+            activateSession: { _ in },
+            retryDelay: { failures in
+                retryFailures.append(failures)
+                if failures == 1 {
+                    firstRetry.fulfill()
+                    while !mayRetry { await Task.yield() }
+                }
+            }
+        )
+        let log = WatchEventLog()
+        let coordinator = WatchAudioCoordinator(
+            recorder: WatchFakeCapture(log: log),
+            session: WatchFakeSession(log: log),
+            player: player,
+            observeNotifications: false
+        )
+
+        coordinator.playReply(
+            turnID: "shared-turn", destination: destination, store: store
+        )
+        await fulfillment(of: [firstRetry], timeout: 1)
+        XCTAssertEqual(coordinator.loadingID, "reply-shared-turn")
+        store.selectedConversationID = "new-conversation"
+        mayRetry = true
+
+        await eventually { coordinator.loadingID == nil }
+        XCTAssertEqual(retryFailures, [1])
+        XCTAssertEqual(lock.withLock { requestPaths }, [
+            "/v1/projects/project/conversations/old-conversation/turns/shared-turn/speech",
+        ])
+        XCTAssertNil(coordinator.playbackErrorMessage)
+    }
+
+    func testReplyCommandScopeRejectsSelectionAndViewLifetimeRaces() {
+        var scope = WatchReplyCommandScope()
+        scope.appear(isActive: true)
+        let claim = scope.beginCommand(
+            serverURL: "https://one.example/", projectID: "p1", conversationID: "c1"
+        )!
+
+        XCTAssertTrue(scope.accepts(
+            claim, serverURL: "https://one.example/", projectID: "p1", conversationID: "c1"
+        ))
+        XCTAssertFalse(scope.accepts(
+            claim, serverURL: "https://two.example/", projectID: "p1", conversationID: "c1"
+        ))
+        XCTAssertFalse(scope.accepts(
+            claim, serverURL: "https://one.example/", projectID: "p1", conversationID: "c2"
+        ))
+
+        scope.selectionChanged()
+        XCTAssertFalse(scope.accepts(
+            claim, serverURL: "https://one.example/", projectID: "p1", conversationID: "c1"
+        ))
+
+        let replacement = scope.beginCommand(
+            serverURL: "https://one.example/", projectID: "p1", conversationID: "c1"
+        )!
+        scope.disappear()
+        XCTAssertFalse(scope.accepts(
+            replacement,
+            serverURL: "https://one.example/", projectID: "p1", conversationID: "c1"
+        ))
+    }
+
+    func testNewCommandAndInactiveSceneInvalidateEarlierClaims() {
+        var scope = WatchReplyCommandScope()
+        scope.appear(isActive: true)
+        let first = scope.beginCommand(
+            serverURL: "https://one.example/", projectID: "p1", conversationID: "c1"
+        )!
+        let second = scope.beginCommand(
+            serverURL: "https://one.example/", projectID: "p1", conversationID: "c1"
+        )!
+
+        XCTAssertFalse(scope.accepts(
+            first, serverURL: "https://one.example/", projectID: "p1", conversationID: "c1"
+        ))
+        XCTAssertTrue(scope.accepts(
+            second, serverURL: "https://one.example/", projectID: "p1", conversationID: "c1"
+        ))
+
+        scope.setActive(false)
+        XCTAssertFalse(scope.accepts(
+            second, serverURL: "https://one.example/", projectID: "p1", conversationID: "c1"
+        ))
+        XCTAssertFalse(scope.allowsPlayback)
+
+        scope.setActive(true)
+        XCTAssertTrue(scope.allowsPlayback)
+        XCTAssertFalse(scope.accepts(
+            second, serverURL: "https://one.example/", projectID: "p1", conversationID: "c1"
+        ))
+    }
+
+    func testSuspendedReadyReplyReopensTheSamePlaybackAttempt() throws {
+        let data = #"[{"seq":1,"kind":"turn","id":"t1","clips":[]},{"seq":2,"kind":"reply","turn":"t1","text":"Hi","audio":"tts/t1.wav"},{"seq":3,"kind":"speech_ready","turn":"t1","attempt":1}]"#.data(using: .utf8)!
+        let events = try JSONDecoder().decode([KiboEvent].self, from: data)
+        var intent = WatchReplyPlaybackIntent()
+        intent.awaitReply(to: "t1", destination: destination)
+
+        let first = events.replyAutoPlayAction(
+            for: "t1", attemptedSpeechEventSeq: intent.attemptedSpeechEventSeq,
+            loadingID: nil, playingID: nil, lastFinishedID: nil
+        )
+        XCTAssertEqual(first, .startPlayback(speechEventSeq: 3))
+        intent.markPlaybackAttempt(speechEventSeq: 3)
+        XCTAssertEqual(
+            events.replyAutoPlayAction(
+                for: "t1", attemptedSpeechEventSeq: intent.attemptedSpeechEventSeq,
+                loadingID: nil, playingID: nil, lastFinishedID: nil
+            ),
+            .wait
+        )
+
+        intent.suspendPlayback()
+        XCTAssertEqual(
+            events.replyAutoPlayAction(
+                for: "t1", attemptedSpeechEventSeq: intent.attemptedSpeechEventSeq,
+                loadingID: nil, playingID: nil, lastFinishedID: nil
+            ),
+            .startPlayback(speechEventSeq: 3)
+        )
+    }
+
+    func testSharedAutoplayWaitsForSpeechStartedAndThroughTooEarlyLoadingGap() throws {
+        let replyData = #"[{"seq":1,"kind":"turn","id":"t1","clips":[]},{"seq":2,"kind":"reply","turn":"t1","text":"Hi","audio":"tts/t1.wav"}]"#.data(using: .utf8)!
+        let reply = try JSONDecoder().decode([KiboEvent].self, from: replyData)
+        XCTAssertEqual(reply.replyReadiness(for: "t1"), .waiting)
+
+        let startedData = #"[{"seq":1,"kind":"turn","id":"t1","clips":[]},{"seq":2,"kind":"reply","turn":"t1","text":"Hi","audio":"tts/t1.wav"},{"seq":3,"kind":"speech_started","turn":"t1","attempt":1}]"#.data(using: .utf8)!
+        let started = try JSONDecoder().decode([KiboEvent].self, from: startedData)
+        XCTAssertEqual(started.replyReadiness(for: "t1"), .playable)
+        XCTAssertEqual(
+            started.replyAutoPlayAction(
+                for: "t1", attemptedSpeechEventSeq: 3,
+                loadingID: "reply-t1", playingID: nil, lastFinishedID: nil
+            ),
+            .wait
+        )
+
+        let restartedData = #"[{"seq":1,"kind":"turn","id":"t1","clips":[]},{"seq":2,"kind":"reply","turn":"t1","text":"Hi","audio":"tts/t1.wav"},{"seq":3,"kind":"speech_started","turn":"t1","attempt":1},{"seq":4,"kind":"speech_retry_scheduled","turn":"t1","attempt":1},{"seq":5,"kind":"speech_started","turn":"t1","attempt":2}]"#.data(using: .utf8)!
+        let restarted = try JSONDecoder().decode([KiboEvent].self, from: restartedData)
+        XCTAssertEqual(
+            restarted.replyAutoPlayAction(
+                for: "t1", attemptedSpeechEventSeq: 3,
+                loadingID: nil, playingID: nil, lastFinishedID: nil
+            ),
+            .startPlayback(speechEventSeq: 5)
+        )
+    }
+
     func testLedgerPreservesAlignmentAcrossByteBoundaries() {
         var ledger = PCMStreamLedger()
         ledger.append(Data([0x01]))
@@ -20,12 +351,12 @@ final class WatchAudioTests: XCTestCase {
         var renderers: [WatchFakeRenderer] = []
         let player = makePlayer { renderers.append($0) }
 
-        player.play(id: "old") { _ in
+        player.play(id: "old") { _, _ in
             try await withCheckedThrowingContinuation { staleLoader = $0 }
         }
         await eventually { staleLoader != nil }
 
-        player.play(id: "new") { _ in
+        player.play(id: "new") { _, _ in
             try await withCheckedThrowingContinuation { replacementLoader = $0 }
         }
         await eventually { replacementLoader != nil }
@@ -48,7 +379,7 @@ final class WatchAudioTests: XCTestCase {
         var renderers: [WatchFakeRenderer] = []
         let player = makePlayer { renderers.append($0) }
 
-        player.play(id: "reply") { offset in
+        player.play(id: "reply") { offset, _ in
             offsets.append(offset)
             if offsets.count == 1 {
                 return SpeechResponseStream(
@@ -68,12 +399,62 @@ final class WatchAudioTests: XCTestCase {
         XCTAssertEqual(renderers[0].scheduledSamples, [1, 2, 3])
     }
 
+    func testNewSpeechGenerationDiscardsEarlierAttemptAndRestartsAtZero() async {
+        var offsets: [Int] = []
+        var expectedGenerations: [String?] = []
+        var renderers: [WatchFakeRenderer] = []
+        let player = makePlayer { renderers.append($0) }
+
+        player.play(id: "reply") { offset, expectedGeneration in
+            offsets.append(offset)
+            expectedGenerations.append(expectedGeneration)
+            switch offsets.count {
+            case 1:
+                return SpeechResponseStream(
+                    generation: "attempt-1",
+                    sampleRate: 10,
+                    channels: 1,
+                    chunks: AsyncThrowingStream { continuation in
+                        continuation.yield(self.pcm([1, 2, 3, 4]))
+                        continuation.finish(throwing: WatchTestError.failed)
+                    }
+                )
+            case 2:
+                return SpeechResponseStream(
+                    generation: "attempt-2",
+                    sampleRate: 10,
+                    channels: 1,
+                    chunks: AsyncThrowingStream { continuation in
+                        continuation.yield(self.pcm([99]))
+                        continuation.finish()
+                    }
+                )
+            default:
+                return SpeechResponseStream(
+                    generation: "attempt-2",
+                    sampleRate: 10,
+                    channels: 1,
+                    chunks: AsyncThrowingStream { continuation in
+                        continuation.yield(self.pcm([10, 11, 12, 13]))
+                        continuation.finish()
+                    }
+                )
+            }
+        }
+
+        await eventually { renderers.count == 2 }
+        XCTAssertEqual(offsets, [0, 4, 0])
+        XCTAssertEqual(expectedGenerations, [nil, "attempt-1", "attempt-2"])
+        XCTAssertTrue(renderers[0].wasStopped)
+        XCTAssertEqual(renderers[1].scheduledSamples, [10, 11, 12, 13])
+    }
+
     func testCleanOddByteRetriesFromLastCompleteSample() async {
         var offsets: [Int] = []
         var renderers: [WatchFakeRenderer] = []
         let player = makePlayer { renderers.append($0) }
 
-        player.play(id: "reply") { offset in
+        player.play(id: "reply") { offset, _ in
             offsets.append(offset)
             if offsets.count == 1 {
                 return self.response(rate: 10, chunks: [Data([1, 0, 0xaa])])
@@ -90,7 +471,7 @@ final class WatchAudioTests: XCTestCase {
         var continuation: AsyncThrowingStream<Data, Error>.Continuation?
         var renderers: [WatchFakeRenderer] = []
         let player = makePlayer { renderers.append($0) }
-        player.play(id: "reply") { _ in
+        player.play(id: "reply") { _, _ in
             SpeechResponseStream(
                 sampleRate: 10,
                 channels: 1,
@@ -127,7 +508,7 @@ final class WatchAudioTests: XCTestCase {
             activateSession: { intents.append($0) },
             retryDelay: { _ in }
         )
-        player.play(id: "reply") { _ in
+        player.play(id: "reply") { _, _ in
             SpeechResponseStream(
                 sampleRate: 10,
                 channels: 1,
@@ -169,7 +550,7 @@ final class WatchAudioTests: XCTestCase {
             activateSession: { intents.append($0) },
             retryDelay: { _ in }
         )
-        player.play(id: "reply") { _ in
+        player.play(id: "reply") { _, _ in
             SpeechResponseStream(
                 sampleRate: 10,
                 channels: 1,
@@ -199,7 +580,7 @@ final class WatchAudioTests: XCTestCase {
             maximumReplySamples: 2,
             retryDelay: { _ in }
         )
-        player.play(id: "reply") { _ in
+        player.play(id: "reply") { _, _ in
             self.response(rate: 10, chunks: [self.pcm([1, 2, 3])])
         }
 
@@ -221,7 +602,7 @@ final class WatchAudioTests: XCTestCase {
             player: player,
             observeNotifications: false
         )
-        player.play(id: "reply") { _ in self.response(rate: 10, chunks: [self.pcm([1, 2, 3])]) }
+        player.play(id: "reply") { _, _ in self.response(rate: 10, chunks: [self.pcm([1, 2, 3])]) }
         await eventually { renderers.count == 1 }
 
         coordinator.beginHold()
@@ -245,7 +626,7 @@ final class WatchAudioTests: XCTestCase {
             player: player,
             observeNotifications: false
         )
-        player.play(id: "reply") { _ in self.response(rate: 10, chunks: [self.pcm([1, 2, 3])]) }
+        player.play(id: "reply") { _, _ in self.response(rate: 10, chunks: [self.pcm([1, 2, 3])]) }
         await eventually { renderers.count == 1 }
 
         coordinator.beginHold()
@@ -269,7 +650,7 @@ final class WatchAudioTests: XCTestCase {
                 player: player,
                 observeNotifications: false
             )
-            player.play(id: "reply") { _ in
+            player.play(id: "reply") { _, _ in
                 self.response(rate: 10, chunks: [self.pcm([1, 2, 3, 4])])
             }
             await eventually { renderers.count == 1 }
@@ -277,6 +658,7 @@ final class WatchAudioTests: XCTestCase {
             coordinator.handleSystemEvent(event)
             renderers[0].completeAll()
 
+            XCTAssertTrue(coordinator.automaticPlaybackSuspended)
             XCTAssertNil(coordinator.playingID)
             XCTAssertNil(coordinator.loadingID)
             XCTAssertEqual(log.events.last, "session.deactivate")
@@ -308,6 +690,27 @@ final class WatchAudioTests: XCTestCase {
             XCTAssertFalse(coordinator.isHolding)
             XCTAssertFalse(capture.isRecording)
         }
+    }
+
+    func testForegroundPreparationDoesNotClearSystemPlaybackSuspension() async {
+        let log = WatchEventLog()
+        let session = WatchFakeSession(log: log)
+        let capture = WatchFakeCapture(log: log)
+        let coordinator = WatchAudioCoordinator(
+            recorder: capture,
+            session: session,
+            player: makePlayer { _ in },
+            observeNotifications: false
+        )
+
+        coordinator.handleSystemEvent(.outputRouteUnavailable)
+        coordinator.stopForInactivity()
+        coordinator.prepare()
+        await eventually { capture.hasPreparedAudioObject }
+
+        XCTAssertTrue(coordinator.automaticPlaybackSuspended)
+        coordinator.resumeAutomaticPlayback()
+        XCTAssertFalse(coordinator.automaticPlaybackSuspended)
     }
 
     func testStopForInactivityCannotReactivateSessionLater() async {
@@ -432,6 +835,7 @@ private final class WatchFakeRenderer: SpeechRendering {
     let startSample: Int
     var playedSample: Int
     private(set) var scheduledSamples: [Int16] = []
+    private(set) var wasStopped = false
     private var completions: [(Int, @MainActor (Int) -> Void)] = []
 
     init(sampleRate: Int, startSample: Int) {
@@ -450,7 +854,7 @@ private final class WatchFakeRenderer: SpeechRendering {
     }
 
     func play() {}
-    func stop() {}
+    func stop() { wasStopped = true }
 
     func completeAll() {
         let callbacks = completions
@@ -538,6 +942,26 @@ private final class WatchFakeCapture: WatchAudioCapturing {
         hasPreparedAudioObject = false
         isRecording = false
     }
+}
+
+private final class WatchStubURLProtocol: URLProtocol {
+    static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        do {
+            let (response, data) = try Self.handler!(request)
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
 }
 
 private enum WatchTestError: Error {

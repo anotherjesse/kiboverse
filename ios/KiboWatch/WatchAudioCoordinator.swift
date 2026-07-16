@@ -71,6 +71,7 @@ final class WatchAudioCoordinator: ObservableObject {
     private var lifecycleEpoch = UUID()
     private var cancellables: Set<AnyCancellable> = []
     private var notificationTokens: [NSObjectProtocol] = []
+    @Published private(set) var automaticPlaybackSuspended = false
 
     init(
         recorder: (any WatchAudioCapturing)? = nil,
@@ -136,10 +137,19 @@ final class WatchAudioCoordinator: ObservableObject {
         }
     }
 
-    func playReply(turnID: String, store: WatchStore) {
-        player.play(id: "reply-\(turnID)") { fromSample in
-            try await store.speechStream(turnID: turnID, fromSample: fromSample)
+    func playReply(turnID: String, destination: KiboDestination, store: WatchStore) {
+        player.play(id: "reply-\(turnID)") { fromSample, generation in
+            try await store.speechStream(
+                destination: destination,
+                turnID: turnID,
+                fromSample: fromSample,
+                generation: generation
+            )
         }
+    }
+
+    func resumeAutomaticPlayback() {
+        automaticPlaybackSuspended = false
     }
 
     /// Idempotent across repeated DragGesture.onChanged events.
@@ -204,6 +214,7 @@ final class WatchAudioCoordinator: ObservableObject {
 
     func conversationChanged() {
         stopForInactivity()
+        automaticPlaybackSuspended = false
         lifecycleEpoch = UUID()
     }
 
@@ -254,6 +265,9 @@ final class WatchAudioCoordinator: ObservableObject {
     }
 
     private func teardownForSystemEvent() {
+        // Set the gate before stopping the player: its synchronous change
+        // callbacks must not interpret teardown as a new autoplay opportunity.
+        automaticPlaybackSuspended = true
         lifecycleEpoch = UUID()
         prepareTask?.cancel()
         prepareTask = nil

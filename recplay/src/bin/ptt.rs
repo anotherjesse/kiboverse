@@ -25,7 +25,7 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -50,7 +50,9 @@ struct Recording {
 }
 
 fn main() -> std::io::Result<()> {
-    let frag = std::env::args().nth(1).unwrap_or_else(|| "USB Gamepad".into());
+    let frag = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "USB Gamepad".into());
     let js = find_js(&frag)
         .ok_or_else(|| std::io::Error::other(format!("no joystick matching {frag:?}")))?;
     let dir = data_dir()?;
@@ -96,7 +98,12 @@ fn main() -> std::io::Result<()> {
                 println!("recording...");
             }
             (RECORD_BTN, 0, Some(_)) => {
-                let Recording { mut arecord, writer, started, work } = rec.take().unwrap();
+                let Recording {
+                    mut arecord,
+                    writer,
+                    started,
+                    work,
+                } = rec.take().unwrap();
                 let elapsed = started.elapsed();
                 arecord.kill()?; // raw stream on stdout: no header to corrupt
                 arecord.wait()?;
@@ -291,7 +298,10 @@ fn tts_stream(text: &str, save_path: PathBuf) -> std::io::Result<Arc<AudioStream
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()?;
-    curl.stdin.take().unwrap().write_all(body.to_string().as_bytes())?;
+    curl.stdin
+        .take()
+        .unwrap()
+        .write_all(body.to_string().as_bytes())?;
     let stdout = curl.stdout.take().unwrap();
 
     let stream = Arc::new(AudioStream::default());
@@ -343,7 +353,9 @@ fn read_sse_audio(
         let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else {
             continue;
         };
-        let Some(b64) = v["delta"]["data"].as_str().filter(|_| v["delta"]["type"] == "audio")
+        let Some(b64) = v["delta"]["data"]
+            .as_str()
+            .filter(|_| v["delta"]["type"] == "audio")
         else {
             continue;
         };
@@ -359,7 +371,10 @@ fn read_sse_audio(
             samples.push(i16::from_le_bytes([lo, data[0]]));
             data = &data[1..];
         }
-        samples.extend(data.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])));
+        samples.extend(
+            data.chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]])),
+        );
         if data.len() % 2 == 1 {
             leftover = Some(data[data.len() - 1]);
         }
@@ -401,7 +416,10 @@ fn gemini(body: &serde_json::Value) -> std::io::Result<serde_json::Value> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()?;
-    curl.stdin.take().unwrap().write_all(body.to_string().as_bytes())?;
+    curl.stdin
+        .take()
+        .unwrap()
+        .write_all(body.to_string().as_bytes())?;
     let out = curl.wait_with_output()?;
     if !out.status.success() {
         return Err(std::io::Error::other(format!("curl exited {}", out.status)));
@@ -587,7 +605,10 @@ impl AudioStream {
     fn chunk(&self, pos: usize, max: usize) -> Vec<i16> {
         let samples = self.samples.lock().unwrap();
         let end = (pos + max).min(samples.len());
-        samples.get(pos..end).map(<[i16]>::to_vec).unwrap_or_default()
+        samples
+            .get(pos..end)
+            .map(<[i16]>::to_vec)
+            .unwrap_or_default()
     }
 
     /// True once every received sample has been consumed and no more can come.
@@ -665,8 +686,7 @@ fn stream_to_wav(
 /// from pure silence. Log a durable [silent] transcript instead.
 fn skip_silent_clip(dir: &Path, id: &str) {
     println!("clip {id} is silent — skipping transcription");
-    let record =
-        serde_json::json!({"kind":"transcript","clip":id,"text":"[silent]","at":epoch()});
+    let record = serde_json::json!({"kind":"transcript","clip":id,"text":"[silent]","at":epoch()});
     if let Err(e) = append_turn(dir, &record.to_string()) {
         eprintln!("FAILED to log silent marker for {id}: {e}");
     }
@@ -770,13 +790,12 @@ fn wait_for_transcripts(dir: &Path, ids: &[String], timeout: Duration) -> Vec<(S
     loop {
         let mut found = Vec::new();
         for v in log_records(dir) {
-            if v["kind"] == "transcript" {
-                if let Some(clip) = v["clip"].as_str() {
-                    if ids.iter().any(|i| i == clip) {
-                        let text = v["text"].as_str().unwrap_or("").to_string();
-                        found.push((clip.to_string(), text));
-                    }
-                }
+            if v["kind"] == "transcript"
+                && let Some(clip) = v["clip"].as_str()
+                && ids.iter().any(|id| id == clip)
+            {
+                let text = v["text"].as_str().unwrap_or("").to_string();
+                found.push((clip.to_string(), text));
             }
         }
         if found.len() >= ids.len() || Instant::now() >= deadline {

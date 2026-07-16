@@ -13,7 +13,18 @@ fn main() -> std::io::Result<()> {
     chime(&[660.0, 880.0])?;
     run(
         "arecord",
-        &["-q", "-D", &dev, "-d", &secs.to_string(), "-f", "S16_LE", "-r", "44100", WAV_PATH],
+        &[
+            "-q",
+            "-D",
+            &dev,
+            "-d",
+            &secs.to_string(),
+            "-f",
+            "S16_LE",
+            "-r",
+            "44100",
+            WAV_PATH,
+        ],
     )?;
     chime(&[880.0, 660.0])?;
 

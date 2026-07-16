@@ -4,17 +4,30 @@ import CryptoKit
 enum APIError: LocalizedError {
     case invalidServerURL
     case invalidResponse
+    case requestDestinationChanged
     case localRecordingChanged
+    case speechGenerationChanged
     case server(Int, String)
 
     var errorDescription: String? {
         switch self {
         case .invalidServerURL: "Enter a valid Kibo server URL."
         case .invalidResponse: "The server returned an unreadable response."
+        case .requestDestinationChanged: "The selected conversation changed."
         case .localRecordingChanged: "The saved recording changed before it could be uploaded."
+        case .speechGenerationChanged: "The reply audio restarted from a new synthesis."
         case let .server(code, message): message.isEmpty ? "Server error \(code)" : message
         }
     }
+}
+
+/// Immutable routing identity for work that may outlive the current UI
+/// selection. Retried requests must keep using this value instead of reading
+/// mutable store state again.
+struct KiboDestination: Sendable, Equatable {
+    let serverURL: String
+    let projectID: String
+    let conversationID: String
 }
 
 enum SpeechPCMEncoding: Sendable, Equatable {
@@ -22,17 +35,20 @@ enum SpeechPCMEncoding: Sendable, Equatable {
 }
 
 struct SpeechResponseStream: Sendable {
+    let generation: String
     let sampleRate: Int
     let channels: Int
     let encoding: SpeechPCMEncoding
     let chunks: AsyncThrowingStream<Data, Error>
 
     init(
+        generation: String = "test-generation",
         sampleRate: Int,
         channels: Int,
         encoding: SpeechPCMEncoding = .signed16LittleEndian,
         chunks: AsyncThrowingStream<Data, Error>
     ) {
+        self.generation = generation
         self.sampleRate = sampleRate
         self.channels = channels
         self.encoding = encoding
@@ -125,15 +141,35 @@ actor KiboAPI {
         )
     }
 
+    func retryClip(projectID: String, conversationID: String, clipID: String) async throws {
+        try await command(path: [
+            "v1", "projects", projectID, "conversations", conversationID,
+            "clips", clipID, "retry",
+        ])
+    }
+
+    func retryTurn(projectID: String, conversationID: String, turnID: String) async throws {
+        try await command(path: [
+            "v1", "projects", projectID, "conversations", conversationID,
+            "turns", turnID, "retry",
+        ])
+    }
+
     func speechStream(
-        projectID: String,
-        conversationID: String,
+        destination: KiboDestination,
         turnID: String,
-        fromSample: Int = 0
+        fromSample: Int = 0,
+        generation: String? = nil
     ) async throws -> SpeechResponseStream {
+        guard let requestBaseURL = Self.normalizedURL(destination.serverURL),
+              requestBaseURL == baseURL else {
+            throw APIError.requestDestinationChanged
+        }
         var request = try makeRequest(
+            rootURL: requestBaseURL,
             path: [
-                "v1", "projects", projectID, "conversations", conversationID,
+                "v1", "projects", destination.projectID,
+                "conversations", destination.conversationID,
                 "turns", turnID, "speech",
             ],
             query: [URLQueryItem(name: "from_sample", value: String(max(0, fromSample)))]
@@ -144,7 +180,14 @@ actor KiboAPI {
             "application/vnd.kibo.pcm; format=s16le",
             forHTTPHeaderField: "Accept"
         )
+        if let generation {
+            request.setValue(generation, forHTTPHeaderField: "X-Speech-Generation")
+        }
         let (bytes, response) = try await session.bytes(for: request)
+        if let http = response as? HTTPURLResponse,
+           http.statusCode == 412 {
+            throw APIError.speechGenerationChanged
+        }
         try validate(response: response, data: nil)
         guard let http = response as? HTTPURLResponse,
               let contentType = http.value(forHTTPHeaderField: "Content-Type")?.lowercased(),
@@ -156,6 +199,8 @@ actor KiboAPI {
               channels == 1 else {
             throw APIError.invalidResponse
         }
+        let generation = http.value(forHTTPHeaderField: "X-Speech-Generation")
+            .flatMap { $0.isEmpty ? nil : $0 } ?? "legacy"
 
         let chunks = AsyncThrowingStream<Data, Error> { continuation in
             let task = Task {
@@ -179,6 +224,7 @@ actor KiboAPI {
             continuation.onTermination = { @Sendable _ in task.cancel() }
         }
         return SpeechResponseStream(
+            generation: generation,
             sampleRate: rate,
             channels: channels,
             encoding: .signed16LittleEndian,
@@ -199,6 +245,12 @@ actor KiboAPI {
         path: [String], query: [URLQueryItem] = [], method: String = "GET", as type: T.Type
     ) async throws -> T {
         try await request(path: path, query: query, method: method, body: nil, as: type)
+    }
+
+    private func command(path: [String]) async throws {
+        let request = try makeRequest(path: path, method: "POST")
+        let (data, response) = try await session.data(for: request)
+        try validate(response: response, data: data)
     }
 
     private func request<Payload: Encodable, T: Decodable>(
@@ -226,8 +278,13 @@ actor KiboAPI {
         catch { throw APIError.invalidResponse }
     }
 
-    private func makeRequest(path: [String], query: [URLQueryItem] = [], method: String = "GET") throws -> URLRequest {
-        var url = baseURL
+    private func makeRequest(
+        rootURL: URL? = nil,
+        path: [String],
+        query: [URLQueryItem] = [],
+        method: String = "GET"
+    ) throws -> URLRequest {
+        var url = rootURL ?? baseURL
         for component in path { url.append(path: component) }
         if !query.isEmpty {
             guard var parts = URLComponents(url: url, resolvingAgainstBaseURL: false) else { throw APIError.invalidServerURL }

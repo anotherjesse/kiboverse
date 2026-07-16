@@ -24,8 +24,10 @@ kibo-data/
 `turns.jsonl` is the durable source of truth and has one monotonic `seq` per
 conversation. Blob files are synced and renamed before their events are
 appended. The Gemini `interaction_id` saved on replies is only a continuation
-cache: if it is absent or rejected, kibod reconstructs context from durable
-turns.
+cache. New replies persist the latest durable reply sequence covered by that
+provider context; out-of-order recovery invalidates an unproven legacy anchor.
+If the cache is absent, stale, or rejected, kibod reconstructs context from
+durable turns.
 
 Projects are folders and may contain zero conversations. Creating a project no
 longer creates a special `general` conversation. The browser project page
@@ -72,7 +74,14 @@ never overwrite a manual name.
 
 Clip uploads require `X-Content-Sha256`, `X-Duration-Ms`, and `X-Peak-Pct`.
 The speech response is chunked signed 16-bit little-endian mono PCM with its
-sample rate in `X-Audio-Sample-Rate`; `from_sample` resumes at a stable offset.
+sample rate in `X-Audio-Sample-Rate`. `X-Speech-Generation` identifies one
+exact synthesis, and `from_sample` resumes at a stable offset only within that
+generation. Resumed clients echo the generation header. The server returns
+`412 Precondition Failed` for a mismatch, and for an unversioned nonzero resume
+after a synthesis rollover; either case must restart at sample zero.
+Persisted WAVs from a headerless legacy server are adopted under a stable token
+derived from their bytes and are treated as already rolled over, because the old
+journal cannot prove that no earlier synthesis prefix reached a client.
 
 ## Checks
 

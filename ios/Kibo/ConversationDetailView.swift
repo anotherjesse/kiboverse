@@ -112,6 +112,14 @@ struct ConversationDetailView: View {
                 .accessibilityElement(children: .combine)
                 .accessibilityAddTraits(playbackID == nil ? [] : .isButton)
                 .accessibilityHint(playbackID == nil ? "" : "Double tap to play the audio")
+                if let retryTarget = item.retryTarget {
+                    Button("Retry", systemImage: "arrow.clockwise") {
+                        Task { await store.retryFailedWork(retryTarget) }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(store.isRetryingFailedWork)
+                }
             }
             if item.role != .person { Spacer(minLength: 44) }
         }
@@ -127,8 +135,10 @@ struct ConversationDetailView: View {
     private func togglePlayback(_ item: TimelineItem) {
         if let clipID = item.clipID {
             audio.toggleClip(clipID: clipID, store: store)
-        } else if item.canPlay, let turnID = item.turnID {
-            audio.toggleReply(turnID: turnID, store: store)
+        } else if item.canPlay,
+                  let turnID = item.turnID,
+                  let destination = store.requestDestination {
+            audio.toggleReply(turnID: turnID, destination: destination, store: store)
         }
     }
 

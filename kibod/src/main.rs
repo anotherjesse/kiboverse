@@ -28,7 +28,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(data_dir = %data_dir.display(), mock_ai = ai.is_mock(), "opened kibo store");
     let listener = tokio::net::TcpListener::bind(address).await?;
     tracing::info!(url = %format!("http://{address}"), "kibod listening");
-    axum::serve(listener, kibod::app(store, ai))
+    axum::serve(listener, kibod::app(store, ai)?)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())

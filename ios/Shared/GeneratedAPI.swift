@@ -98,6 +98,12 @@ public struct KiboEvent: Codable, Hashable, Sendable {
 	public let turn: String?
 	public let text: String?
 	public let error: String?
+	public let attempt: UInt32?
+	public let generation: String?
+	public let retry_at_ms: UInt64?
+	public let terminal: Bool?
+	public let stage: String?
+	public let reason: String?
 	public let audio: String?
 	public let clips: [String]?
 	public let answers: [String]?
@@ -114,7 +120,7 @@ public struct KiboEvent: Codable, Hashable, Sendable {
 	public let name: String?
 	public let source: String?
 
-	public init(seq: UInt64, kind: String, id: String?, at: UInt64?, clip: String?, turn: String?, text: String?, error: String?, audio: String?, clips: [String]?, answers: [String]?, ms: UInt64?, peak: UInt32?, file: String?, mime: String?, recorded_at: UInt64?, sha256: String?, interaction_id: String?, samples: UInt64?, rate: UInt32?, recovered: Bool?, name: String?, source: String?) {
+	public init(seq: UInt64, kind: String, id: String?, at: UInt64?, clip: String?, turn: String?, text: String?, error: String?, attempt: UInt32?, generation: String?, retry_at_ms: UInt64?, terminal: Bool?, stage: String?, reason: String?, audio: String?, clips: [String]?, answers: [String]?, ms: UInt64?, peak: UInt32?, file: String?, mime: String?, recorded_at: UInt64?, sha256: String?, interaction_id: String?, samples: UInt64?, rate: UInt32?, recovered: Bool?, name: String?, source: String?) {
 		self.seq = seq
 		self.kind = kind
 		self.id = id
@@ -123,6 +129,12 @@ public struct KiboEvent: Codable, Hashable, Sendable {
 		self.turn = turn
 		self.text = text
 		self.error = error
+		self.attempt = attempt
+		self.generation = generation
+		self.retry_at_ms = retry_at_ms
+		self.terminal = terminal
+		self.stage = stage
+		self.reason = reason
 		self.audio = audio
 		self.clips = clips
 		self.answers = answers

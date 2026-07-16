@@ -7,6 +7,11 @@ struct KiboWatchApp: App {
     }
 }
 
+enum WatchRetryWorkOutcome: Equatable {
+    case notAccepted
+    case accepted(requiredEventsRevision: UInt64)
+}
+
 @MainActor
 final class WatchStore: ObservableObject {
     static let defaultServerURL = "https://wideboi.stingray-nominal.ts.net/"
@@ -20,12 +25,15 @@ final class WatchStore: ObservableObject {
     @Published var projects: [KiboProject] = []
     @Published var conversations: [KiboConversation] = []
     @Published var events: [KiboEvent] = []
+    @Published private(set) var eventRevision: UInt64 = 0
     @Published var selectedProjectID: String?
     @Published var selectedConversationID: String?
     @Published var status = "Connecting…"
     @Published var errorMessage: String?
     @Published var isUploading = false
     @Published var isSubmitting = false
+    @Published private(set) var isRetryingFailedWork = false
+    @Published private(set) var isChangingServer = false
     @Published var pendingUploadCount = 0
     @Published private(set) var recoveryItemCount = 0
 
@@ -37,6 +45,7 @@ final class WatchStore: ObservableObject {
     private var hasStarted = false
     private var loadVersion = 0
     private var selectionVersion = 0
+    private var eventRequestVersion = 0
 
     var serverURL: String {
         let raw = defaults.string(forKey: Key.serverURL) ?? Self.defaultServerURL
@@ -55,10 +64,20 @@ final class WatchStore: ObservableObject {
         isSubmitting || !events.pendingTurnIDs.isEmpty
     }
 
-    init() {
+    var requestDestination: KiboDestination? {
+        guard let projectID = selectedProjectID,
+              let conversationID = selectedConversationID else { return nil }
+        return KiboDestination(
+            serverURL: serverURL,
+            projectID: projectID,
+            conversationID: conversationID
+        )
+    }
+
+    init(session: URLSession = .shared) {
         let raw = UserDefaults.standard.string(forKey: Key.serverURL) ?? Self.defaultServerURL
         let canonical = KiboAPI.canonicalServerURL(raw) ?? Self.defaultServerURL
-        api = try! KiboAPI(serverURL: canonical)
+        api = try! KiboAPI(serverURL: canonical, session: session)
         selectedProjectID = defaults.string(forKey: Key.projectID)
         selectedConversationID = defaults.string(forKey: Key.conversationID)
         let inventory = spool.inventory()
@@ -129,27 +148,38 @@ final class WatchStore: ObservableObject {
         await refreshEvents()
     }
 
-    func refreshEvents(quiet: Bool = false) async {
+    @discardableResult
+    func refreshEvents(quiet: Bool = false) async -> Bool {
         guard let projectID = selectedProjectID,
-              let conversationID = selectedConversationID else { return }
+              let conversationID = selectedConversationID else { return false }
         let version = selectionVersion
+        eventRequestVersion += 1
+        let requestVersion = eventRequestVersion
         do {
             let loaded = try await api.events(
                 projectID: projectID,
                 conversationID: conversationID
             )
             guard version == selectionVersion,
+                  requestVersion == eventRequestVersion,
                   projectID == selectedProjectID,
-                  conversationID == selectedConversationID else { return }
+                  conversationID == selectedConversationID else { return false }
             events = loaded.events
+            if eventRevision < .max { eventRevision += 1 }
             updatePendingUploadCount()
             if pendingUploadCount == 0 && !isUploading {
                 status = "Live"
                 errorMessage = nil
             }
+            return true
         } catch {
-            guard version == selectionVersion else { return }
+            guard !Task.isCancelled,
+                  version == selectionVersion,
+                  requestVersion == eventRequestVersion,
+                  projectID == selectedProjectID,
+                  conversationID == selectedConversationID else { return false }
             if !quiet || events.isEmpty { report(error) }
+            return false
         }
     }
 
@@ -178,10 +208,16 @@ final class WatchStore: ObservableObject {
     }
 
     @discardableResult
-    func submitTurn() async -> String? {
-        guard let projectID = selectedProjectID,
-              let conversationID = selectedConversationID,
-              !isSubmitting else { return nil }
+    func submitTurn(
+        serverURL: String,
+        projectID: String,
+        conversationID: String
+    ) async -> String? {
+        guard serverURL == self.serverURL,
+              projectID == selectedProjectID,
+              conversationID == selectedConversationID,
+              !isSubmitting,
+              !isChangingServer else { return nil }
         updatePendingUploadCount()
         guard recoveryItemCount == 0 else {
             status = "Open Server to resolve saved recordings"
@@ -189,6 +225,10 @@ final class WatchStore: ObservableObject {
         }
         let destinationKey = "\(projectID)/\(conversationID)"
         guard await retryPendingUploads(destinationKey: destinationKey) else { return nil }
+        guard !Task.isCancelled,
+              serverURL == self.serverURL,
+              projectID == selectedProjectID,
+              conversationID == selectedConversationID else { return nil }
         updatePendingUploadCount()
         guard recoveryItemCount == 0 else {
             status = "Open Server to resolve saved recordings"
@@ -211,29 +251,91 @@ final class WatchStore: ObservableObject {
                 turnID: turnID
             )
             defaults.removeObject(forKey: commandKey)
-            await refreshEvents()
+            if serverURL == self.serverURL,
+               projectID == selectedProjectID,
+               conversationID == selectedConversationID {
+                await refreshEvents()
+            }
             return turnID
         } catch {
-            report(error)
+            if serverURL == self.serverURL,
+               projectID == selectedProjectID,
+               conversationID == selectedConversationID {
+                report(error)
+            }
             return nil
         }
     }
 
-    func speechStream(turnID: String, fromSample: Int) async throws -> SpeechResponseStream {
-        guard let projectID = selectedProjectID,
-              let conversationID = selectedConversationID else {
-            throw APIError.invalidResponse
+    func speechStream(
+        destination: KiboDestination,
+        turnID: String,
+        fromSample: Int,
+        generation: String? = nil
+    ) async throws -> SpeechResponseStream {
+        guard destination == requestDestination else {
+            throw APIError.requestDestinationChanged
         }
-        return try await api.speechStream(
-            projectID: projectID,
-            conversationID: conversationID,
+        let response = try await api.speechStream(
+            destination: destination,
             turnID: turnID,
-            fromSample: fromSample
+            fromSample: fromSample,
+            generation: generation
         )
+        guard destination == requestDestination else {
+            throw APIError.requestDestinationChanged
+        }
+        return response
+    }
+
+    func retryFailedWork(
+        _ target: RetryTarget,
+        serverURL: String,
+        projectID: String,
+        conversationID: String
+    ) async -> WatchRetryWorkOutcome {
+        guard serverURL == self.serverURL,
+              projectID == selectedProjectID,
+              conversationID == selectedConversationID,
+              !isRetryingFailedWork,
+              !isChangingServer else { return .notAccepted }
+        isRetryingFailedWork = true
+        defer { isRetryingFailedWork = false }
+        do {
+            switch target {
+            case let .clip(clipID):
+                try await api.retryClip(
+                    projectID: projectID, conversationID: conversationID, clipID: clipID
+                )
+            case let .turn(turnID):
+                try await api.retryTurn(
+                    projectID: projectID, conversationID: conversationID, turnID: turnID
+                )
+            }
+            let requiredEventsRevision = eventRevision < .max
+                ? eventRevision + 1
+                : eventRevision
+            let stillSelected = serverURL == self.serverURL
+                && projectID == selectedProjectID
+                && conversationID == selectedConversationID
+            if stillSelected {
+                status = "Retrying…"
+                errorMessage = nil
+            }
+            if stillSelected { await refreshEvents() }
+            return .accepted(requiredEventsRevision: requiredEventsRevision)
+        } catch {
+            if serverURL == self.serverURL,
+               projectID == selectedProjectID,
+               conversationID == selectedConversationID {
+                report(error)
+            }
+            return .notAccepted
+        }
     }
 
     func saveServer(_ value: String) async -> Bool {
-        guard !isUploading, !isSubmitting else {
+        guard !isUploading, !isSubmitting, !isRetryingFailedWork, !isChangingServer else {
             errorMessage = "Wait for the current request to finish."
             return false
         }
@@ -242,17 +344,26 @@ final class WatchStore: ObservableObject {
             errorMessage = "Let saved recordings finish sending before changing servers."
             return false
         }
+        guard let canonicalURL = KiboAPI.canonicalServerURL(value) else {
+            report(APIError.invalidServerURL)
+            return false
+        }
+        if canonicalURL == serverURL { return true }
+        isChangingServer = true
+        defer { isChangingServer = false }
         do {
-            guard let canonicalURL = KiboAPI.canonicalServerURL(value) else {
-                throw APIError.invalidServerURL
-            }
-            try await api.setServerURL(canonicalURL)
-            defaults.set(canonicalURL, forKey: Key.serverURL)
+            // Invalidate the selected destination before the shared API actor
+            // changes its base URL. Commands are also barred by
+            // isChangingServer, so no request can straddle this boundary.
             loadVersion += 1
             selectionVersion += 1
+            selectedProjectID = nil
+            selectedConversationID = nil
             projects = []
             conversations = []
             events = []
+            try await api.setServerURL(canonicalURL)
+            defaults.set(canonicalURL, forKey: Key.serverURL)
             await load()
             return errorMessage == nil
         } catch {

@@ -28,7 +28,14 @@ The design follows the separation in Rich Hickey's *Simple Made Easy*:
   download. On release, playback uses a fresh engine and resumes one second
   before the last played sample.
 - A failed stream discards an unmatched byte and reconnects from the last
-  complete decoded sample. Format changes are terminal rather than retried.
+  complete decoded sample within the same `X-Speech-Generation`. If a server
+  synthesis retry changes that opaque generation, the player stops the old
+  renderer, discards its ledger, and requests sample zero. Resumed requests
+  echo the expected generation, and a server `412` triggers the same reset.
+  Header-less older servers are treated as `legacy` while connected to that
+  server. An upgraded server adopts persisted legacy WAVs under a distinct
+  content-derived token, which deliberately restarts any partial legacy ledger.
+  Format changes are terminal rather than retried.
 - Reply retention is injected policy: iPhone keeps its ten-minute cap; Watch
   uses a three-minute cap (4,320,000 samples, about 8.64 MB raw PCM). Scheduled
   engine buffers remain bounded to one second.

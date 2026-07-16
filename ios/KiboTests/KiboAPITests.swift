@@ -7,6 +7,100 @@ import XCTest
 final class KiboAPITests: XCTestCase {
     private var session: URLSession!
 
+    func testReplyAutoplayGateRequiresSafeVisibleAudioScope() {
+        XCTAssertTrue(ReplyAutoplayGate(
+            sceneIsActive: true,
+            systemPlaybackSuspended: false,
+            captureIsActive: false,
+            overlayIsPresented: false
+        ).allowsPlayback)
+
+        for gate in [
+            ReplyAutoplayGate(
+                sceneIsActive: false, systemPlaybackSuspended: false,
+                captureIsActive: false, overlayIsPresented: false
+            ),
+            ReplyAutoplayGate(
+                sceneIsActive: true, systemPlaybackSuspended: true,
+                captureIsActive: false, overlayIsPresented: false
+            ),
+            ReplyAutoplayGate(
+                sceneIsActive: true, systemPlaybackSuspended: false,
+                captureIsActive: true, overlayIsPresented: false
+            ),
+            ReplyAutoplayGate(
+                sceneIsActive: true, systemPlaybackSuspended: false,
+                captureIsActive: false, overlayIsPresented: true
+            ),
+        ] {
+            XCTAssertFalse(gate.allowsPlayback)
+        }
+    }
+
+    func testReplyLifecycleSuspensionRearmsTheSameDurableSpeechEvent() throws {
+        var lifecycle = ReplyLifecycle()
+        lifecycle.appear(isActive: true)
+        lifecycle.awaitReply(
+            to: "t1",
+            destination: KiboDestination(
+                serverURL: "https://one.example/",
+                projectID: "p1",
+                conversationID: "c1"
+            )
+        )
+        lifecycle.markPlaybackAttempt(speechEventSeq: 3)
+
+        lifecycle.becomeInactive()
+
+        XCTAssertEqual(lifecycle.awaitedTurnID, "t1")
+        XCTAssertNil(lifecycle.attemptedSpeechEventSeq)
+        lifecycle.becomeActive()
+        let data = #"[{"seq":1,"kind":"turn","id":"t1","clips":[]},{"seq":2,"kind":"reply","turn":"t1","text":"Hi","audio":"tts/t1.wav"},{"seq":3,"kind":"speech_started","turn":"t1","attempt":1}]"#.data(using: .utf8)!
+        let events = try JSONDecoder().decode([KiboEvent].self, from: data)
+        XCTAssertEqual(
+            events.replyAutoPlayAction(
+                for: "t1",
+                attemptedSpeechEventSeq: lifecycle.attemptedSpeechEventSeq,
+                loadingID: nil,
+                playingID: nil,
+                lastFinishedID: nil
+            ),
+            .startPlayback(speechEventSeq: 3)
+        )
+    }
+
+    func testReplyLifecycleInvalidatesCommandsBeforeEveryTeardown() {
+        let destination = KiboDestination(
+            serverURL: "https://one.example/",
+            projectID: "p1",
+            conversationID: "c1"
+        )
+        var lifecycle = ReplyLifecycle()
+        lifecycle.appear(isActive: true)
+        let first = lifecycle.beginCommand(destination: destination)!
+        let replacement = lifecycle.beginCommand(destination: destination)!
+        XCTAssertFalse(lifecycle.accepts(first, destination: destination))
+        XCTAssertTrue(lifecycle.accepts(replacement, destination: destination))
+
+        lifecycle.awaitReply(to: "turn-1", destination: destination)
+        lifecycle.markPlaybackAttempt(speechEventSeq: 7)
+        lifecycle.becomeInactive()
+        XCTAssertFalse(lifecycle.accepts(replacement, destination: destination))
+        XCTAssertEqual(lifecycle.awaitedTurnID, "turn-1")
+        XCTAssertNil(lifecycle.attemptedSpeechEventSeq)
+        XCTAssertFalse(lifecycle.allowsPlayback)
+
+        lifecycle.becomeActive()
+        let foreground = lifecycle.beginCommand(destination: destination)!
+        lifecycle.selectionChanged()
+        XCTAssertFalse(lifecycle.accepts(foreground, destination: destination))
+        XCTAssertNil(lifecycle.awaitedTurnID)
+
+        lifecycle.disappear()
+        XCTAssertFalse(lifecycle.allowsPlayback)
+        XCTAssertNil(lifecycle.beginCommand(destination: destination))
+    }
+
     override func setUp() {
         super.setUp()
         let configuration = URLSessionConfiguration.ephemeral
@@ -41,6 +135,31 @@ final class KiboAPITests: XCTestCase {
         let api = try KiboAPI(serverURL: "https://example.test/gateway/kibo/", session: session)
         let projects = try await api.projects()
         XCTAssertTrue(projects.isEmpty)
+    }
+
+    func testExplicitRetryCommandsUseDedicatedEndpoints() async throws {
+        let lock = NSLock()
+        var paths: [String] = []
+        StubURLProtocol.handler = { request in
+            XCTAssertEqual(request.httpMethod, "POST")
+            lock.withLock { paths.append(request.url!.path) }
+            return (
+                HTTPURLResponse(
+                    url: request.url!, statusCode: 202,
+                    httpVersion: nil, headerFields: nil
+                )!,
+                Data()
+            )
+        }
+        let api = try KiboAPI(serverURL: "https://example.test", session: session)
+
+        try await api.retryClip(projectID: "p", conversationID: "c", clipID: "clip-1")
+        try await api.retryTurn(projectID: "p", conversationID: "c", turnID: "turn-1")
+
+        XCTAssertEqual(lock.withLock { paths }, [
+            "/v1/projects/p/conversations/c/clips/clip-1/retry",
+            "/v1/projects/p/conversations/c/turns/turn-1/retry",
+        ])
     }
 
     func testClipUploadUsesServerContractHeaders() async throws {
@@ -135,6 +254,10 @@ final class KiboAPITests: XCTestCase {
                 request.value(forHTTPHeaderField: "Accept"),
                 "application/vnd.kibo.pcm; format=s16le"
             )
+            XCTAssertEqual(
+                request.value(forHTTPHeaderField: "X-Speech-Generation"),
+                "generation-1"
+            )
             let response = HTTPURLResponse(
                 url: request.url!,
                 statusCode: 200,
@@ -149,27 +272,88 @@ final class KiboAPITests: XCTestCase {
         }
         let api = try KiboAPI(serverURL: "https://example.test", session: session)
         let response = try await api.speechStream(
-            projectID: "p",
-            conversationID: "c",
+            destination: KiboDestination(
+                serverURL: "https://example.test/",
+                projectID: "p",
+                conversationID: "c"
+            ),
             turnID: "t",
-            fromSample: 17
+            fromSample: 17,
+            generation: "generation-1"
         )
         var body = Data()
         for try await chunk in response.chunks { body.append(chunk) }
         XCTAssertEqual(response.sampleRate, 24_000)
         XCTAssertEqual(response.channels, 1)
+        XCTAssertEqual(response.generation, "legacy")
         XCTAssertEqual(body, Data([1, 0, 2, 0]))
     }
 
+    func testReplyReconnectKeepsItsImmutableDestinationAfterSelectionChanges() async throws {
+        let savedServerURL = UserDefaults.standard.string(forKey: "serverURL")
+        UserDefaults.standard.set("https://reply-owner.test/", forKey: "serverURL")
+        defer {
+            if let savedServerURL {
+                UserDefaults.standard.set(savedServerURL, forKey: "serverURL")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "serverURL")
+            }
+        }
+
+        let lock = NSLock()
+        var requestPaths: [String] = []
+        StubURLProtocol.handler = { request in
+            lock.withLock { requestPaths.append(request.url!.path) }
+            return (
+                HTTPURLResponse(
+                    url: request.url!, statusCode: 500,
+                    httpVersion: nil, headerFields: nil
+                )!,
+                Data()
+            )
+        }
+
+        let firstRetry = expectation(description: "first stream load failed")
+        var mayRetry = false
+        var retryFailures: [Int] = []
+        let store = AppStore(session: session)
+        store.selectedProjectID = "project"
+        store.selectedConversationID = "old-conversation"
+        let destination = try XCTUnwrap(store.requestDestination)
+        let speech = SpeechPlayer(
+            activateSession: { _ in },
+            retryDelay: { failures in
+                retryFailures.append(failures)
+                if failures == 1 {
+                    firstRetry.fulfill()
+                    while !mayRetry { await Task.yield() }
+                }
+            }
+        )
+
+        speech.playReply(turnID: "shared-turn", destination: destination, store: store)
+        await fulfillment(of: [firstRetry], timeout: 1)
+        XCTAssertEqual(speech.loadingID, "reply-shared-turn")
+        store.selectedConversationID = "new-conversation"
+        mayRetry = true
+
+        await eventually { speech.loadingID == nil }
+        XCTAssertEqual(retryFailures, [1])
+        XCTAssertEqual(lock.withLock { requestPaths }, [
+            "/v1/projects/project/conversations/old-conversation/turns/shared-turn/speech",
+        ])
+        XCTAssertNil(speech.errorMessage)
+    }
+
     func testTimelineBuildsPersonAndReplyCards() throws {
-        let data = #"[{"seq":1,"kind":"clip","id":"c1"},{"seq":2,"kind":"transcript","clip":"c1","text":"Hello"},{"seq":3,"kind":"turn","id":"t1","clips":["c1"]},{"seq":4,"kind":"reply","turn":"t1","text":"Hi","audio":"tts/t1.wav"}]"#.data(using: .utf8)!
+        let data = #"[{"seq":1,"kind":"clip","id":"c1"},{"seq":2,"kind":"transcript","clip":"c1","text":"Hello"},{"seq":3,"kind":"turn","id":"t1","clips":["c1"]},{"seq":4,"kind":"reply","turn":"t1","text":"Hi","audio":"tts/t1.wav"},{"seq":5,"kind":"speech_started","turn":"t1","attempt":1}]"#.data(using: .utf8)!
         let events = try JSONDecoder().decode([KiboEvent].self, from: data)
         XCTAssertEqual(events.timeline().map(\.body), ["Hello", "Hi"])
         XCTAssertTrue(events.timeline().last?.canPlay == true)
     }
 
     func testTimelineSplitsEachRecordingIntoItsOwnCard() throws {
-        let data = #"[{"seq":1,"kind":"clip","id":"c1","ms":1500},{"seq":2,"kind":"clip","id":"c2","ms":900},{"seq":3,"kind":"transcript","clip":"c1","text":"First"},{"seq":4,"kind":"transcript","clip":"c2","text":"Second"},{"seq":5,"kind":"turn","id":"t1","clips":["c1","c2"]},{"seq":6,"kind":"reply","turn":"t1","text":"Hi","audio":"tts/t1.wav"}]"#.data(using: .utf8)!
+        let data = #"[{"seq":1,"kind":"clip","id":"c1","ms":1500},{"seq":2,"kind":"clip","id":"c2","ms":900},{"seq":3,"kind":"transcript","clip":"c1","text":"First"},{"seq":4,"kind":"transcript","clip":"c2","text":"Second"},{"seq":5,"kind":"turn","id":"t1","clips":["c1","c2"]},{"seq":6,"kind":"reply","turn":"t1","text":"Hi","audio":"tts/t1.wav"},{"seq":7,"kind":"speech_ready","turn":"t1"}]"#.data(using: .utf8)!
         let events = try JSONDecoder().decode([KiboEvent].self, from: data)
         let cards = events.timeline()
         XCTAssertEqual(cards.map(\.body), ["First", "Second", "Hi"])
@@ -178,10 +362,33 @@ final class KiboAPITests: XCTestCase {
         XCTAssertTrue(cards.allSatisfy { $0.role == .kibo || $0.canPlay })
     }
 
-    func testTimelineUsesLatestDuplicateEventInsteadOfCrashing() throws {
-        let data = #"[{"seq":1,"kind":"clip","id":"c1"},{"seq":2,"kind":"transcript_error","clip":"c1","error":"first"},{"seq":3,"kind":"transcript_error","clip":"c1","error":"latest"}]"#.data(using: .utf8)!
+    func testTerminalFailureIsAbsorbingUntilExplicitRetry() throws {
+        let data = #"[{"seq":1,"kind":"clip","id":"c1"},{"seq":2,"kind":"transcript_error","clip":"c1","error":"first","terminal":true},{"seq":3,"kind":"transcript_error","clip":"c1","error":"latest","terminal":true}]"#.data(using: .utf8)!
         let events = try JSONDecoder().decode([KiboEvent].self, from: data)
-        XCTAssertEqual(events.timeline().single?.body, "latest")
+        XCTAssertEqual(events.timeline().single?.body, "first")
+        XCTAssertEqual(events.retryableFailure, .clip("c1"))
+
+        let recoveredData = #"[{"seq":1,"kind":"clip","id":"c1"},{"seq":2,"kind":"transcript_error","clip":"c1","error":"first","terminal":true},{"seq":3,"kind":"transcript_started","clip":"c1","attempt":2},{"seq":4,"kind":"transcript","clip":"c1","text":"ignored"},{"seq":5,"kind":"transcript_retry_requested","clip":"c1"},{"seq":6,"kind":"transcript","clip":"c1","text":"Recovered"}]"#.data(using: .utf8)!
+        let recovered = try JSONDecoder().decode([KiboEvent].self, from: recoveredData)
+        XCTAssertEqual(recovered.timeline().single?.body, "Recovered")
+    }
+
+    func testSuccessfulTextStagesRemainAuthoritativeAcrossStaleEvents() throws {
+        let staleTranscriptData = #"[{"seq":1,"kind":"clip","id":"c1"},{"seq":2,"kind":"transcript","clip":"c1","text":"First"},{"seq":3,"kind":"transcript_retry_scheduled","clip":"c1"},{"seq":4,"kind":"transcript_error","clip":"c1","error":"stale"},{"seq":5,"kind":"transcript","clip":"c1","text":"ignored"}]"#.data(using: .utf8)!
+        let staleTranscript = try JSONDecoder().decode([KiboEvent].self, from: staleTranscriptData)
+        XCTAssertEqual(staleTranscript.timeline().single?.body, "First")
+
+        let transcriptData = #"[{"seq":1,"kind":"clip","id":"c1"},{"seq":2,"kind":"transcript","clip":"c1","text":"First"},{"seq":3,"kind":"transcript_retry_scheduled","clip":"c1"},{"seq":4,"kind":"transcript_error","clip":"c1","error":"stale"},{"seq":5,"kind":"transcript","clip":"c1","text":"ignored"},{"seq":6,"kind":"transcript_retry_requested","clip":"c1"},{"seq":7,"kind":"transcript","clip":"c1","text":"Replaced"}]"#.data(using: .utf8)!
+        let transcript = try JSONDecoder().decode([KiboEvent].self, from: transcriptData)
+        XCTAssertEqual(transcript.timeline().single?.body, "First")
+
+        let staleReplyData = #"[{"seq":1,"kind":"turn","id":"t1","clips":[]},{"seq":2,"kind":"reply","turn":"t1","text":"First"},{"seq":3,"kind":"reply_retry_scheduled","turn":"t1"},{"seq":4,"kind":"reply_error","turn":"t1","error":"stale"},{"seq":5,"kind":"reply","turn":"t1","text":"ignored"}]"#.data(using: .utf8)!
+        let staleReply = try JSONDecoder().decode([KiboEvent].self, from: staleReplyData)
+        XCTAssertEqual(staleReply.timeline().single?.body, "First")
+
+        let replyData = #"[{"seq":1,"kind":"turn","id":"t1","clips":[]},{"seq":2,"kind":"reply","turn":"t1","text":"First"},{"seq":3,"kind":"reply_retry_scheduled","turn":"t1"},{"seq":4,"kind":"reply_error","turn":"t1","error":"stale"},{"seq":5,"kind":"reply","turn":"t1","text":"ignored"},{"seq":6,"kind":"reply_retry_requested","turn":"t1"},{"seq":7,"kind":"reply","turn":"t1","text":"Replaced"}]"#.data(using: .utf8)!
+        let reply = try JSONDecoder().decode([KiboEvent].self, from: replyData)
+        XCTAssertEqual(reply.timeline().single?.body, "First")
     }
 
     func testPendingTurnEndsWhenReplyArrives() throws {
@@ -192,6 +399,184 @@ final class KiboAPITests: XCTestCase {
         let finishedData = #"[{"seq":1,"kind":"turn","id":"t1","clips":[]},{"seq":2,"kind":"reply","turn":"t1","text":"Done"}]"#.data(using: .utf8)!
         let finished = try JSONDecoder().decode([KiboEvent].self, from: finishedData)
         XCTAssertTrue(finished.pendingTurnIDs.isEmpty)
+    }
+
+    func testRetryEventsDistinguishInitialWorkFromRetrying() throws {
+        let initialData = #"[{"seq":1,"kind":"clip","id":"c1"},{"seq":2,"kind":"transcript_started","clip":"c1","attempt":1},{"seq":3,"kind":"turn","id":"t1","clips":["c1"]},{"seq":4,"kind":"reply_started","turn":"t1","attempt":1}]"#.data(using: .utf8)!
+        let initial = try JSONDecoder().decode([KiboEvent].self, from: initialData)
+        XCTAssertEqual(initial.timeline().map(\.body), ["Transcribing…", "Thinking…"])
+
+        let retryingData = #"[{"seq":1,"kind":"clip","id":"c1"},{"seq":2,"kind":"transcript_started","clip":"c1","attempt":1},{"seq":3,"kind":"transcript_retry_scheduled","clip":"c1","attempt":1},{"seq":4,"kind":"turn","id":"t1","clips":["c1"]},{"seq":5,"kind":"reply_started","turn":"t1","attempt":1},{"seq":6,"kind":"reply_retry_scheduled","turn":"t1","attempt":1}]"#.data(using: .utf8)!
+        let retrying = try JSONDecoder().decode([KiboEvent].self, from: retryingData)
+        XCTAssertEqual(retrying.pendingTurnIDs, ["t1"])
+        XCTAssertEqual(retrying.timeline().map(\.body), ["Retrying transcription…", "Retrying…"])
+
+        let attemptData = #"[{"seq":1,"kind":"turn","id":"t1","clips":[]},{"seq":2,"kind":"reply_started","turn":"t1","attempt":2}]"#.data(using: .utf8)!
+        let attempt = try JSONDecoder().decode([KiboEvent].self, from: attemptData)
+        XCTAssertEqual(attempt.timeline().single?.body, "Retrying…")
+
+        let speechAttemptData = #"[{"seq":1,"kind":"turn","id":"t1","clips":[]},{"seq":2,"kind":"reply","turn":"t1","text":"Hi","audio":"tts/t1.wav"},{"seq":3,"kind":"speech_retry_scheduled","turn":"t1"},{"seq":4,"kind":"speech_started","turn":"t1","attempt":2}]"#.data(using: .utf8)!
+        let speechAttempt = try JSONDecoder().decode([KiboEvent].self, from: speechAttemptData)
+        XCTAssertEqual(speechAttempt.timeline().single?.body, "Hi\n\nRetrying speech…")
+        XCTAssertEqual(speechAttempt.replyReadiness(for: "t1"), .playable)
+    }
+
+    func testLegacyNonterminalErrorsRemainRetryableAndAcceptRecovery() throws {
+        let data = #"[{"seq":1,"kind":"clip","id":"c1"},{"seq":2,"kind":"transcript_error","clip":"c1","error":"offline"},{"seq":3,"kind":"transcript_started","clip":"c1","attempt":2},{"seq":4,"kind":"transcript","clip":"c1","text":"Recovered input"},{"seq":5,"kind":"turn","id":"t1","clips":["c1"]},{"seq":6,"kind":"reply_error","turn":"t1","error":"offline","terminal":false},{"seq":7,"kind":"reply_started","turn":"t1","attempt":2},{"seq":8,"kind":"reply","turn":"t1","text":"Recovered reply","audio":"tts/t1.wav"},{"seq":9,"kind":"tts_error","turn":"t1","error":"offline"},{"seq":10,"kind":"speech_started","turn":"t1","attempt":2},{"seq":11,"kind":"speech_ready","turn":"t1"}]"#.data(using: .utf8)!
+        let events = try JSONDecoder().decode([KiboEvent].self, from: data)
+
+        XCTAssertTrue(events.pendingTurnIDs.isEmpty)
+        XCTAssertEqual(events.timeline().map(\.body), ["Recovered input", "Recovered reply"])
+        XCTAssertTrue(events.timeline().last?.canPlay == true)
+        XCTAssertNil(events.retryableFailure)
+    }
+
+    func testDurableRetrySupersedesTerminalTranscriptFailure() throws {
+        let data = #"[{"seq":1,"kind":"clip","id":"c1"},{"seq":2,"kind":"transcript_error","clip":"c1","error":"broken","terminal":true},{"seq":3,"kind":"transcript_retry_requested","clip":"c1"},{"seq":4,"kind":"transcript","clip":"c1","text":"Recovered"}]"#.data(using: .utf8)!
+        let events = try JSONDecoder().decode([KiboEvent].self, from: data)
+
+        XCTAssertEqual(events.timeline().single?.body, "Recovered")
+    }
+
+    func testTranscriptRetryReopensItsTranscriptionFailedTurn() throws {
+        let retryingData = #"[{"seq":1,"kind":"clip","id":"c1"},{"seq":2,"kind":"turn","id":"t1","clips":["c1"]},{"seq":3,"kind":"transcript_error","clip":"c1","error":"broken","terminal":true},{"seq":4,"kind":"reply_error","turn":"t1","stage":"transcription","error":"broken","terminal":true},{"seq":5,"kind":"transcript_retry_requested","clip":"c1"}]"#.data(using: .utf8)!
+        let waiting = try JSONDecoder().decode([KiboEvent].self, from: retryingData)
+        XCTAssertEqual(waiting.pendingTurnIDs, ["t1"])
+        XCTAssertEqual(waiting.timeline().map(\.body), ["Retrying transcription…", "Retrying…"])
+
+        let recoveredData = #"[{"seq":1,"kind":"clip","id":"c1"},{"seq":2,"kind":"turn","id":"t1","clips":["c1"]},{"seq":3,"kind":"transcript_error","clip":"c1","error":"broken","terminal":true},{"seq":4,"kind":"reply_error","turn":"t1","stage":"transcription","error":"broken","terminal":true},{"seq":5,"kind":"transcript_retry_requested","clip":"c1"},{"seq":6,"kind":"transcript","clip":"c1","text":"Fixed"},{"seq":7,"kind":"reply_started","turn":"t1","attempt":1},{"seq":8,"kind":"reply","turn":"t1","text":"Recovered","audio":"tts/t1.wav"}]"#.data(using: .utf8)!
+        let recovered = try JSONDecoder().decode([KiboEvent].self, from: recoveredData)
+        XCTAssertTrue(recovered.pendingTurnIDs.isEmpty)
+        XCTAssertEqual(recovered.timeline().map(\.body), ["Fixed", "Recovered"])
+    }
+
+    func testTranscriptSuccessWaitsForEveryClaimedClipBeforeReopeningReply() throws {
+        let data = #"[{"seq":1,"kind":"clip","id":"c1"},{"seq":2,"kind":"clip","id":"c2"},{"seq":3,"kind":"turn","id":"t1","clips":["c1","c2"]},{"seq":4,"kind":"transcript_error","clip":"c1","error":"still broken","terminal":true},{"seq":5,"kind":"reply_error","turn":"t1","stage":"transcription","error":"claimed clip failed","terminal":true},{"seq":6,"kind":"transcript","clip":"c2","text":"Healthy sibling"}]"#.data(using: .utf8)!
+        let events = try JSONDecoder().decode([KiboEvent].self, from: data)
+
+        XCTAssertTrue(events.pendingTurnIDs.isEmpty)
+        XCTAssertEqual(events.retryableFailure, .turn("t1"))
+        XCTAssertEqual(events.timeline().map(\.body), ["still broken", "Healthy sibling", "claimed clip failed"])
+    }
+
+    func testRepeatedTerminalTranscriptFailureClosesReopenedTurn() throws {
+        let retryFailedData = #"[{"seq":1,"kind":"clip","id":"c1"},{"seq":2,"kind":"turn","id":"t1","clips":["c1"]},{"seq":3,"kind":"transcript_error","clip":"c1","error":"broken","terminal":true},{"seq":4,"kind":"reply_error","turn":"t1","stage":"transcription","error":"broken","terminal":true},{"seq":5,"kind":"transcript_retry_requested","clip":"c1"},{"seq":6,"kind":"transcript_started","clip":"c1","attempt":1},{"seq":7,"kind":"transcript_error","clip":"c1","error":"still broken","terminal":true}]"#.data(using: .utf8)!
+        let stillPending = try JSONDecoder().decode([KiboEvent].self, from: retryFailedData)
+        XCTAssertEqual(stillPending.pendingTurnIDs, ["t1"])
+
+        let closedData = #"[{"seq":1,"kind":"clip","id":"c1"},{"seq":2,"kind":"turn","id":"t1","clips":["c1"]},{"seq":3,"kind":"transcript_error","clip":"c1","error":"broken","terminal":true},{"seq":4,"kind":"reply_error","turn":"t1","stage":"transcription","error":"broken","terminal":true},{"seq":5,"kind":"transcript_retry_requested","clip":"c1"},{"seq":6,"kind":"transcript_started","clip":"c1","attempt":1},{"seq":7,"kind":"transcript_error","clip":"c1","error":"still broken","terminal":true},{"seq":8,"kind":"reply_error","turn":"t1","stage":"transcription","error":"still broken","terminal":true}]"#.data(using: .utf8)!
+        let closed = try JSONDecoder().decode([KiboEvent].self, from: closedData)
+        XCTAssertTrue(closed.pendingTurnIDs.isEmpty)
+        XCTAssertEqual(closed.retryableFailure, .turn("t1"))
+        XCTAssertEqual(closed.timeline().map(\.body), ["still broken", "still broken"])
+    }
+
+    func testSpeechRetryRequiresAdvertisedAndExistingSpeech() throws {
+        let audioLessData = #"[{"seq":1,"kind":"turn","id":"t1","clips":[]},{"seq":2,"kind":"reply","turn":"t1","text":"Text only"},{"seq":3,"kind":"speech_retry_requested","turn":"t1"}]"#.data(using: .utf8)!
+        let audioLess = try JSONDecoder().decode([KiboEvent].self, from: audioLessData)
+        XCTAssertEqual(audioLess.timeline().single?.body, "Text only")
+
+        let readyData = #"[{"seq":1,"kind":"turn","id":"t1","clips":[]},{"seq":2,"kind":"reply","turn":"t1","text":"Spoken","audio":"tts/t1.wav"},{"seq":3,"kind":"speech_started","turn":"t1","attempt":1},{"seq":4,"kind":"speech_ready","turn":"t1"},{"seq":5,"kind":"speech_retry_requested","turn":"t1"}]"#.data(using: .utf8)!
+        let ready = try JSONDecoder().decode([KiboEvent].self, from: readyData)
+        XCTAssertEqual(ready.timeline().single?.body, "Spoken\n\nRetrying speech…")
+        XCTAssertEqual(ready.replyReadiness(for: "t1"), .waiting)
+    }
+
+    func testReplyWaitsForSpeechEndpointAndAutoplayKeepsAwaitingWhileLoading() throws {
+        let replyData = #"[{"seq":1,"kind":"turn","id":"t1","clips":[]},{"seq":2,"kind":"reply","turn":"t1","text":"Text survives","audio":"tts/t1.wav"}]"#.data(using: .utf8)!
+        let reply = try JSONDecoder().decode([KiboEvent].self, from: replyData)
+        XCTAssertEqual(reply.replyReadiness(for: "t1"), .waiting)
+        XCTAssertFalse(reply.timeline().last?.canPlay == true)
+
+        let streamingData = #"[{"seq":1,"kind":"turn","id":"t1","clips":[]},{"seq":2,"kind":"reply","turn":"t1","text":"Text survives","audio":"tts/t1.wav"},{"seq":3,"kind":"speech_started","turn":"t1","attempt":1}]"#.data(using: .utf8)!
+        let streaming = try JSONDecoder().decode([KiboEvent].self, from: streamingData)
+        XCTAssertEqual(streaming.replyReadiness(for: "t1"), .playable)
+        XCTAssertEqual(
+            streaming.replyAutoPlayAction(
+                for: "t1", attemptedSpeechEventSeq: nil,
+                loadingID: nil, playingID: nil, lastFinishedID: nil
+            ),
+            .startPlayback(speechEventSeq: 3)
+        )
+        XCTAssertEqual(
+            streaming.replyAutoPlayAction(
+                for: "t1", attemptedSpeechEventSeq: 3,
+                loadingID: "reply-t1", playingID: nil, lastFinishedID: nil
+            ),
+            .wait,
+            "A 425 retry remains a live loading request and must not clear autoplay"
+        )
+        XCTAssertEqual(
+            streaming.replyAutoPlayAction(
+                for: "t1", attemptedSpeechEventSeq: 3,
+                loadingID: nil, playingID: "reply-t1", lastFinishedID: nil
+            ),
+            .wait,
+            "Audible playback is not durable lifecycle completion"
+        )
+    }
+
+    func testAutoplayOwnershipSurvivesFailedStreamUntilLifecycleRecoveryCompletes() throws {
+        let startedData = #"[{"seq":1,"kind":"turn","id":"t1","clips":[]},{"seq":2,"kind":"reply","turn":"t1","text":"Hi","audio":"tts/t1.wav"},{"seq":3,"kind":"speech_started","turn":"t1","attempt":1}]"#.data(using: .utf8)!
+        let started = try JSONDecoder().decode([KiboEvent].self, from: startedData)
+        XCTAssertEqual(
+            started.replyAutoPlayAction(
+                for: "t1", attemptedSpeechEventSeq: 3,
+                loadingID: nil, playingID: nil, lastFinishedID: nil
+            ),
+            .wait,
+            "A failed transport must wait for a new durable speech event instead of looping"
+        )
+
+        let scheduledData = #"[{"seq":1,"kind":"turn","id":"t1","clips":[]},{"seq":2,"kind":"reply","turn":"t1","text":"Hi","audio":"tts/t1.wav"},{"seq":3,"kind":"speech_started","turn":"t1","attempt":1},{"seq":4,"kind":"speech_retry_scheduled","turn":"t1","attempt":1}]"#.data(using: .utf8)!
+        let scheduled = try JSONDecoder().decode([KiboEvent].self, from: scheduledData)
+        XCTAssertEqual(
+            scheduled.replyAutoPlayAction(
+                for: "t1", attemptedSpeechEventSeq: 3,
+                loadingID: nil, playingID: nil, lastFinishedID: nil
+            ),
+            .wait
+        )
+
+        let restartedData = #"[{"seq":1,"kind":"turn","id":"t1","clips":[]},{"seq":2,"kind":"reply","turn":"t1","text":"Hi","audio":"tts/t1.wav"},{"seq":3,"kind":"speech_started","turn":"t1","attempt":1},{"seq":4,"kind":"speech_retry_scheduled","turn":"t1","attempt":1},{"seq":5,"kind":"speech_started","turn":"t1","attempt":2}]"#.data(using: .utf8)!
+        let restarted = try JSONDecoder().decode([KiboEvent].self, from: restartedData)
+        XCTAssertEqual(
+            restarted.replyAutoPlayAction(
+                for: "t1", attemptedSpeechEventSeq: 3,
+                loadingID: nil, playingID: nil, lastFinishedID: nil
+            ),
+            .startPlayback(speechEventSeq: 5)
+        )
+
+        let readyData = #"[{"seq":1,"kind":"turn","id":"t1","clips":[]},{"seq":2,"kind":"reply","turn":"t1","text":"Hi","audio":"tts/t1.wav"},{"seq":3,"kind":"speech_started","turn":"t1","attempt":1},{"seq":4,"kind":"speech_retry_scheduled","turn":"t1","attempt":1},{"seq":5,"kind":"speech_started","turn":"t1","attempt":2},{"seq":6,"kind":"speech_ready","turn":"t1"}]"#.data(using: .utf8)!
+        let ready = try JSONDecoder().decode([KiboEvent].self, from: readyData)
+        XCTAssertEqual(
+            ready.replyAutoPlayAction(
+                for: "t1", attemptedSpeechEventSeq: 5,
+                loadingID: nil, playingID: "reply-t1", lastFinishedID: nil
+            ),
+            .wait
+        )
+        XCTAssertEqual(
+            ready.replyAutoPlayAction(
+                for: "t1", attemptedSpeechEventSeq: 5,
+                loadingID: nil, playingID: nil, lastFinishedID: "reply-t1"
+            ),
+            .complete
+        )
+    }
+
+    func testSuccessfulSpeechIsAbsorbingUntilExplicitRetry() throws {
+        let readyData = #"[{"seq":1,"kind":"turn","id":"t1","clips":[]},{"seq":2,"kind":"reply","turn":"t1","text":"Text survives","audio":"tts/t1.wav"},{"seq":3,"kind":"speech_ready","turn":"t1"},{"seq":4,"kind":"tts_error","turn":"t1","error":"stale","terminal":false}]"#.data(using: .utf8)!
+        let ready = try JSONDecoder().decode([KiboEvent].self, from: readyData)
+        XCTAssertEqual(ready.replyReadiness(for: "t1"), .playable)
+        XCTAssertTrue(ready.timeline().last?.canPlay == true)
+
+        let failedData = #"[{"seq":1,"kind":"turn","id":"t1","clips":[]},{"seq":2,"kind":"reply","turn":"t1","text":"Text survives","audio":"tts/t1.wav"},{"seq":3,"kind":"speech_ready","turn":"t1"},{"seq":4,"kind":"speech_retry_requested","turn":"t1"},{"seq":5,"kind":"tts_error","turn":"t1","error":"broken","terminal":true}]"#.data(using: .utf8)!
+        let failed = try JSONDecoder().decode([KiboEvent].self, from: failedData)
+
+        XCTAssertEqual(failed.replyReadiness(for: "t1"), .failed)
+        XCTAssertEqual(failed.timeline().last?.body, "Text survives\n\nSpeech unavailable: broken")
     }
 
     func testPCMStreamLedgerCarriesSamplesAcrossArbitraryByteBoundaries() {
@@ -368,6 +753,7 @@ final class KiboAPITests: XCTestCase {
 
         coordinator.handleSystemEvent(.outputRouteUnavailable)
 
+        XCTAssertTrue(coordinator.automaticPlaybackSuspended)
         XCTAssertEqual(log.events, ["capture.preserve"])
         XCTAssertEqual(inventoryRefreshes, 1)
         XCTAssertFalse(coordinator.isHolding)
@@ -452,7 +838,7 @@ final class KiboAPITests: XCTestCase {
         )
         let response = speechResponse(rate: 10, chunks: [pcmData([1, 2]), pcmData([3, 4])])
 
-        speech.playReply(id: "reply") { _ in response }
+        speech.playReply(id: "reply") { _, _ in response }
         await eventually { renderers.count == 1 && renderers[0].scheduledSamples == [1, 2, 3, 4] }
 
         XCTAssertEqual(speech.playingID, "reply")
@@ -460,6 +846,36 @@ final class KiboAPITests: XCTestCase {
         XCTAssertEqual(renderers[0].playCount, 1)
         renderers[0].completeAll()
         XCTAssertNil(speech.playingID)
+    }
+
+    func testTooEarlySpeechStreamRetriesWhileRequestRemainsLoading() async {
+        var attempts = 0
+        var loadingDuringGap: String?
+        var renderers: [FakeSpeechRenderer] = []
+        let player = PCMStreamingPlayer(
+            makeRenderer: { rate, start in
+                let renderer = FakeSpeechRenderer(sampleRate: rate, startSample: start)
+                renderers.append(renderer)
+                return renderer
+            },
+            activateSession: { _ in },
+            retryDelay: { _ in }
+        )
+
+        player.play(id: "reply-t1") { _, _ in
+            attempts += 1
+            if attempts == 1 {
+                loadingDuringGap = player.loadingID
+                throw APIError.server(425, "speech is not ready yet")
+            }
+            return self.speechResponse(rate: 10, chunks: [self.pcmData([1, 2, 3, 4])])
+        }
+
+        await eventually { renderers.count == 1 }
+        XCTAssertEqual(attempts, 2)
+        XCTAssertEqual(loadingDuringGap, "reply-t1")
+        XCTAssertEqual(player.playingID, "reply-t1")
+        XCTAssertNil(player.errorMessage)
     }
 
     func testReleaseBeforePrebufferPreservesPlaybackRebuildIntent() async throws {
@@ -475,7 +891,7 @@ final class KiboAPITests: XCTestCase {
             },
             activateSession: { intents.append($0) }
         )
-        speech.playReply(id: "reply") { _ in
+        speech.playReply(id: "reply") { _, _ in
             SpeechResponseStream(sampleRate: 10, channels: 1, chunks: chunks)
         }
         await eventually { continuation != nil }
@@ -503,7 +919,7 @@ final class KiboAPITests: XCTestCase {
             },
             activateSession: { intents.append($0) }
         )
-        speech.playReply(id: "reply") { _ in
+        speech.playReply(id: "reply") { _, _ in
             SpeechResponseStream(sampleRate: 10, channels: 1, chunks: chunks)
         }
         continuation?.yield(pcmData(Array(0..<20).map(Int16.init)))
@@ -543,7 +959,7 @@ final class KiboAPITests: XCTestCase {
             },
             activateSession: { _ in }
         )
-        speech.playReply(id: "reply") { _ in
+        speech.playReply(id: "reply") { _, _ in
             self.speechResponse(rate: 10, chunks: [self.pcmData(Array(0..<20).map(Int16.init))])
         }
         await eventually { renderers.count == 1 }
@@ -568,7 +984,7 @@ final class KiboAPITests: XCTestCase {
             },
             activateSession: { _ in }
         )
-        speech.playReply(id: "reply") { offset in
+        speech.playReply(id: "reply") { offset, _ in
             offsets.append(offset)
             if offsets.count == 1 {
                 let chunks = AsyncThrowingStream<Data, Error> { continuation in
@@ -585,6 +1001,114 @@ final class KiboAPITests: XCTestCase {
         XCTAssertEqual(renderers[0].scheduledSamples, [1, 2, 3])
     }
 
+    func testNewSpeechGenerationDiscardsEarlierAttemptAndRestartsAtZero() async throws {
+        var offsets: [Int] = []
+        var expectedGenerations: [String?] = []
+        var renderers: [FakeSpeechRenderer] = []
+        let player = PCMStreamingPlayer(
+            makeRenderer: { rate, start in
+                let renderer = FakeSpeechRenderer(sampleRate: rate, startSample: start)
+                renderers.append(renderer)
+                return renderer
+            },
+            activateSession: { _ in },
+            retryDelay: { _ in }
+        )
+
+        player.play(id: "reply") { offset, expectedGeneration in
+            offsets.append(offset)
+            expectedGenerations.append(expectedGeneration)
+            switch offsets.count {
+            case 1:
+                return SpeechResponseStream(
+                    generation: "attempt-1",
+                    sampleRate: 10,
+                    channels: 1,
+                    chunks: AsyncThrowingStream { continuation in
+                        continuation.yield(self.pcmData([1, 2, 3, 4]))
+                        continuation.finish(throwing: TestStreamError.failed)
+                    }
+                )
+            case 2:
+                return SpeechResponseStream(
+                    generation: "attempt-2",
+                    sampleRate: 10,
+                    channels: 1,
+                    chunks: AsyncThrowingStream { continuation in
+                        continuation.yield(self.pcmData([99]))
+                        continuation.finish()
+                    }
+                )
+            default:
+                return SpeechResponseStream(
+                    generation: "attempt-2",
+                    sampleRate: 10,
+                    channels: 1,
+                    chunks: AsyncThrowingStream { continuation in
+                        continuation.yield(self.pcmData([10, 11, 12, 13]))
+                        continuation.finish()
+                    }
+                )
+            }
+        }
+
+        await eventually { renderers.count == 2 }
+        XCTAssertEqual(offsets, [0, 4, 0])
+        XCTAssertEqual(expectedGenerations, [nil, "attempt-1", "attempt-2"])
+        XCTAssertTrue(renderers[0].wasStopped)
+        XCTAssertEqual(renderers[1].scheduledSamples, [10, 11, 12, 13])
+    }
+
+    func testGenerationPreconditionFailureResetsLedgerAndExpectedToken() async throws {
+        var offsets: [Int] = []
+        var expectedGenerations: [String?] = []
+        var renderers: [FakeSpeechRenderer] = []
+        let player = PCMStreamingPlayer(
+            makeRenderer: { rate, start in
+                let renderer = FakeSpeechRenderer(sampleRate: rate, startSample: start)
+                renderers.append(renderer)
+                return renderer
+            },
+            activateSession: { _ in },
+            retryDelay: { _ in }
+        )
+
+        player.play(id: "reply") { offset, expectedGeneration in
+            offsets.append(offset)
+            expectedGenerations.append(expectedGeneration)
+            switch offsets.count {
+            case 1:
+                return SpeechResponseStream(
+                    generation: "attempt-1",
+                    sampleRate: 10,
+                    channels: 1,
+                    chunks: AsyncThrowingStream { continuation in
+                        continuation.yield(self.pcmData([1, 2, 3, 4]))
+                        continuation.finish(throwing: TestStreamError.failed)
+                    }
+                )
+            case 2:
+                throw APIError.speechGenerationChanged
+            default:
+                return SpeechResponseStream(
+                    generation: "attempt-2",
+                    sampleRate: 10,
+                    channels: 1,
+                    chunks: AsyncThrowingStream { continuation in
+                        continuation.yield(self.pcmData([10, 11, 12, 13]))
+                        continuation.finish()
+                    }
+                )
+            }
+        }
+
+        await eventually { renderers.count == 2 }
+        XCTAssertEqual(offsets, [0, 4, 0])
+        XCTAssertEqual(expectedGenerations, [nil, "attempt-1", nil])
+        XCTAssertTrue(renderers[0].wasStopped)
+        XCTAssertEqual(renderers[1].scheduledSamples, [10, 11, 12, 13])
+    }
+
     func testCleanOddByteEOFReconnectsFromLastCompleteSample() async throws {
         var offsets: [Int] = []
         var renderers: [FakeSpeechRenderer] = []
@@ -596,7 +1120,7 @@ final class KiboAPITests: XCTestCase {
             },
             activateSession: { _ in }
         )
-        speech.playReply(id: "reply") { offset in
+        speech.playReply(id: "reply") { offset, _ in
             offsets.append(offset)
             if offsets.count == 1 {
                 return self.speechResponse(rate: 10, chunks: [Data([1, 0, 0xaa])])
@@ -733,6 +1257,264 @@ final class KiboAPITests: XCTestCase {
         XCTAssertEqual(counts.0, 1)
         XCTAssertEqual(counts.1, 0)
         XCTAssertEqual(store.recoveryItemCount, 1)
+    }
+
+    func testServerChangeCannotStraddleAnAcceptedRetry() async throws {
+        let savedServerURL = UserDefaults.standard.string(forKey: "serverURL")
+        UserDefaults.standard.set("https://old-retry.test/", forKey: "serverURL")
+        defer {
+            if let savedServerURL { UserDefaults.standard.set(savedServerURL, forKey: "serverURL") }
+            else { UserDefaults.standard.removeObject(forKey: "serverURL") }
+        }
+
+        let retryStarted = expectation(description: "retry started")
+        let releaseRetry = DispatchSemaphore(value: 0)
+        StubURLProtocol.handler = { request in
+            if request.httpMethod == "POST" {
+                XCTAssertEqual(request.url?.host, "old-retry.test")
+                retryStarted.fulfill()
+                _ = releaseRetry.wait(timeout: .now() + 2)
+                return (
+                    HTTPURLResponse(
+                        url: request.url!, statusCode: 202,
+                        httpVersion: nil, headerFields: nil
+                    )!,
+                    Data()
+                )
+            }
+            let body = #"{"events":[],"latest_seq":0}"#.data(using: .utf8)!
+            return (
+                HTTPURLResponse(
+                    url: request.url!, statusCode: 200,
+                    httpVersion: nil, headerFields: nil
+                )!,
+                body
+            )
+        }
+
+        let store = AppStore(session: session)
+        store.selectedProjectID = "project"
+        store.selectedConversationID = "conversation"
+        let retry = Task { await store.retryFailedWork(.turn("turn-1")) }
+        await fulfillment(of: [retryStarted], timeout: 2)
+
+        let changed = await store.updateServerURL("https://new-retry.test/")
+
+        XCTAssertFalse(changed)
+        XCTAssertEqual(store.serverURL, "https://old-retry.test/")
+        releaseRetry.signal()
+        await retry.value
+    }
+
+    func testServerChangeCannotStraddleProjectCreation() async throws {
+        let savedServerURL = UserDefaults.standard.string(forKey: "serverURL")
+        UserDefaults.standard.set("https://old-create.test/", forKey: "serverURL")
+        defer {
+            if let savedServerURL { UserDefaults.standard.set(savedServerURL, forKey: "serverURL") }
+            else { UserDefaults.standard.removeObject(forKey: "serverURL") }
+        }
+
+        let createStarted = expectation(description: "project create started")
+        let releaseCreate = DispatchSemaphore(value: 0)
+        defer { releaseCreate.signal() }
+        StubURLProtocol.handler = { request in
+            XCTAssertEqual(request.url?.host, "old-create.test")
+            switch (request.httpMethod, request.url?.path) {
+            case ("POST", "/v1/projects"):
+                createStarted.fulfill()
+                _ = releaseCreate.wait(timeout: .now() + 2)
+                let body = #"{"id":"bedroom","name":"Bedroom","created_at":1}"#
+                    .data(using: .utf8)!
+                return (
+                    HTTPURLResponse(
+                        url: request.url!, statusCode: 201,
+                        httpVersion: nil, headerFields: nil
+                    )!,
+                    body
+                )
+            case ("GET", "/v1/projects"):
+                let body = #"{"projects":[{"id":"bedroom","name":"Bedroom","created_at":1}]}"#
+                    .data(using: .utf8)!
+                return (
+                    HTTPURLResponse(
+                        url: request.url!, statusCode: 200,
+                        httpVersion: nil, headerFields: nil
+                    )!,
+                    body
+                )
+            case ("GET", "/v1/projects/bedroom/conversations"):
+                let body = #"{"conversations":[]}"#.data(using: .utf8)!
+                return (
+                    HTTPURLResponse(
+                        url: request.url!, statusCode: 200,
+                        httpVersion: nil, headerFields: nil
+                    )!,
+                    body
+                )
+            default:
+                XCTFail("Unexpected request: \(request.httpMethod ?? "") \(request.url?.path ?? "")")
+                throw URLError(.unsupportedURL)
+            }
+        }
+
+        let store = AppStore(session: session)
+        let creation = Task { await store.createProject(name: "Bedroom") }
+        await fulfillment(of: [createStarted], timeout: 2)
+
+        let changed = await store.updateServerURL("https://new-create.test/")
+
+        XCTAssertFalse(changed)
+        XCTAssertEqual(store.serverURL, "https://old-create.test/")
+        releaseCreate.signal()
+        await creation.value
+        XCTAssertEqual(store.selectedProjectID, "bedroom")
+        XCTAssertEqual(store.projects.map(\.id), ["bedroom"])
+    }
+
+    func testConversationCreateCompletionRejectsAwayAndBackSelectionABA() async throws {
+        let savedServerURL = UserDefaults.standard.string(forKey: "serverURL")
+        UserDefaults.standard.set("https://conversation-create.test/", forKey: "serverURL")
+        defer {
+            if let savedServerURL { UserDefaults.standard.set(savedServerURL, forKey: "serverURL") }
+            else { UserDefaults.standard.removeObject(forKey: "serverURL") }
+        }
+
+        let createStarted = expectation(description: "conversation create started")
+        let releaseCreate = DispatchSemaphore(value: 0)
+        defer { releaseCreate.signal() }
+        let lock = NSLock()
+        var conversationListReads = 0
+        StubURLProtocol.handler = { request in
+            let path = request.url?.path ?? ""
+            if request.httpMethod == "POST" && path == "/v1/projects/p1/conversations" {
+                createStarted.fulfill()
+                _ = releaseCreate.wait(timeout: .now() + 2)
+                let body = #"{"id":"created","project_id":"p1","name":"Created","name_source":"manual","created_at":2,"last_activity_at":2}"#
+                    .data(using: .utf8)!
+                return (
+                    HTTPURLResponse(
+                        url: request.url!, statusCode: 201,
+                        httpVersion: nil, headerFields: nil
+                    )!,
+                    body
+                )
+            }
+            if request.httpMethod == "GET" && path == "/v1/projects/p1/conversations" {
+                lock.withLock { conversationListReads += 1 }
+                let body = #"{"conversations":[{"id":"created","project_id":"p1","name":"Created","name_source":"manual","created_at":2,"last_activity_at":2}]}"#
+                    .data(using: .utf8)!
+                return (
+                    HTTPURLResponse(
+                        url: request.url!, statusCode: 200,
+                        httpVersion: nil, headerFields: nil
+                    )!,
+                    body
+                )
+            }
+            if request.httpMethod == "GET" && path.hasSuffix("/events") {
+                let body = #"{"events":[],"latest_seq":0}"#.data(using: .utf8)!
+                return (
+                    HTTPURLResponse(
+                        url: request.url!, statusCode: 200,
+                        httpVersion: nil, headerFields: nil
+                    )!,
+                    body
+                )
+            }
+            XCTFail("Unexpected request: \(request.httpMethod ?? "") \(path)")
+            throw URLError(.unsupportedURL)
+        }
+
+        let store = AppStore(session: session)
+        store.selectedProjectID = "p1"
+        store.selectedConversationID = "original"
+        store.conversations = [
+            KiboConversation(
+                id: "original", project_id: "p1", name: "Original",
+                name_source: .manual, created_at: 1, last_activity_at: 1
+            ),
+            KiboConversation(
+                id: "other", project_id: "p1", name: "Other",
+                name_source: .manual, created_at: 1, last_activity_at: 1
+            ),
+        ]
+        let creation = Task { await store.createConversation(name: "Created") }
+        await fulfillment(of: [createStarted], timeout: 2)
+
+        let away = Task { await store.selectConversation("other") }
+        await eventually { store.selectedConversationID == "other" }
+        let back = Task { await store.selectConversation("original") }
+        await eventually { store.selectedConversationID == "original" }
+        releaseCreate.signal()
+        await away.value
+        await back.value
+        await creation.value
+
+        XCTAssertEqual(store.selectedConversationID, "original")
+        XCTAssertEqual(store.conversations.map(\.id), ["original", "other"])
+        XCTAssertEqual(lock.withLock { conversationListReads }, 0)
+    }
+
+    func testSubmitTurnDoesNotReturnOrRefreshAfterSelectionChanges() async throws {
+        let savedServerURL = UserDefaults.standard.string(forKey: "serverURL")
+        UserDefaults.standard.set("https://submit-selection.test/", forKey: "serverURL")
+        defer {
+            if let savedServerURL { UserDefaults.standard.set(savedServerURL, forKey: "serverURL") }
+            else { UserDefaults.standard.removeObject(forKey: "serverURL") }
+        }
+
+        let submitStarted = expectation(description: "turn submit started")
+        let releaseSubmit = DispatchSemaphore(value: 0)
+        defer { releaseSubmit.signal() }
+        let lock = NSLock()
+        var eventReads = 0
+        StubURLProtocol.handler = { request in
+            let path = request.url?.path ?? ""
+            if request.httpMethod == "POST" && path.hasSuffix("/turns") {
+                XCTAssertTrue(path.contains("/conversations/original/"))
+                submitStarted.fulfill()
+                _ = releaseSubmit.wait(timeout: .now() + 2)
+                let body = #"{"turn_id":"accepted","clips":[],"created":true}"#
+                    .data(using: .utf8)!
+                return (
+                    HTTPURLResponse(
+                        url: request.url!, statusCode: 202,
+                        httpVersion: nil, headerFields: nil
+                    )!,
+                    body
+                )
+            }
+            if request.httpMethod == "GET" && path.hasSuffix("/events") {
+                lock.withLock { eventReads += 1 }
+                let body = #"{"events":[],"latest_seq":0}"#.data(using: .utf8)!
+                return (
+                    HTTPURLResponse(
+                        url: request.url!, statusCode: 200,
+                        httpVersion: nil, headerFields: nil
+                    )!,
+                    body
+                )
+            }
+            XCTFail("Unexpected request: \(request.httpMethod ?? "") \(path)")
+            throw URLError(.unsupportedURL)
+        }
+
+        let store = AppStore(session: session)
+        store.discardPendingUploads()
+        store.selectedProjectID = "p1"
+        store.selectedConversationID = "original"
+        let submission = Task { await store.submitTurn() }
+        await fulfillment(of: [submitStarted], timeout: 2)
+
+        let selection = Task { await store.selectConversation("replacement") }
+        await eventually { store.selectedConversationID == "replacement" }
+        releaseSubmit.signal()
+        await selection.value
+        let turnID = await submission.value
+
+        XCTAssertNil(turnID)
+        XCTAssertEqual(store.selectedConversationID, "replacement")
+        XCTAssertEqual(lock.withLock { eventReads }, 1)
     }
 
     func testSuccessfulUploadRestoresExistingRecoveryStatus() async throws {

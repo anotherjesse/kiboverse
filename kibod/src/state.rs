@@ -1,4 +1,5 @@
 use crate::ai::{Ai, HistoryTurn, TTS_RATE};
+use crate::knowledge::{self, Document, IngestReceipt, JinaReader, ReaderDocument, WebSource};
 use crate::store::{AutoNameOutcome, Store};
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
@@ -6,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{Mutex as AsyncMutex, broadcast, watch};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -16,10 +17,12 @@ pub struct AppState {
 struct Inner {
     pub store: Store,
     pub ai: Ai,
+    jina: JinaReader,
     channels: Mutex<HashMap<String, broadcast::Sender<Value>>>,
     speech: Mutex<HashMap<String, Arc<SpeechStream>>>,
     transcribing: Mutex<HashSet<String>>,
     processing_conversations: Mutex<HashSet<String>>,
+    knowledge_locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
 }
 
 pub struct SpeechStream {
@@ -27,6 +30,18 @@ pub struct SpeechStream {
     done: Mutex<bool>,
     error: Mutex<Option<String>>,
     changed: watch::Sender<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub enum IngestOutcome {
+    Ingested(IngestReceipt),
+    Skipped,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IngestSummary {
+    pub ingested: usize,
+    pub skipped: usize,
 }
 
 impl Default for SpeechStream {
@@ -79,10 +94,12 @@ impl AppState {
             inner: Arc::new(Inner {
                 store,
                 ai,
+                jina: JinaReader::from_env(),
                 channels: Mutex::new(HashMap::new()),
                 speech: Mutex::new(HashMap::new()),
                 transcribing: Mutex::new(HashSet::new()),
                 processing_conversations: Mutex::new(HashSet::new()),
+                knowledge_locks: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -93,6 +110,148 @@ impl AppState {
 
     pub fn ai(&self) -> &Ai {
         &self.inner.ai
+    }
+
+    pub fn jina_has_api_key(&self) -> bool {
+        self.inner.jina.has_api_key()
+    }
+
+    pub async fn ingest_changed(&self, project_id: &str) -> Result<IngestSummary> {
+        let lock = self.knowledge_lock(project_id);
+        let _guard = lock.lock().await;
+        let mut summary = IngestSummary::default();
+        for conversation in self.inner.store.list_conversations(project_id)? {
+            let document =
+                knowledge::conversation_document(&self.inner.store, project_id, &conversation.id)?;
+            if document.body.trim().is_empty() {
+                continue;
+            }
+            match self.ingest_document(project_id, document, false).await? {
+                IngestOutcome::Ingested(_) => summary.ingested += 1,
+                IngestOutcome::Skipped => summary.skipped += 1,
+            }
+        }
+        for source in knowledge::list_web_sources(&self.inner.store, project_id)? {
+            let document = knowledge::web_document(&self.inner.store, project_id, &source.id)?;
+            match self.ingest_document(project_id, document, false).await? {
+                IngestOutcome::Ingested(_) => summary.ingested += 1,
+                IngestOutcome::Skipped => summary.skipped += 1,
+            }
+        }
+        Ok(summary)
+    }
+
+    pub async fn ingest_conversation(
+        &self,
+        project_id: &str,
+        conversation_id: &str,
+        force: bool,
+    ) -> Result<IngestOutcome> {
+        let lock = self.knowledge_lock(project_id);
+        let _guard = lock.lock().await;
+        let document =
+            knowledge::conversation_document(&self.inner.store, project_id, conversation_id)?;
+        self.ingest_document(project_id, document, force).await
+    }
+
+    pub async fn import_url(
+        &self,
+        project_id: &str,
+        url: &str,
+    ) -> Result<(WebSource, IngestOutcome)> {
+        let lock = self.knowledge_lock(project_id);
+        let _guard = lock.lock().await;
+        self.inner.store.project(project_id)?;
+        let reader = self.inner.jina.read(url).await?;
+        self.import_reader_document(project_id, reader).await
+    }
+
+    async fn import_reader_document(
+        &self,
+        project_id: &str,
+        reader: ReaderDocument,
+    ) -> Result<(WebSource, IngestOutcome)> {
+        let source = knowledge::import_reader_document(&self.inner.store, project_id, reader)?;
+        let document = knowledge::web_document(&self.inner.store, project_id, &source.id)?;
+        let outcome = self.ingest_document(project_id, document, false).await?;
+        Ok((source, outcome))
+    }
+
+    pub async fn ingest_web_source(
+        &self,
+        project_id: &str,
+        source_id: &str,
+        force: bool,
+    ) -> Result<IngestOutcome> {
+        let lock = self.knowledge_lock(project_id);
+        let _guard = lock.lock().await;
+        let document = knowledge::web_document(&self.inner.store, project_id, source_id)?;
+        self.ingest_document(project_id, document, force).await
+    }
+
+    pub async fn refresh_web_source(
+        &self,
+        project_id: &str,
+        source_id: &str,
+    ) -> Result<(WebSource, IngestOutcome)> {
+        let lock = self.knowledge_lock(project_id);
+        let _guard = lock.lock().await;
+        let source = knowledge::read_web_source(&self.inner.store, project_id, source_id)?;
+        let reader = self.inner.jina.read(&source.url).await?;
+        self.import_reader_document(project_id, reader).await
+    }
+
+    async fn ingest_document(
+        &self,
+        project_id: &str,
+        document: Document,
+        force: bool,
+    ) -> Result<IngestOutcome> {
+        if document.body.trim().is_empty() {
+            return Err(anyhow!(
+                "source has no transcript or document content to ingest"
+            ));
+        }
+        let (instructions, instructions_hash) =
+            knowledge::instructions(&self.inner.store, project_id)?;
+        let checkpoint = knowledge::checkpoint(&self.inner.store, project_id)?;
+        if !force
+            && !knowledge::needs_ingest(
+                checkpoint.documents.get(&document.key),
+                &document,
+                &instructions_hash,
+            )
+        {
+            return Ok(IngestOutcome::Skipped);
+        }
+        let note = self
+            .inner
+            .ai
+            .knowledge_note(
+                &document.title,
+                document.kind.as_str(),
+                &document.body,
+                &instructions,
+            )
+            .await?;
+        let receipt = knowledge::commit_ingestion(
+            &self.inner.store,
+            project_id,
+            &document,
+            &instructions_hash,
+            &note,
+        )?;
+        Ok(IngestOutcome::Ingested(receipt))
+    }
+
+    fn knowledge_lock(&self, project_id: &str) -> Arc<AsyncMutex<()>> {
+        self.inner
+            .knowledge_locks
+            .lock()
+            .unwrap()
+            .entry(project_id.to_string())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
     }
 
     pub fn subscribe(&self, project_id: &str, conversation_id: &str) -> broadcast::Receiver<Value> {
@@ -668,12 +827,14 @@ mod tests {
     async fn mock_pipeline_reaches_durable_speech() {
         let temporary = tempfile::tempdir().unwrap();
         let store = Store::open(temporary.path()).unwrap();
+        let conversation = store.create_conversation("kibo", None).unwrap();
+        let conversation_id = conversation.id.as_str();
         let wav = b"RIFF0000WAVE mock";
         let sha = hex_sha256(wav);
         store
             .put_clip(ClipUpload {
                 project_id: "kibo",
-                conversation_id: "general",
+                conversation_id,
                 clip_id: "clip-1",
                 bytes: wav,
                 expected_sha256: &sha,
@@ -683,17 +844,19 @@ mod tests {
             })
             .unwrap();
         let state = AppState::new(store.clone(), Ai::mock());
-        state.start_transcription("kibo".into(), "general".into(), "clip-1".into());
-        let outcome = store.create_turn("kibo", "general", "turn-1").unwrap();
+        state.start_transcription("kibo".into(), conversation.id.clone(), "clip-1".into());
+        let outcome = store
+            .create_turn("kibo", conversation_id, "turn-1")
+            .unwrap();
         assert!(matches!(outcome, CreateTurnOutcome::Created { .. }));
-        state.start_turn("kibo".into(), "general".into(), "turn-1".into());
+        state.start_turn("kibo".into(), conversation.id.clone(), "turn-1".into());
 
-        wait_for_event(&store, "speech_ready").await;
-        let records = store.records("kibo", "general").unwrap();
+        wait_for_event(&store, conversation_id, "speech_ready").await;
+        let records = store.records("kibo", conversation_id).unwrap();
         assert!(records.iter().any(|event| event["kind"] == "reply"));
         assert!(
             store
-                .speech_path("kibo", "general", "turn-1")
+                .speech_path("kibo", conversation_id, "turn-1")
                 .unwrap()
                 .exists()
         );
@@ -703,27 +866,29 @@ mod tests {
     async fn resume_synthesizes_a_reply_left_without_speech() {
         let temporary = tempfile::tempdir().unwrap();
         let store = Store::open(temporary.path()).unwrap();
+        let conversation = store.create_conversation("kibo", None).unwrap();
+        let conversation_id = conversation.id.as_str();
         store
             .append(
                 "kibo",
-                "general",
+                conversation_id,
                 json!({"kind":"turn", "id":"turn-1", "clips":["clip-1"]}),
             )
             .unwrap();
         store
             .append(
                 "kibo",
-                "general",
+                conversation_id,
                 json!({"kind":"reply", "turn":"turn-1", "text":"Recovered reply", "audio":"tts/turn-1.wav"}),
             )
             .unwrap();
         let state = AppState::new(store.clone(), Ai::mock());
         state.resume().unwrap();
 
-        wait_for_event(&store, "speech_ready").await;
+        wait_for_event(&store, conversation_id, "speech_ready").await;
         assert!(
             store
-                .speech_path("kibo", "general", "turn-1")
+                .speech_path("kibo", conversation_id, "turn-1")
                 .unwrap()
                 .exists()
         );
@@ -733,35 +898,37 @@ mod tests {
     async fn conversation_worker_uses_durable_turn_order() {
         let temporary = tempfile::tempdir().unwrap();
         let store = Store::open(temporary.path()).unwrap();
+        let conversation = store.create_conversation("kibo", None).unwrap();
+        let conversation_id = conversation.id.as_str();
         for (clip, turn, text) in [
             ("clip-1", "turn-1", "first"),
             ("clip-2", "turn-2", "second"),
         ] {
             store
-                .append("kibo", "general", json!({"kind":"clip", "id":clip}))
+                .append("kibo", conversation_id, json!({"kind":"clip", "id":clip}))
                 .unwrap();
             store
                 .append(
                     "kibo",
-                    "general",
+                    conversation_id,
                     json!({"kind":"transcript", "clip":clip, "text":text}),
                 )
                 .unwrap();
             store
                 .append(
                     "kibo",
-                    "general",
+                    conversation_id,
                     json!({"kind":"turn", "id":turn, "clips":[clip]}),
                 )
                 .unwrap();
         }
         let state = AppState::new(store.clone(), Ai::mock());
         // Even a later turn winning the request race cannot overtake the log.
-        state.start_turn("kibo".into(), "general".into(), "turn-2".into());
-        state.start_turn("kibo".into(), "general".into(), "turn-1".into());
-        wait_for_event_count(&store, "speech_ready", 2).await;
+        state.start_turn("kibo".into(), conversation.id.clone(), "turn-2".into());
+        state.start_turn("kibo".into(), conversation.id.clone(), "turn-1".into());
+        wait_for_event_count(&store, conversation_id, "speech_ready", 2).await;
         let replies: Vec<_> = store
-            .records("kibo", "general")
+            .records("kibo", conversation_id)
             .unwrap()
             .into_iter()
             .filter(|event| event["kind"] == "reply")
@@ -770,15 +937,106 @@ mod tests {
         assert_eq!(replies, ["turn-1", "turn-2"]);
     }
 
-    async fn wait_for_event(store: &Store, kind: &str) {
-        wait_for_event_count(store, kind, 1).await;
+    #[tokio::test]
+    async fn knowledge_ingestion_skips_unchanged_and_force_replaces_the_note() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(temporary.path()).unwrap();
+        let conversation = store
+            .create_conversation("kibo", Some("Design notes"))
+            .unwrap();
+        store
+            .append(
+                "kibo",
+                &conversation.id,
+                json!({"kind":"transcript", "clip":"clip-1", "text":"Keep raw sources separate from generated notes."}),
+            )
+            .unwrap();
+        let state = AppState::new(store.clone(), Ai::mock());
+
+        let first = state
+            .ingest_conversation("kibo", &conversation.id, false)
+            .await
+            .unwrap();
+        assert!(matches!(first, IngestOutcome::Ingested(ref receipt) if receipt.generation == 1));
+        assert!(matches!(
+            state
+                .ingest_conversation("kibo", &conversation.id, false)
+                .await
+                .unwrap(),
+            IngestOutcome::Skipped
+        ));
+
+        store
+            .append(
+                "kibo",
+                &conversation.id,
+                json!({"kind":"speech_ready", "turn":"turn-1", "samples":10, "rate":24000}),
+            )
+            .unwrap();
+        assert!(matches!(
+            state
+                .ingest_conversation("kibo", &conversation.id, false)
+                .await
+                .unwrap(),
+            IngestOutcome::Skipped
+        ));
+
+        let forced = state
+            .ingest_conversation("kibo", &conversation.id, true)
+            .await
+            .unwrap();
+        assert!(matches!(forced, IngestOutcome::Ingested(ref receipt) if receipt.generation == 2));
+        let page = knowledge::read_markdown(
+            &store,
+            "kibo",
+            &format!("wiki/sources/conversation--{}.md", conversation.id),
+        )
+        .unwrap();
+        assert!(page.contains("source_id: \"conversation:"));
+        assert!(page.contains("Keep raw sources separate"));
     }
 
-    async fn wait_for_event_count(store: &Store, kind: &str, count: usize) {
+    #[tokio::test]
+    async fn imported_reader_content_uses_the_same_checkpoint_path() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(temporary.path()).unwrap();
+        let state = AppState::new(store.clone(), Ai::mock());
+        let (source, first) = state
+            .import_reader_document(
+                "kibo",
+                ReaderDocument {
+                    url: "https://example.com/article".into(),
+                    title: "Useful article".into(),
+                    content: "# Useful article\n\nA durable web source.".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(first, IngestOutcome::Ingested(_)));
+        assert!(matches!(
+            state
+                .ingest_web_source("kibo", &source.id, false)
+                .await
+                .unwrap(),
+            IngestOutcome::Skipped
+        ));
+        let files = knowledge::markdown_files(&store, "kibo").unwrap();
+        assert!(
+            files
+                .iter()
+                .any(|file| file.path == format!("wiki/sources/web--{}.md", source.id))
+        );
+    }
+
+    async fn wait_for_event(store: &Store, conversation_id: &str, kind: &str) {
+        wait_for_event_count(store, conversation_id, kind, 1).await;
+    }
+
+    async fn wait_for_event_count(store: &Store, conversation_id: &str, kind: &str, count: usize) {
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 if store
-                    .records("kibo", "general")
+                    .records("kibo", conversation_id)
                     .unwrap()
                     .iter()
                     .filter(|event| event["kind"] == kind)

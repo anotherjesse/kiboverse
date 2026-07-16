@@ -30,6 +30,7 @@ be exercised without credentials. Set these environment variables as needed:
 | Variable | Default | Purpose |
 |---|---|---|
 | `GEMINI_API_KEY` | unset | Enables Gemini transcription, chat, and TTS |
+| `JINA_API_KEY` | unset | Raises Jina Reader limits for project URL ingestion |
 | `KIBO_AI_MODE` | automatic | Set to `mock` to force deterministic local AI |
 | `KIBO_DATA_DIR` | `~/kibo-data` | Durable projects, logs, clips, and speech |
 | `KIBO_BIND` | `127.0.0.1:3000` | Listen address; use `0.0.0.0:3000` on a trusted LAN/tailnet |
@@ -39,9 +40,18 @@ before uploading, and will not submit a turn until its pending uploads are
 acknowledged. The server log remains authoritative: live WebSocket events are
 paired with cursor-based `GET /events?after=<seq>` recovery.
 
-New conversations are named from the first successful transcription. A later
+Projects act as folders and may be empty. The browser's project page starts
+unnamed chats without asking for a room name, lists them by recent activity,
+and opens each as an independent conversation. New conversations are named
+from the first successful transcription. A later
 AI-generated title after a few completed turns is intentionally left as a
 phase-two TODO; manual names will remain authoritative.
+
+Each project also has a **Knowledge** workspace in the browser. It compiles
+changed conversations into Markdown source notes, can force-regenerate one
+note, imports or refreshes public webpages and PDFs through Jina Reader, and
+renders generated Markdown alongside its raw text. The notes and successful
+content-hash checkpoints live under the project's `knowledge/` directory.
 
 This phase has no user authentication and is intended only for localhost or a
 trusted tailnet. Browser microphone capture works on localhost; remote browser

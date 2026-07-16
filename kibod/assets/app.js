@@ -19,6 +19,47 @@
   const recordingStatus = $("#recording-status");
   const connectionStatus = $("#connection-status");
 
+  function setupKnowledgeProgress() {
+    const progress = $("#knowledge-progress");
+    if (!progress) return;
+    const title = $("#knowledge-progress-title", progress);
+    const detail = $("#knowledge-progress-detail", progress);
+    const forms = document.querySelectorAll("form[data-knowledge-action]");
+    for (const form of forms) {
+      form.addEventListener("submit", (event) => {
+        if (root.dataset.knowledgeBusy === "true") {
+          event.preventDefault();
+          return;
+        }
+        event.preventDefault();
+        root.dataset.knowledgeBusy = "true";
+        $(".knowledge-main")?.setAttribute("aria-busy", "true");
+        if (title) title.textContent = form.dataset.progressTitle || "Updating knowledge";
+        if (detail) detail.textContent = form.dataset.progressDetail || "This may take a moment.";
+        progress.hidden = false;
+        for (const button of document.querySelectorAll("form[data-knowledge-action] button")) {
+          button.disabled = true;
+        }
+        for (const input of document.querySelectorAll("form[data-knowledge-action] input")) {
+          input.readOnly = true;
+        }
+        const submitButton = form.querySelector("button[type=submit]");
+        if (submitButton) submitButton.textContent = form.dataset.progressButton || "Working…";
+        window.setTimeout(() => {
+          if (root.dataset.knowledgeBusy === "true" && detail) {
+            detail.textContent = form.dataset.progressLong || "Still working—larger sources can take a little longer.";
+          }
+        }, 8000);
+        // Let the progress panel paint before native navigation begins.
+        window.requestAnimationFrame(() => {
+          window.requestAnimationFrame(() => form.submit());
+        });
+      });
+    }
+  }
+
+  setupKnowledgeProgress();
+
   if (!conversationUrl) return;
 
   let cursor = Number(root.dataset.lastSeq || 0);

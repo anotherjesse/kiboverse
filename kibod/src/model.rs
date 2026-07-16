@@ -15,6 +15,16 @@ pub struct Conversation {
     #[serde(default)]
     pub name_source: ConversationNameSource,
     pub created_at: u64,
+    /// Most recent durable event in this conversation. Older metadata does not
+    /// contain this field, so readers fall back to `created_at` when it is zero.
+    #[serde(default)]
+    pub last_activity_at: u64,
+}
+
+impl Conversation {
+    pub fn activity_at(&self) -> u64 {
+        self.last_activity_at.max(self.created_at)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,5 +127,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(conversation.name_source, ConversationNameSource::Manual);
+        assert_eq!(conversation.last_activity_at, 0);
+        assert_eq!(conversation.activity_at(), 1);
     }
 }

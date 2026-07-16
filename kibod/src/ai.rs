@@ -128,6 +128,32 @@ impl Ai {
         chat_reply(&response)
     }
 
+    /// Compile one canonical project source into a durable Markdown note.
+    /// Provenance frontmatter is added by the knowledge store after this
+    /// returns, so the model only owns the human-readable body.
+    pub async fn knowledge_note(
+        &self,
+        title: &str,
+        source_kind: &str,
+        source_body: &str,
+        instructions: &str,
+    ) -> Result<String> {
+        if self.mock {
+            return Ok(format!(
+                "# {title}\n\n## Summary\n\nMock knowledge note generated from a {source_kind} source.\n\n## Source material\n\n{}",
+                source_body.trim()
+            ));
+        }
+        let prompt = format!(
+            "You maintain a personal knowledge base. Return only the Markdown body for one source note; do not include YAML frontmatter or a fenced code block.\n\nProject instructions:\n{instructions}\n\nSource kind: {source_kind}\nSource title: {title}\n\nCanonical source:\n{source_body}"
+        );
+        let response = self
+            .interaction(&json!({"model": GEMINI_MODEL, "input": prompt}))
+            .await
+            .context("generate knowledge note")?;
+        output_text(&response, "knowledge note")
+    }
+
     /// Start TTS in the background. Each successful receive is the next
     /// contiguous block of 24 kHz mono signed-16 PCM samples. The sender
     /// closes at EOF; a terminal synthesis/parsing failure is sent as `Err`.

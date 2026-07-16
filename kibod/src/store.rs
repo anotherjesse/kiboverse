@@ -7,6 +7,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
@@ -14,6 +16,8 @@ pub struct Store {
     root: Arc<PathBuf>,
     locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     _writer_lock: Arc<File>,
+    #[cfg(test)]
+    fail_activity_writes: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,8 +91,11 @@ impl Store {
             root: Arc::new(root),
             locks: Arc::new(Mutex::new(HashMap::new())),
             _writer_lock: Arc::new(writer_lock),
+            #[cfg(test)]
+            fail_activity_writes: Arc::new(AtomicBool::new(false)),
         };
         store.ensure_starter()?;
+        store.reconcile_activity_caches();
         Ok(store)
     }
 
@@ -104,13 +111,53 @@ impl Store {
                 created_at: epoch(),
             };
             self.write_project(&project)?;
-            let conversation = Conversation {
-                id: "general".into(),
-                project_id: project.id,
-                name: "New conversation".into(),
-                name_source: ConversationNameSource::Placeholder,
-                created_at: epoch(),
-            };
+        }
+        Ok(())
+    }
+
+    /// Rebuild the conversation activity cache from its authoritative event
+    /// log. A corrupt log or failed metadata write is reported but does not
+    /// make `Store::open` fail: reconciliation never edits the log, and normal
+    /// readers/workers will still surface authoritative-log errors.
+    fn reconcile_activity_caches(&self) {
+        let conversations = match self.conversation_keys() {
+            Ok(conversations) => conversations,
+            Err(error) => {
+                tracing::warn!(
+                    "could not enumerate conversations for activity reconciliation: {error:#}"
+                );
+                return;
+            }
+        };
+        for (project_id, conversation_id) in conversations {
+            if let Err(error) = self.reconcile_conversation_activity(&project_id, &conversation_id)
+            {
+                tracing::warn!(
+                    %project_id,
+                    %conversation_id,
+                    "could not reconcile conversation activity cache: {error:#}"
+                );
+            }
+        }
+    }
+
+    fn reconcile_conversation_activity(
+        &self,
+        project_id: &str,
+        conversation_id: &str,
+    ) -> Result<()> {
+        let lock = self.conversation_lock(project_id, conversation_id);
+        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut conversation = self.conversation(project_id, conversation_id)?;
+        let last_activity_at = self
+            .records_unlocked(project_id, conversation_id)?
+            .iter()
+            .filter_map(|record| record["at"].as_u64())
+            .max()
+            .unwrap_or(conversation.created_at)
+            .max(conversation.created_at);
+        if conversation.last_activity_at != last_activity_at {
+            conversation.last_activity_at = last_activity_at;
             self.write_conversation(&conversation)?;
         }
         Ok(())
@@ -142,13 +189,6 @@ impl Store {
             created_at: epoch(),
         };
         self.write_project(&project)?;
-        self.write_conversation(&Conversation {
-            id: "general".into(),
-            project_id: project.id.clone(),
-            name: "New conversation".into(),
-            name_source: ConversationNameSource::Placeholder,
-            created_at: epoch(),
-        })?;
         Ok(project)
     }
 
@@ -162,14 +202,20 @@ impl Store {
 
     pub fn list_conversations(&self, project_id: &str) -> Result<Vec<Conversation>> {
         self.project(project_id)?;
-        let mut conversations = Vec::new();
+        let mut conversations: Vec<Conversation> = Vec::new();
         for entry in fs::read_dir(self.project_dir(project_id).join("conversations"))? {
             let path = entry?.path().join("conversation.json");
             if path.exists() {
                 conversations.push(read_json(&path)?);
             }
         }
-        conversations.sort_by_key(|conversation: &Conversation| conversation.created_at);
+        conversations.sort_by(|left, right| {
+            right
+                .activity_at()
+                .cmp(&left.activity_at())
+                .then_with(|| right.created_at.cmp(&left.created_at))
+                .then_with(|| left.id.cmp(&right.id))
+        });
         Ok(conversations)
     }
 
@@ -197,12 +243,14 @@ impl Store {
             Some(name) => (clean_name(name)?, ConversationNameSource::Manual),
             None => ("New conversation", ConversationNameSource::Placeholder),
         };
+        let created_at = epoch();
         let conversation = Conversation {
             id: make_id(name),
             project_id: project_id.into(),
             name: name.into(),
             name_source,
-            created_at: epoch(),
+            created_at,
+            last_activity_at: created_at,
         };
         self.write_conversation(&conversation)?;
         Ok(conversation)
@@ -281,6 +329,7 @@ impl Store {
         object.insert("seq".into(), seq.into());
         object.entry("at").or_insert_with(|| epoch().into());
         append_jsonl(&path, &record)?;
+        self.record_activity_best_effort(project_id, conversation_id, record["at"].as_u64());
         Ok(record)
     }
 
@@ -339,6 +388,11 @@ impl Store {
             "sha256": actual_sha,
         });
         append_jsonl(&path, &record)?;
+        self.record_activity_best_effort(
+            upload.project_id,
+            upload.conversation_id,
+            record["at"].as_u64(),
+        );
         Ok((PutClip::Created, Some(record)))
     }
 
@@ -417,6 +471,7 @@ impl Store {
             "clips": clips,
         });
         append_jsonl(&path, &record)?;
+        self.record_activity_best_effort(project_id, conversation_id, record["at"].as_u64());
         Ok(CreateTurnOutcome::Created {
             clips: turn_clips(&record)?,
             record,
@@ -467,6 +522,38 @@ impl Store {
             .entry(key)
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
+    }
+
+    fn record_activity_unlocked(
+        &self,
+        project_id: &str,
+        conversation_id: &str,
+        event_at: Option<u64>,
+    ) -> Result<()> {
+        #[cfg(test)]
+        if self.fail_activity_writes.load(Ordering::Relaxed) {
+            bail!("injected activity metadata write failure");
+        }
+        let mut conversation = self.conversation(project_id, conversation_id)?;
+        conversation.last_activity_at = conversation
+            .activity_at()
+            .max(event_at.unwrap_or_else(epoch));
+        self.write_conversation(&conversation)
+    }
+
+    fn record_activity_best_effort(
+        &self,
+        project_id: &str,
+        conversation_id: &str,
+        event_at: Option<u64>,
+    ) {
+        if let Err(error) = self.record_activity_unlocked(project_id, conversation_id, event_at) {
+            tracing::warn!(
+                %project_id,
+                %conversation_id,
+                "durable event committed but activity cache update failed: {error:#}"
+            );
+        }
     }
 
     fn check_id(&self, id: &str) -> Result<()> {
@@ -689,14 +776,36 @@ pub fn hex_sha256(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn store_with_general() -> (tempfile::TempDir, Store) {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(temporary.path()).unwrap();
+        store
+            .write_conversation(&Conversation {
+                id: "general".into(),
+                project_id: "kibo".into(),
+                name: "General".into(),
+                name_source: ConversationNameSource::Manual,
+                created_at: 1,
+                last_activity_at: 1,
+            })
+            .unwrap();
+        (temporary, store)
+    }
+
     #[test]
-    fn starter_and_append_sequence_are_durable() {
+    fn starter_and_new_projects_begin_without_conversations() {
         let temporary = tempfile::tempdir().unwrap();
         let store = Store::open(temporary.path()).unwrap();
         assert_eq!(store.list_projects().unwrap()[0].id, "kibo");
-        let starter = store.conversation("kibo", "general").unwrap();
-        assert_eq!(starter.name, "New conversation");
-        assert_eq!(starter.name_source, ConversationNameSource::Placeholder);
+        assert!(store.list_conversations("kibo").unwrap().is_empty());
+
+        let project = store.create_project("Recipes").unwrap();
+        assert!(store.list_conversations(&project.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn append_sequence_is_durable_for_existing_general_data() {
+        let (_temporary, store) = store_with_general();
         let one = store
             .append("kibo", "general", json!({"kind":"one"}))
             .unwrap();
@@ -718,8 +827,7 @@ mod tests {
 
     #[test]
     fn clip_upload_is_idempotent_by_id_and_hash() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = Store::open(temporary.path()).unwrap();
+        let (_temporary, store) = store_with_general();
         let bytes = b"RIFF tiny fake wav";
         let sha = hex_sha256(bytes);
         let upload = || ClipUpload {
@@ -739,8 +847,7 @@ mod tests {
 
     #[test]
     fn append_recovers_an_incomplete_final_jsonl_record() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = Store::open(temporary.path()).unwrap();
+        let (_temporary, store) = store_with_general();
         store
             .append("kibo", "general", json!({"kind":"one"}))
             .unwrap();
@@ -764,8 +871,7 @@ mod tests {
 
     #[test]
     fn orphaned_clip_is_recovered_but_never_overwritten() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = Store::open(temporary.path()).unwrap();
+        let (_temporary, store) = store_with_general();
         let path = store.clip_path("kibo", "general", "clip-1").unwrap();
         fs::write(&path, b"different").unwrap();
         let bytes = b"RIFF tiny fake wav";
@@ -796,8 +902,7 @@ mod tests {
 
     #[test]
     fn concurrent_appends_have_unique_monotonic_sequences() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = Store::open(temporary.path()).unwrap();
+        let (_temporary, store) = store_with_general();
         let threads: Vec<_> = (0..4)
             .map(|thread| {
                 let store = store.clone();
@@ -831,8 +936,7 @@ mod tests {
 
     #[test]
     fn create_turn_claims_clips_once_and_is_idempotent() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = Store::open(temporary.path()).unwrap();
+        let (_temporary, store) = store_with_general();
         let bytes = b"RIFF tiny fake wav";
         let sha = hex_sha256(bytes);
         store
@@ -874,8 +978,7 @@ mod tests {
 
     #[test]
     fn concurrent_turn_retries_share_one_claim() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = Store::open(temporary.path()).unwrap();
+        let (_temporary, store) = store_with_general();
         let bytes = b"RIFF tiny fake wav";
         let sha = hex_sha256(bytes);
         store
@@ -937,6 +1040,176 @@ mod tests {
         assert_eq!(manual.name, "Road trip notes");
         assert_eq!(manual.name_source, ConversationNameSource::Manual);
         assert!(store.create_conversation("kibo", Some("  ")).is_err());
+    }
+
+    #[test]
+    fn conversations_sort_by_persisted_recent_activity() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(temporary.path()).unwrap();
+        let mut older = store.create_conversation("kibo", None).unwrap();
+        older.created_at = 1;
+        older.last_activity_at = 1;
+        store.write_conversation(&older).unwrap();
+        let mut newer = store.create_conversation("kibo", None).unwrap();
+        newer.created_at = 2;
+        newer.last_activity_at = 2;
+        store.write_conversation(&newer).unwrap();
+
+        store
+            .append(
+                "kibo",
+                &older.id,
+                json!({"kind":"reply", "at":10, "turn":"turn-1", "text":"hello"}),
+            )
+            .unwrap();
+
+        let conversations = store.list_conversations("kibo").unwrap();
+        assert_eq!(conversations[0].id, older.id);
+        assert_eq!(conversations[0].last_activity_at, 10);
+        assert_eq!(conversations[1].id, newer.id);
+    }
+
+    #[test]
+    fn startup_backfills_legacy_activity_from_newest_durable_event() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(temporary.path()).unwrap();
+        let mut conversation = store.create_conversation("kibo", None).unwrap();
+        conversation.created_at = 1;
+        conversation.last_activity_at = 1;
+        store.write_conversation(&conversation).unwrap();
+        store
+            .append("kibo", &conversation.id, json!({"kind":"one", "at":40}))
+            .unwrap();
+        store
+            .append("kibo", &conversation.id, json!({"kind":"two", "at":30}))
+            .unwrap();
+        let metadata_path = store
+            .conversation_dir("kibo", &conversation.id)
+            .join("conversation.json");
+        let mut legacy: Value = read_json(&metadata_path).unwrap();
+        legacy.as_object_mut().unwrap().remove("last_activity_at");
+        write_json_atomic(&metadata_path, &legacy).unwrap();
+        let conversation_id = conversation.id;
+        drop(store);
+
+        let reopened = Store::open(temporary.path()).unwrap();
+        let reconciled = reopened.conversation("kibo", &conversation_id).unwrap();
+        assert_eq!(reconciled.last_activity_at, 40);
+        let persisted: Value = read_json(&metadata_path).unwrap();
+        assert_eq!(persisted["last_activity_at"], 40);
+    }
+
+    #[test]
+    fn durable_writes_succeed_when_activity_cache_writes_fail() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(temporary.path()).unwrap();
+        let mut conversation = store.create_conversation("kibo", None).unwrap();
+        conversation.created_at = 1;
+        conversation.last_activity_at = 1;
+        store.write_conversation(&conversation).unwrap();
+        store.fail_activity_writes.store(true, Ordering::Relaxed);
+
+        store
+            .append("kibo", &conversation.id, json!({"kind":"note", "at":50}))
+            .unwrap();
+        let bytes = b"RIFF tiny fake wav";
+        let sha = hex_sha256(bytes);
+        assert_eq!(
+            store
+                .put_clip(ClipUpload {
+                    project_id: "kibo",
+                    conversation_id: &conversation.id,
+                    clip_id: "clip-1",
+                    bytes,
+                    expected_sha256: &sha,
+                    duration_ms: 1,
+                    peak_pct: 1,
+                    recorded_at: 1,
+                })
+                .unwrap()
+                .0,
+            PutClip::Created
+        );
+        assert!(matches!(
+            store
+                .create_turn("kibo", &conversation.id, "turn-1")
+                .unwrap(),
+            CreateTurnOutcome::Created { .. }
+        ));
+        let records = store.records("kibo", &conversation.id).unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(
+            store
+                .conversation("kibo", &conversation.id)
+                .unwrap()
+                .last_activity_at,
+            1
+        );
+        let durable_activity = records
+            .iter()
+            .filter_map(|record| record["at"].as_u64())
+            .max()
+            .unwrap();
+        let conversation_id = conversation.id;
+        drop(store);
+
+        let reopened = Store::open(temporary.path()).unwrap();
+        assert_eq!(
+            reopened
+                .conversation("kibo", &conversation_id)
+                .unwrap()
+                .last_activity_at,
+            durable_activity
+        );
+    }
+
+    #[test]
+    fn clip_and_turn_creation_advance_persisted_activity() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(temporary.path()).unwrap();
+        let mut conversation = store.create_conversation("kibo", None).unwrap();
+        conversation.created_at = 1;
+        conversation.last_activity_at = 1;
+        store.write_conversation(&conversation).unwrap();
+        let bytes = b"RIFF tiny fake wav";
+        let sha = hex_sha256(bytes);
+
+        let (_, Some(clip)) = store
+            .put_clip(ClipUpload {
+                project_id: "kibo",
+                conversation_id: &conversation.id,
+                clip_id: "clip-1",
+                bytes,
+                expected_sha256: &sha,
+                duration_ms: 1,
+                peak_pct: 1,
+                recorded_at: 1,
+            })
+            .unwrap()
+        else {
+            panic!("new clip should have an event")
+        };
+        assert_eq!(
+            store
+                .conversation("kibo", &conversation.id)
+                .unwrap()
+                .last_activity_at,
+            clip["at"].as_u64().unwrap()
+        );
+
+        let CreateTurnOutcome::Created { record, .. } = store
+            .create_turn("kibo", &conversation.id, "turn-1")
+            .unwrap()
+        else {
+            panic!("new turn should be created")
+        };
+        assert_eq!(
+            store
+                .conversation("kibo", &conversation.id)
+                .unwrap()
+                .last_activity_at,
+            record["at"].as_u64().unwrap()
+        );
     }
 
     #[test]

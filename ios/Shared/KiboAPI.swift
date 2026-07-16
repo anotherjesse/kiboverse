@@ -4,12 +4,14 @@ import CryptoKit
 enum APIError: LocalizedError {
     case invalidServerURL
     case invalidResponse
+    case localRecordingChanged
     case server(Int, String)
 
     var errorDescription: String? {
         switch self {
         case .invalidServerURL: "Enter a valid Kibo server URL."
         case .invalidResponse: "The server returned an unreadable response."
+        case .localRecordingChanged: "The saved recording changed before it could be uploaded."
         case let .server(code, message): message.isEmpty ? "Server error \(code)" : message
         }
     }
@@ -91,10 +93,14 @@ actor KiboAPI {
 
     func uploadClip(
         fileURL: URL, projectID: String, conversationID: String,
-        clipID: String, durationMs: Int, peakPct: Int, recordedAt: Int
+        clipID: String, durationMs: Int, peakPct: Int, recordedAt: Int,
+        expectedSHA256: String? = nil
     ) async throws {
         let data = try Data(contentsOf: fileURL)
         let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        guard expectedSHA256 == nil || expectedSHA256 == digest else {
+            throw APIError.localRecordingChanged
+        }
         var request = try makeRequest(path: [
             "v1", "projects", projectID, "conversations", conversationID, "clips", clipID
         ], method: "PUT")
@@ -105,7 +111,10 @@ actor KiboAPI {
         request.setValue(digest, forHTTPHeaderField: "X-Content-Sha256")
         let (responseData, response) = try await session.upload(for: request, from: data)
         try validate(response: response, data: responseData)
-        do { _ = try decoder.decode(PutClipResponse.self, from: responseData) }
+        do {
+            let receipt = try decoder.decode(PutClipResponse.self, from: responseData)
+            guard receipt.clip_id == clipID else { throw APIError.invalidResponse }
+        }
         catch { throw APIError.invalidResponse }
     }
 

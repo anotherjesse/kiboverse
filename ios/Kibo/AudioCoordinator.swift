@@ -33,6 +33,7 @@ protocol AudioCapturing: AnyObject {
     func start(holdID: UUID) async -> Bool
     func stop(holdID: UUID) -> LocalRecording?
     func cancel(holdID: UUID?)
+    func preserveForRecovery(holdID: UUID?)
     func resetAudioObjects()
 }
 
@@ -70,6 +71,7 @@ final class AudioCoordinator: ObservableObject {
     private let recorder: any AudioCapturing
     private let player: SpeechPlayer
     private let session: any AudioSessionControlling
+    private let recordingInventoryDidChange: @MainActor () -> Void
     private var activeHoldID: UUID?
     private var recorderStartTask: Task<Void, Never>?
     private var configurationRebuildTask: Task<Void, Never>?
@@ -80,12 +82,14 @@ final class AudioCoordinator: ObservableObject {
         recorder: (any AudioCapturing)? = nil,
         session: (any AudioSessionControlling)? = nil,
         player: SpeechPlayer? = nil,
-        observeNotifications: Bool = true
+        observeNotifications: Bool = true,
+        recordingInventoryDidChange: @escaping @MainActor () -> Void = {}
     ) {
         let recorder = recorder ?? AudioRecorder()
         let session = session ?? AudioSessionController()
         self.recorder = recorder
         self.session = session
+        self.recordingInventoryDidChange = recordingInventoryDidChange
         self.player = player ?? SpeechPlayer(activateSession: { try session.activate(for: $0) })
         recorder.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
@@ -170,6 +174,7 @@ final class AudioCoordinator: ObservableObject {
         recorderStartTask?.cancel()
         recorderStartTask = nil
         let recording = recorder.stop(holdID: holdID)
+        if recording == nil { recordingInventoryDidChange() }
         restorePlaybackAfterCapture()
         Task { await prepare() }
         return recording
@@ -194,14 +199,23 @@ final class AudioCoordinator: ObservableObject {
     }
 
     func stop() {
-        cancelActiveHold(resumePlayback: false, prepareAfterward: false)
+        preserveActiveHold()
         player.stop()
     }
 
     func stopForInactivity() {
-        cancelActiveHold(resumePlayback: false, prepareAfterward: false)
+        preserveActiveHold()
         player.stop()
         session.deactivate()
+    }
+
+    private func preserveActiveHold() {
+        guard let holdID = activeHoldID else { return }
+        activeHoldID = nil
+        recorderStartTask?.cancel()
+        recorderStartTask = nil
+        recorder.preserveForRecovery(holdID: holdID)
+        recordingInventoryDidChange()
     }
 
     private func restorePlaybackAfterCapture() {
@@ -269,7 +283,7 @@ final class AudioCoordinator: ObservableObject {
             configurationRebuildTask?.cancel()
             configurationRebuildTask = nil
             let wasHolding = activeHoldID != nil
-            cancelActiveHold(resumePlayback: false, prepareAfterward: false)
+            preserveActiveHold()
             player.stop() // Never move private headphone audio onto the speaker implicitly.
             if wasHolding {
                 recorder.errorMessage = "The recording stopped because the audio input changed."
@@ -286,7 +300,7 @@ final class AudioCoordinator: ObservableObject {
             configurationRebuildTask?.cancel()
             configurationRebuildTask = nil
             let wasHolding = activeHoldID != nil
-            cancelActiveHold(resumePlayback: false, prepareAfterward: false)
+            preserveActiveHold()
             player.stop()
             if wasHolding {
                 recorder.errorMessage = "The recording was interrupted. Please try again."
@@ -294,9 +308,7 @@ final class AudioCoordinator: ObservableObject {
         case .mediaServicesReset:
             configurationRebuildTask?.cancel()
             configurationRebuildTask = nil
-            recorderStartTask?.cancel()
-            recorderStartTask = nil
-            activeHoldID = nil
+            preserveActiveHold()
             recorder.resetAudioObjects()
             player.stop()
             recorder.errorMessage = "Audio services restarted. Tap and hold to begin again."

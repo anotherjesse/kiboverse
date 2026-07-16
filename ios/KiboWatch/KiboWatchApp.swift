@@ -27,9 +27,10 @@ final class WatchStore: ObservableObject {
     @Published var isUploading = false
     @Published var isSubmitting = false
     @Published var pendingUploadCount = 0
+    @Published private(set) var recoveryItemCount = 0
 
     private let defaults = UserDefaults.standard
-    private let spool = WatchPendingUploadSpool()
+    private let spool = PendingUploadSpool(directoryName: PendingUploadSpool.watchDirectoryName)
     private var api: KiboAPI
     private var pollTask: Task<Void, Never>?
     private var uploadTask: Task<Bool, Never>?
@@ -60,7 +61,9 @@ final class WatchStore: ObservableObject {
         api = try! KiboAPI(serverURL: canonical)
         selectedProjectID = defaults.string(forKey: Key.projectID)
         selectedConversationID = defaults.string(forKey: Key.conversationID)
-        pendingUploadCount = spool.all().filter { $0.serverURL == canonical }.count
+        let inventory = spool.inventory()
+        pendingUploadCount = inventory.protectedCount(for: canonical)
+        recoveryItemCount = inventory.recoveryItems.count
     }
 
     deinit {
@@ -179,8 +182,18 @@ final class WatchStore: ObservableObject {
         guard let projectID = selectedProjectID,
               let conversationID = selectedConversationID,
               !isSubmitting else { return nil }
+        updatePendingUploadCount()
+        guard recoveryItemCount == 0 else {
+            status = "Open Server to resolve saved recordings"
+            return nil
+        }
         let destinationKey = "\(projectID)/\(conversationID)"
         guard await retryPendingUploads(destinationKey: destinationKey) else { return nil }
+        updatePendingUploadCount()
+        guard recoveryItemCount == 0 else {
+            status = "Open Server to resolve saved recordings"
+            return nil
+        }
         guard !spool.all().contains(where: {
             $0.serverURL == serverURL && $0.destinationKey == destinationKey
         }) else { return nil }
@@ -224,6 +237,7 @@ final class WatchStore: ObservableObject {
             errorMessage = "Wait for the current request to finish."
             return false
         }
+        refreshRecordingInventory()
         guard pendingUploadCount == 0 else {
             errorMessage = "Let saved recordings finish sending before changing servers."
             return false
@@ -288,9 +302,24 @@ final class WatchStore: ObservableObject {
                     clipID: clip.id,
                     durationMs: clip.durationMs,
                     peakPct: clip.peakPct,
-                    recordedAt: clip.recordedAt
+                    recordedAt: clip.recordedAt,
+                    expectedSHA256: clip.sha256
                 )
                 spool.remove(clip)
+            } catch APIError.localRecordingChanged {
+                allSent = false
+                do {
+                    try spool.quarantine(
+                        clip,
+                        reason: .audioChecksumMismatch,
+                        detail: "The WAV no longer matches the checksum saved when it was queued."
+                    )
+                    status = "Recording recovery needed"
+                    errorMessage = "A saved recording changed. Open Server to review it."
+                } catch {
+                    status = "Saved on this Watch"
+                    errorMessage = "The recording changed and could not be quarantined. \(error.localizedDescription)"
+                }
             } catch {
                 allSent = false
                 status = "Saved on this Watch"
@@ -299,6 +328,26 @@ final class WatchStore: ObservableObject {
         }
         if allSent { status = "Thought saved" }
         return allSent
+    }
+
+    func discardPendingUploads() {
+        guard !isUploading else {
+            errorMessage = "Wait for the current upload to finish before discarding recordings."
+            return
+        }
+        let inventory = spool.inventory()
+        for clip in inventory.clips where clip.serverURL == serverURL { spool.remove(clip) }
+        do {
+            for recovery in inventory.recoveryItems { try spool.remove(recovery) }
+        } catch {
+            updatePendingUploadCount()
+            status = "Recording recovery needed"
+            errorMessage = "Some saved recordings could not be discarded. \(error.localizedDescription)"
+            return
+        }
+        updatePendingUploadCount()
+        errorMessage = nil
+        status = "Saved recordings discarded"
     }
 
     private func beginPolling() {
@@ -317,7 +366,16 @@ final class WatchStore: ObservableObject {
     }
 
     private func updatePendingUploadCount() {
-        pendingUploadCount = spool.all().filter { $0.serverURL == serverURL }.count
+        let inventory = spool.inventory()
+        pendingUploadCount = inventory.protectedCount(for: serverURL)
+        recoveryItemCount = inventory.recoveryItems.count
+        if recoveryItemCount > 0 && !isUploading && errorMessage == nil {
+            status = "Recording recovery needed"
+        }
+    }
+
+    func refreshRecordingInventory() {
+        updatePendingUploadCount()
     }
 
     private func persist(_ value: String?, key: String) {

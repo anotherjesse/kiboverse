@@ -51,7 +51,9 @@ struct TalkView: View {
                             .padding(.vertical, 14)
                         }
                         .buttonStyle(.borderedProminent)
-                        .disabled(store.selectedConversationID == nil)
+                        .disabled(
+                            store.selectedConversationID == nil || store.recoveryItemCount > 0
+                        )
                         .padding(.horizontal)
                     }
                     .padding(.top, 22)

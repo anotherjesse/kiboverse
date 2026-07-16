@@ -63,6 +63,7 @@ final class WatchAudioCoordinator: ObservableObject {
     private let recorder: any WatchAudioCapturing
     private let session: any WatchAudioSessionControlling
     private let player: PCMStreamingPlayer
+    private let recordingInventoryDidChange: @MainActor () -> Void
     private var activeHoldID: UUID?
     private var recorderStartTask: Task<Void, Never>?
     private var prepareTask: Task<Void, Never>?
@@ -75,12 +76,14 @@ final class WatchAudioCoordinator: ObservableObject {
         recorder: (any WatchAudioCapturing)? = nil,
         session: (any WatchAudioSessionControlling)? = nil,
         player: PCMStreamingPlayer? = nil,
-        observeNotifications: Bool = true
+        observeNotifications: Bool = true,
+        recordingInventoryDidChange: @escaping @MainActor () -> Void = {}
     ) {
         let recorder = recorder ?? WatchAudioRecorder()
         let session = session ?? WatchAudioSessionController()
         self.recorder = recorder
         self.session = session
+        self.recordingInventoryDidChange = recordingInventoryDidChange
         self.player = player ?? PCMStreamingPlayer(
             makeRenderer: { try EngineSpeechRenderer(sampleRate: $0, startingAt: $1) },
             activateSession: { intent in
@@ -183,6 +186,7 @@ final class WatchAudioCoordinator: ObservableObject {
         recorderStartTask?.cancel()
         recorderStartTask = nil
         let recording = recorder.stop(holdID: holdID)
+        if recording == nil { recordingInventoryDidChange() }
         player.resumeAfterCapture()
         if playingID == nil, loadingID == nil { session.deactivate() }
         return recording
@@ -215,7 +219,10 @@ final class WatchAudioCoordinator: ObservableObject {
         routeRebuildTask = nil
         recorderStartTask?.cancel()
         recorderStartTask = nil
-        if let holdID = activeHoldID { recorder.cancel(holdID: holdID) }
+        if let holdID = activeHoldID {
+            recorder.preserveForRecovery(holdID: holdID)
+            recordingInventoryDidChange()
+        }
         activeHoldID = nil
         recorder.resetAudioObjects()
         player.stop()
@@ -254,7 +261,10 @@ final class WatchAudioCoordinator: ObservableObject {
         routeRebuildTask = nil
         recorderStartTask?.cancel()
         recorderStartTask = nil
-        if let holdID = activeHoldID { recorder.cancel(holdID: holdID) }
+        if let holdID = activeHoldID {
+            recorder.preserveForRecovery(holdID: holdID)
+            recordingInventoryDidChange()
+        }
         activeHoldID = nil
         recorder.resetAudioObjects()
         player.stop()

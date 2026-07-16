@@ -21,9 +21,14 @@ struct SettingsView: View {
                 if store.pendingUploadCount > 0 {
                     Section("Saved recordings") {
                         Label(
-                            "\(store.pendingUploadCount) waiting to upload",
+                            "\(store.pendingUploadCount) saved on this device",
                             systemImage: "arrow.triangle.2.circlepath"
                         )
+                        if store.recoveryItemCount > 0 {
+                            Text("\(store.recoveryItemCount) need review and cannot be retried automatically.")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
                         Button("Retry now") { Task { _ = await store.retryPendingUploads() } }
                             .disabled(store.isUploading)
                         Button("Discard saved recordings", role: .destructive) {
@@ -46,7 +51,10 @@ struct SettingsView: View {
                     }.disabled(value.isEmpty || saving || store.isUploading || store.isSubmitting)
                 }
             }
-            .onAppear { value = store.serverURL }
+            .onAppear {
+                value = store.serverURL
+                store.refreshRecordingInventory()
+            }
             .alert("Discard saved recordings?", isPresented: $confirmingDiscard) {
                 Button("Cancel", role: .cancel) {}
                 Button("Discard", role: .destructive) { store.discardPendingUploads() }

@@ -63,6 +63,63 @@ final class KiboAPITests: XCTestCase {
         )
     }
 
+    func testClipUploadRejectsMismatchedReceipt() async throws {
+        StubURLProtocol.handler = { request in
+            let body = #"{"clip_id":"some-other-clip","created":true}"#.data(using: .utf8)!
+            return (
+                HTTPURLResponse(
+                    url: request.url!, statusCode: 201,
+                    httpVersion: nil, headerFields: nil
+                )!,
+                body
+            )
+        }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString + ".wav")
+        try Data(repeating: 0, count: 44).write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let api = try KiboAPI(serverURL: "https://example.test", session: session)
+
+        do {
+            try await api.uploadClip(
+                fileURL: url, projectID: "p", conversationID: "c", clipID: "clip-1",
+                durationMs: 875, peakPct: 42, recordedAt: 1234
+            )
+            XCTFail("A receipt for a different clip must not acknowledge this recording")
+        } catch APIError.invalidResponse {
+            // Expected.
+        }
+    }
+
+    func testClipUploadRejectsAudioChangedSinceEnqueue() async throws {
+        StubURLProtocol.handler = { request in
+            XCTFail("Changed audio must not reach the network")
+            return (
+                HTTPURLResponse(
+                    url: request.url!, statusCode: 500,
+                    httpVersion: nil, headerFields: nil
+                )!,
+                Data()
+            )
+        }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString + ".wav")
+        try Data(repeating: 0, count: 44).write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let api = try KiboAPI(serverURL: "https://example.test", session: session)
+
+        do {
+            try await api.uploadClip(
+                fileURL: url, projectID: "p", conversationID: "c", clipID: "clip-1",
+                durationMs: 875, peakPct: 42, recordedAt: 1234,
+                expectedSHA256: String(repeating: "0", count: 64)
+            )
+            XCTFail("Changed audio must be retained for recovery")
+        } catch APIError.localRecordingChanged {
+            // Expected.
+        }
+    }
+
     func testSpeechStreamUsesSampleResumeOffsetAndDeliversPCMIncrementally() async throws {
         StubURLProtocol.handler = { request in
             XCTAssertEqual(
@@ -288,8 +345,9 @@ final class KiboAPITests: XCTestCase {
         ])
     }
 
-    func testSystemRouteLossCancelsCaptureWithoutResumingPlayback() async throws {
+    func testSystemRouteLossPreservesCaptureWithoutResumingPlayback() async throws {
         let log = AudioEventLog()
+        var inventoryRefreshes = 0
         let session = FakeAudioSession(log: log)
         let capture = FakeAudioCapture(log: log)
         let speech = SpeechPlayer(
@@ -301,7 +359,8 @@ final class KiboAPITests: XCTestCase {
             recorder: capture,
             session: session,
             player: speech,
-            observeNotifications: false
+            observeNotifications: false,
+            recordingInventoryDidChange: { inventoryRefreshes += 1 }
         )
         coordinator.beginHold()
         await eventually { capture.isRecording }
@@ -309,7 +368,8 @@ final class KiboAPITests: XCTestCase {
 
         coordinator.handleSystemEvent(.outputRouteUnavailable)
 
-        XCTAssertEqual(log.events, ["capture.cancel"])
+        XCTAssertEqual(log.events, ["capture.preserve"])
+        XCTAssertEqual(inventoryRefreshes, 1)
         XCTAssertFalse(coordinator.isHolding)
         XCTAssertFalse(capture.isRecording)
     }
@@ -609,14 +669,138 @@ final class KiboAPITests: XCTestCase {
         XCTAssertEqual(finalIDs.sorted(), [first.id, second.id].sorted())
     }
 
+    func testSubmitTurnStopsWhenRetryQuarantinesChangedRecording() async throws {
+        let savedServerURL = UserDefaults.standard.string(forKey: "serverURL")
+        UserDefaults.standard.set("https://quarantine.test/", forKey: "serverURL")
+        defer {
+            if let savedServerURL { UserDefaults.standard.set(savedServerURL, forKey: "serverURL") }
+            else { UserDefaults.standard.removeObject(forKey: "serverURL") }
+        }
+        let lock = NSLock()
+        var putCount = 0
+        var postCount = 0
+        StubURLProtocol.handler = { request in
+            if request.httpMethod == "PUT" {
+                lock.withLock { putCount += 1 }
+                let body = #"{"error":"temporarily offline"}"#.data(using: .utf8)!
+                return (
+                    HTTPURLResponse(
+                        url: request.url!, statusCode: 503,
+                        httpVersion: nil, headerFields: nil
+                    )!,
+                    body
+                )
+            }
+            if request.httpMethod == "POST" {
+                lock.withLock { postCount += 1 }
+                let body = #"{"turn_id":"unexpected","clips":[],"created":true}"#
+                    .data(using: .utf8)!
+                return (
+                    HTTPURLResponse(
+                        url: request.url!, statusCode: 202,
+                        httpVersion: nil, headerFields: nil
+                    )!,
+                    body
+                )
+            }
+            let body = #"{"events":[],"latest_seq":0}"#.data(using: .utf8)!
+            return (
+                HTTPURLResponse(
+                    url: request.url!, statusCode: 200,
+                    httpVersion: nil, headerFields: nil
+                )!,
+                body
+            )
+        }
+
+        let store = AppStore(session: session)
+        store.selectedProjectID = "project"
+        store.selectedConversationID = "conversation"
+        let recording = try makeRecordingForUpload()
+        defer {
+            store.discardPendingUploads()
+            try? FileManager.default.removeItem(at: recording.url)
+        }
+
+        store.queueRecording(recording)
+        await store.waitForRecordingTasks()
+        try Data(repeating: 1, count: 44).write(to: recording.url)
+
+        let turnID = await store.submitTurn()
+        let counts = lock.withLock { (putCount, postCount) }
+
+        XCTAssertNil(turnID)
+        XCTAssertEqual(counts.0, 1)
+        XCTAssertEqual(counts.1, 0)
+        XCTAssertEqual(store.recoveryItemCount, 1)
+    }
+
+    func testSuccessfulUploadRestoresExistingRecoveryStatus() async throws {
+        let savedServerURL = UserDefaults.standard.string(forKey: "serverURL")
+        UserDefaults.standard.set("https://recovery-status.test/", forKey: "serverURL")
+        defer {
+            if let savedServerURL { UserDefaults.standard.set(savedServerURL, forKey: "serverURL") }
+            else { UserDefaults.standard.removeObject(forKey: "serverURL") }
+        }
+        StubURLProtocol.handler = { request in
+            if request.httpMethod == "PUT" {
+                let clipID = request.url!.lastPathComponent
+                let body = #"{"clip_id":"\#(clipID)","created":true}"#.data(using: .utf8)!
+                return (
+                    HTTPURLResponse(
+                        url: request.url!, statusCode: 201,
+                        httpVersion: nil, headerFields: nil
+                    )!,
+                    body
+                )
+            }
+            let body = #"{"events":[],"latest_seq":0}"#.data(using: .utf8)!
+            return (
+                HTTPURLResponse(
+                    url: request.url!, statusCode: 200,
+                    httpVersion: nil, headerFields: nil
+                )!,
+                body
+            )
+        }
+
+        let directory = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        )[0].appendingPathComponent(PendingUploadSpool.phoneDirectoryName, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let orphanURL = directory.appendingPathComponent(
+            "working-recording-\(UUID().uuidString.lowercased()).wav"
+        )
+        try Data([1, 2, 3]).write(to: orphanURL)
+        try Data().write(to: ActiveRecordingFileLease.startedMarkerURL(for: orphanURL))
+
+        let store = AppStore(session: session)
+        store.selectedProjectID = "project"
+        store.selectedConversationID = "conversation"
+        let recording = try makeRecordingForUpload()
+        defer {
+            store.discardPendingUploads()
+            try? FileManager.default.removeItem(at: recording.url)
+        }
+
+        store.queueRecording(recording)
+        await store.waitForRecordingTasks()
+
+        XCTAssertEqual(store.recoveryItemCount, 1)
+        XCTAssertEqual(store.status, "Recording recovery needed")
+    }
+
 
     func testPendingSpoolPersistsDestinationAndRecordingTime() throws {
         let id = UUID().uuidString.lowercased()
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        let url = base.appendingPathComponent("PendingRecordings/recording-\(id).wav")
-        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("recording-\(id).wav")
         try Data([1, 2, 3]).write(to: url)
-        let spool = PendingUploadSpool()
+        let spool = PendingUploadSpool(directoryURL: directory)
         let clip = try spool.enqueue(
             recording: LocalRecording(
                 id: id, url: url, durationMs: 900, peakPct: 35, recordedAt: 4321
@@ -628,7 +812,244 @@ final class KiboAPITests: XCTestCase {
         let restored = try XCTUnwrap(spool.all().first { $0.id == id })
         XCTAssertEqual(restored.destinationKey, "project/conversation")
         XCTAssertEqual(restored.recordedAt, 4321)
+        XCTAssertEqual(restored.schemaVersion, PendingClip.currentSchemaVersion)
+        XCTAssertEqual(restored.sha256?.count, 64)
         XCTAssertTrue(FileManager.default.fileExists(atPath: spool.wavURL(for: restored).path))
+    }
+
+    func testPendingSpoolReadsLegacySidecarWithoutSchemaVersion() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let id = "legacy-clip"
+        try Data([1, 2, 3]).write(
+            to: directory.appendingPathComponent("recording-\(id).wav")
+        )
+        let legacy: [String: Any] = [
+            "id": id,
+            "serverURL": "https://example.test/",
+            "projectID": "project",
+            "conversationID": "conversation",
+            "wavFilename": "recording-\(id).wav",
+            "durationMs": 900,
+            "peakPct": 20,
+            "recordedAt": 123,
+            "enqueuedAtMs": 456,
+        ]
+        try JSONSerialization.data(withJSONObject: legacy).write(
+            to: directory.appendingPathComponent("\(id).json")
+        )
+
+        let inventory = PendingUploadSpool(directoryURL: directory).inventory()
+        let clip = try XCTUnwrap(inventory.clips.first)
+        XCTAssertEqual(clip.id, id)
+        XCTAssertEqual(clip.schemaVersion, 1)
+        XCTAssertNil(clip.sha256)
+        XCTAssertTrue(inventory.recoveryItems.isEmpty)
+    }
+
+    func testPendingSpoolQuarantinesOverflowingLegacyTimestampWithoutDeletingFiles() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let id = "legacy-overflow"
+        let audioURL = directory.appendingPathComponent("recording-\(id).wav")
+        let metadataURL = directory.appendingPathComponent("\(id).json")
+        try Data([1, 2, 3]).write(to: audioURL)
+        let legacy: [String: Any] = [
+            "id": id,
+            "serverURL": "https://example.test/",
+            "projectID": "project",
+            "conversationID": "conversation",
+            "wavFilename": audioURL.lastPathComponent,
+            "durationMs": 900,
+            "recordedAt": Int.max,
+        ]
+        try JSONSerialization.data(withJSONObject: legacy).write(to: metadataURL)
+
+        let inventory = PendingUploadSpool(directoryURL: directory).inventory()
+
+        XCTAssertTrue(inventory.clips.isEmpty)
+        XCTAssertEqual(inventory.recoveryItems.map(\.reason), [.unreadableMetadata])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: audioURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: metadataURL.path))
+    }
+
+    func testPendingSpoolRejectsVersionTwoSidecarWithoutChecksum() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let id = "missing-checksum"
+        let audioURL = directory.appendingPathComponent("recording-\(id).wav")
+        try Data([1, 2, 3]).write(to: audioURL)
+        let sidecar: [String: Any] = [
+            "schemaVersion": 2,
+            "id": id,
+            "serverURL": "https://example.test/",
+            "projectID": "project",
+            "conversationID": "conversation",
+            "wavFilename": audioURL.lastPathComponent,
+            "durationMs": 900,
+        ]
+        try JSONSerialization.data(withJSONObject: sidecar).write(
+            to: directory.appendingPathComponent("\(id).json")
+        )
+
+        let inventory = PendingUploadSpool(directoryURL: directory).inventory()
+        XCTAssertTrue(inventory.clips.isEmpty)
+        XCTAssertEqual(inventory.recoveryItems.map(\.reason), [.unreadableMetadata])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: audioURL.path))
+    }
+
+    func testPendingSpoolCleansPrewarmedRecorderFileThatNeverStarted() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let audioURL = directory.appendingPathComponent(
+            "working-recording-\(UUID().uuidString.lowercased()).wav"
+        )
+        try Data([1, 2, 3]).write(to: audioURL)
+        let spool = PendingUploadSpool(directoryURL: directory)
+        var lease: ActiveRecordingFileLease? = ActiveRecordingFileLease(url: audioURL)
+
+        withExtendedLifetime(lease) {
+            XCTAssertTrue(spool.inventory().recoveryItems.isEmpty)
+        }
+        lease = nil
+
+        XCTAssertTrue(spool.inventory().recoveryItems.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: audioURL.path))
+    }
+
+    func testPendingSpoolRecoversStartedRecorderFileAfterLeaseEnds() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let audioURL = directory.appendingPathComponent(
+            "working-recording-\(UUID().uuidString.lowercased()).wav"
+        )
+        let markerURL = ActiveRecordingFileLease.startedMarkerURL(for: audioURL)
+        try Data([1, 2, 3]).write(to: audioURL)
+        let spool = PendingUploadSpool(directoryURL: directory)
+        var lease: ActiveRecordingFileLease? = ActiveRecordingFileLease(url: audioURL)
+        try lease?.markStarted()
+
+        withExtendedLifetime(lease) {
+            XCTAssertTrue(spool.inventory().recoveryItems.isEmpty)
+        }
+        lease = nil
+
+        let recovery = try XCTUnwrap(spool.inventory().recoveryItems.first)
+        XCTAssertEqual(recovery.reason, .interruptedWorkingFile)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: audioURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: markerURL.path))
+
+        try spool.remove(recovery)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: audioURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: markerURL.path))
+    }
+
+    func testPendingSpoolQuarantinesChecksumMismatchWithoutDeletingRecording() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let id = UUID().uuidString.lowercased()
+        let audioURL = directory.appendingPathComponent("recording-\(id).wav")
+        let metadataURL = directory.appendingPathComponent("\(id).json")
+        try Data([1, 2, 3]).write(to: audioURL)
+        let spool = PendingUploadSpool(directoryURL: directory)
+        let clip = try spool.enqueue(
+            recording: LocalRecording(
+                id: id, url: audioURL, durationMs: 900, peakPct: 20, recordedAt: 123
+            ),
+            serverURL: "https://example.test/",
+            projectID: "project",
+            conversationID: "conversation"
+        )
+
+        try spool.quarantine(
+            clip,
+            reason: .audioChecksumMismatch,
+            detail: "The WAV changed after it was queued."
+        )
+        let inventory = spool.inventory()
+
+        XCTAssertTrue(inventory.clips.isEmpty)
+        let recovery = try XCTUnwrap(inventory.recoveryItems.first)
+        XCTAssertEqual(recovery.reason, .audioChecksumMismatch)
+        XCTAssertEqual(recovery.detail, "The WAV changed after it was queued.")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: audioURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: metadataURL.path))
+    }
+
+    func testPendingSpoolCanDiscardAndRecreateUnreadableRoot() throws {
+        let parent = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let directory = parent.appendingPathComponent("PendingRecordings", isDirectory: true)
+        try Data("not-a-directory".utf8).write(to: directory)
+        let spool = PendingUploadSpool(directoryURL: directory)
+        let recovery = try XCTUnwrap(spool.inventory().recoveryItems.first)
+        XCTAssertEqual(recovery.reason, .unreadableDirectory)
+
+        try spool.remove(recovery)
+
+        let values = try directory.resourceValues(forKeys: [.isDirectoryKey])
+        XCTAssertEqual(values.isDirectory, true)
+        XCTAssertTrue(spool.inventory().recoveryItems.isEmpty)
+    }
+
+    func testPendingSpoolSurfacesOrphanAndCorruptMetadataWithoutDeletingAudio() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let orphanURL = directory.appendingPathComponent("recording-orphan.wav")
+        let corruptAudioURL = directory.appendingPathComponent("recording-corrupt.wav")
+        let corruptMetadataURL = directory.appendingPathComponent("corrupt.json")
+        try Data([1]).write(to: orphanURL)
+        try Data([2]).write(to: corruptAudioURL)
+        try Data("not-json".utf8).write(to: corruptMetadataURL)
+
+        let inventory = PendingUploadSpool(directoryURL: directory).inventory()
+        XCTAssertEqual(
+            Set(inventory.recoveryItems.map(\.reason)),
+            Set([.missingMetadata, .unreadableMetadata])
+        )
+        XCTAssertEqual(inventory.protectedCount(for: "https://example.test/"), 2)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: orphanURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: corruptAudioURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: corruptMetadataURL.path))
+    }
+
+    func testPendingSpoolKeepsMetadataWhoseAudioIsMissing() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let id = "missing-audio"
+        let metadataURL = directory.appendingPathComponent("\(id).json")
+        let sidecar: [String: Any] = [
+            "id": id,
+            "serverURL": "https://example.test/",
+            "projectID": "project",
+            "conversationID": "conversation",
+            "wavFilename": "recording-\(id).wav",
+            "durationMs": 900,
+        ]
+        try JSONSerialization.data(withJSONObject: sidecar).write(to: metadataURL)
+
+        let inventory = PendingUploadSpool(directoryURL: directory).inventory()
+        XCTAssertTrue(inventory.clips.isEmpty)
+        XCTAssertEqual(inventory.recoveryItems.map(\.reason), [.metadataWithoutAudio])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: metadataURL.path))
     }
 
     func testSavedWatchProjectWinsOverFirstProject() throws {
@@ -762,6 +1183,11 @@ private final class FakeAudioCapture: AudioCapturing {
 
     func cancel(holdID: UUID?) {
         log.events.append("capture.cancel")
+        isRecording = false
+    }
+
+    func preserveForRecovery(holdID: UUID?) {
+        log.events.append("capture.preserve")
         isRecording = false
     }
 

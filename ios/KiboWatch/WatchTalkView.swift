@@ -3,10 +3,20 @@ import WatchKit
 
 struct WatchTalkView: View {
     @Environment(\.scenePhase) private var scenePhase
-    @StateObject private var store = WatchStore()
-    @StateObject private var audio = WatchAudioCoordinator()
+    @StateObject private var store: WatchStore
+    @StateObject private var audio: WatchAudioCoordinator
     @State private var awaitedTurnID: String?
     @State private var showingServer = false
+
+    init() {
+        let store = WatchStore()
+        _store = StateObject(wrappedValue: store)
+        _audio = StateObject(wrappedValue: WatchAudioCoordinator(
+            recordingInventoryDidChange: { [weak store] in
+                store?.refreshRecordingInventory()
+            }
+        ))
+    }
 
     var body: some View {
         NavigationStack {
@@ -110,6 +120,7 @@ struct WatchTalkView: View {
             || audio.isRecording
             || audio.isStarting
             || store.isSubmitting
+            || store.recoveryItemCount > 0
     }
 
     private var talkButton: some View {
@@ -155,6 +166,7 @@ struct WatchTalkView: View {
         if audio.loadingID != nil { return "Loading reply…" }
         if audio.playingID != nil { return "Kibo is speaking" }
         if audio.lastFinishedID != nil { return "Reply played" }
+        if store.recoveryItemCount > 0 { return "Recovery needed · open Server" }
         if store.pendingUploadCount > 0 { return "Saved · tap Ask to retry" }
         return "Hold while you speak"
     }
@@ -246,6 +258,7 @@ struct WatchServerView: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var store: WatchStore
     @State private var value = ""
+    @State private var confirmingDiscard = false
 
     var body: some View {
         NavigationStack {
@@ -255,9 +268,30 @@ struct WatchServerView: View {
                 Button("Connect") {
                     Task { if await store.saveServer(value) { dismiss() } }
                 }
+                if store.pendingUploadCount > 0 {
+                    Section("Saved recordings") {
+                        Text("\(store.pendingUploadCount) saved")
+                        if store.recoveryItemCount > 0 {
+                            Text("\(store.recoveryItemCount) need review")
+                        }
+                        Button("Discard", role: .destructive) {
+                            confirmingDiscard = true
+                        }
+                        .disabled(store.isUploading)
+                    }
+                }
             }
             .navigationTitle("Server")
-            .onAppear { value = store.serverURL }
+            .onAppear {
+                value = store.serverURL
+                store.refreshRecordingInventory()
+            }
+            .alert("Discard recordings?", isPresented: $confirmingDiscard) {
+                Button("Cancel", role: .cancel) {}
+                Button("Discard", role: .destructive) { store.discardPendingUploads() }
+            } message: {
+                Text("Recordings that have not reached the server will be permanently deleted.")
+            }
         }
     }
 }

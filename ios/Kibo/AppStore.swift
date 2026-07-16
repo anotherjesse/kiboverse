@@ -24,6 +24,7 @@ final class AppStore: ObservableObject {
     @Published var isUploading = false
     @Published var isSubmitting = false
     @Published var pendingUploadCount = 0
+    @Published private(set) var recoveryItemCount = 0
     @Published var status = "Connecting…"
     @Published var errorMessage: String?
 
@@ -31,7 +32,7 @@ final class AppStore: ObservableObject {
     private var pollTask: Task<Void, Never>?
     private var uploadTask: (id: UUID, task: Task<UploadRunResult, Never>)?
     private var recordingTasks: [UUID: Task<Void, Never>] = [:]
-    private let spool = PendingUploadSpool()
+    private let spool = PendingUploadSpool(directoryName: PendingUploadSpool.phoneDirectoryName)
     private var serverVersion = 0
     private var projectSelectionVersion = 0
     private var eventSelectionVersion = 0
@@ -45,7 +46,9 @@ final class AppStore: ObservableObject {
             ?? (try! KiboAPI(serverURL: Self.defaultServerURL, session: session))
         selectedProjectID = UserDefaults.standard.string(forKey: Key.projectID)
         selectedConversationID = UserDefaults.standard.string(forKey: Key.conversationID)
-        pendingUploadCount = spool.all().filter { $0.serverURL == savedURL }.count
+        let inventory = spool.inventory()
+        pendingUploadCount = inventory.protectedCount(for: savedURL)
+        recoveryItemCount = inventory.recoveryItems.count
     }
 
     deinit {
@@ -244,8 +247,8 @@ final class AppStore: ObservableObject {
         isUploading = true
         status = "Sending saved recordings…"
         defer {
-            updatePendingUploadCount()
             isUploading = false
+            updatePendingUploadCount()
         }
         var allSent = true
         for clip in pending {
@@ -254,9 +257,24 @@ final class AppStore: ObservableObject {
                     fileURL: spool.wavURL(for: clip),
                     projectID: clip.projectID, conversationID: clip.conversationID,
                     clipID: clip.id, durationMs: clip.durationMs,
-                    peakPct: clip.peakPct, recordedAt: clip.recordedAt
+                    peakPct: clip.peakPct, recordedAt: clip.recordedAt,
+                    expectedSHA256: clip.sha256
                 )
                 spool.remove(clip)
+            } catch APIError.localRecordingChanged {
+                allSent = false
+                do {
+                    try spool.quarantine(
+                        clip,
+                        reason: .audioChecksumMismatch,
+                        detail: "The WAV no longer matches the checksum saved when it was queued."
+                    )
+                    status = "Recording recovery needed"
+                    errorMessage = "A saved recording changed before upload. Review it in Settings."
+                } catch {
+                    status = "Saved on this iPhone"
+                    errorMessage = "The recording changed and could not be quarantined. \(error.localizedDescription)"
+                }
             } catch {
                 allSent = false
                 status = "Saved on this iPhone"
@@ -272,7 +290,16 @@ final class AppStore: ObservableObject {
             errorMessage = "Wait for the current upload to finish before discarding recordings."
             return
         }
-        for clip in spool.all() where clip.serverURL == serverURL { spool.remove(clip) }
+        let inventory = spool.inventory()
+        for clip in inventory.clips where clip.serverURL == serverURL { spool.remove(clip) }
+        do {
+            for recovery in inventory.recoveryItems { try spool.remove(recovery) }
+        } catch {
+            updatePendingUploadCount()
+            status = "Recording recovery needed"
+            errorMessage = "Some saved recordings could not be discarded. \(error.localizedDescription)"
+            return
+        }
         updatePendingUploadCount()
         errorMessage = nil
         status = "Saved recordings discarded"
@@ -282,10 +309,20 @@ final class AppStore: ObservableObject {
     func submitTurn() async -> String? {
         guard let projectID = selectedProjectID, let conversationID = selectedConversationID else { return nil }
         guard !isUploading, !isSubmitting else { return nil }
+        updatePendingUploadCount()
+        guard recoveryItemCount == 0 else {
+            status = "Resolve recording recovery in Settings before asking Kibo"
+            return nil
+        }
         isSubmitting = true
         defer { isSubmitting = false }
         let destination = "\(projectID)/\(conversationID)"
         guard await retryPendingUploads(destinationKey: destination) else { return nil }
+        updatePendingUploadCount()
+        guard recoveryItemCount == 0 else {
+            status = "Resolve recording recovery in Settings before asking Kibo"
+            return nil
+        }
         guard !spool.all().contains(where: {
             $0.serverURL == serverURL && $0.destinationKey == destination
         }) else { return nil }
@@ -314,6 +351,7 @@ final class AppStore: ObservableObject {
             errorMessage = "Wait for the current upload or Kibo request to finish before changing servers."
             return false
         }
+        refreshRecordingInventory()
         guard pendingUploadCount == 0 else {
             errorMessage = "Retry or discard saved recordings before changing servers."
             return false
@@ -393,7 +431,16 @@ final class AppStore: ObservableObject {
     }
 
     private func updatePendingUploadCount() {
-        pendingUploadCount = spool.all().filter { $0.serverURL == serverURL }.count
+        let inventory = spool.inventory()
+        pendingUploadCount = inventory.protectedCount(for: serverURL)
+        recoveryItemCount = inventory.recoveryItems.count
+        if recoveryItemCount > 0 && !isUploading && errorMessage == nil {
+            status = "Recording recovery needed"
+        }
+    }
+
+    func refreshRecordingInventory() {
+        updatePendingUploadCount()
     }
 
     private func persist(_ value: String?, key: String) {

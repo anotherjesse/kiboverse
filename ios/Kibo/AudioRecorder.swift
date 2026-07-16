@@ -1,14 +1,6 @@
 @preconcurrency import AVFoundation
 import Foundation
 
-struct LocalRecording: Sendable {
-    let id: String
-    let url: URL
-    let durationMs: Int
-    let peakPct: Int
-    let recordedAt: Int
-}
-
 @MainActor
 final class AudioRecorder: NSObject, ObservableObject, @preconcurrency AVAudioRecorderDelegate {
     @Published private(set) var isRecording = false
@@ -17,7 +9,9 @@ final class AudioRecorder: NSObject, ObservableObject, @preconcurrency AVAudioRe
     @Published var errorMessage: String?
 
     private var recorder: AVAudioRecorder?
+    private var recorderLease: ActiveRecordingFileLease?
     private var preparedRecorder: AVAudioRecorder?
+    private var preparedRecorderLease: ActiveRecordingFileLease?
     private var meterTask: Task<Void, Never>?
     private var peakPct = 0
     private var activeHoldID: UUID?
@@ -33,12 +27,17 @@ final class AudioRecorder: NSObject, ObservableObject, @preconcurrency AVAudioRe
         let allowed = await AVAudioApplication.requestRecordPermission()
         guard allowed, recorder == nil, preparedRecorder == nil, !isStarting else { return }
         do {
-            let recorder = try makeRecorder()
-            guard recorder.prepareToRecord() else { throw RecorderError.couldNotPrepare }
+            let (recorder, lease) = try makeRecorder()
+            guard recorder.prepareToRecord() else {
+                discard(recorder, lease: lease)
+                throw RecorderError.couldNotPrepare
+            }
             preparedRecorder = recorder
+            preparedRecorderLease = lease
         } catch {
             // A cold-start fallback remains available when the user presses.
             preparedRecorder = nil
+            preparedRecorderLease = nil
         }
     }
 
@@ -48,20 +47,23 @@ final class AudioRecorder: NSObject, ObservableObject, @preconcurrency AVAudioRe
         startingHoldID = holdID
         isStarting = true
         var warmRecorder = preparedRecorder
+        var warmLease = preparedRecorderLease
         if let preparedRecorder = warmRecorder {
             self.preparedRecorder = nil
+            self.preparedRecorderLease = nil
             guard !Task.isCancelled else {
                 activeHoldID = nil
                 finishStarting(holdID)
-                try? FileManager.default.removeItem(at: preparedRecorder.url)
+                if let warmLease { discard(preparedRecorder, lease: warmLease) }
                 return false
             }
             // Playback may have changed the shared route after this recorder was
             // prepared. Try the warm recorder first, then fall back to a fresh one.
-            if beginRecording(preparedRecorder, holdID: holdID) { return true }
-            preparedRecorder.stop()
-            try? FileManager.default.removeItem(at: preparedRecorder.url)
+            if let warmLease,
+               beginRecording(preparedRecorder, lease: warmLease, holdID: holdID) { return true }
+            if let warmLease { discard(preparedRecorder, lease: warmLease) }
             warmRecorder = nil
+            warmLease = nil
         }
         let allowed = await AVAudioApplication.requestRecordPermission()
         guard activeHoldID == holdID, !Task.isCancelled else {
@@ -76,10 +78,10 @@ final class AudioRecorder: NSObject, ObservableObject, @preconcurrency AVAudioRe
             return false
         }
         do {
-            let recorder = try makeRecorder()
+            let (recorder, lease) = try makeRecorder()
             recorder.prepareToRecord()
-            guard beginRecording(recorder, holdID: holdID) else {
-                try? FileManager.default.removeItem(at: recorder.url)
+            guard beginRecording(recorder, lease: lease, holdID: holdID) else {
+                discard(recorder, lease: lease)
                 throw RecorderError.couldNotStart
             }
             return true
@@ -101,13 +103,16 @@ final class AudioRecorder: NSObject, ObservableObject, @preconcurrency AVAudioRe
         }
         let durationMs = Int((recorder.currentTime * 1000).rounded())
         let workingURL = recorder.url
+        let lease = recorderLease
+        self.recorder = nil
+        recorderLease = nil
         recorder.stop()
         meterTask?.cancel()
         meterTask = nil
-        self.recorder = nil
         level = 0
         isRecording = false
         guard durationMs >= 350 else {
+            lease?.relinquish()
             try? FileManager.default.removeItem(at: workingURL)
             errorMessage = "Hold a little longer to record."
             return nil
@@ -117,9 +122,10 @@ final class AudioRecorder: NSObject, ObservableObject, @preconcurrency AVAudioRe
         do {
             url = try pendingDirectory().appendingPathComponent("recording-\(id).wav")
             try FileManager.default.moveItem(at: workingURL, to: url)
+            lease?.relinquish()
         } catch {
-            errorMessage = "The recording could not be saved. \(error.localizedDescription)"
-            try? FileManager.default.removeItem(at: workingURL)
+            lease?.abandonForRecovery()
+            errorMessage = "The recording could not be finalized and was kept for recovery. \(error.localizedDescription)"
             return nil
         }
         return LocalRecording(
@@ -137,18 +143,41 @@ final class AudioRecorder: NSObject, ObservableObject, @preconcurrency AVAudioRe
         meterTask = nil
         if let recorder {
             let url = recorder.url
+            self.recorder = nil
             recorder.stop()
+            recorderLease?.relinquish()
             try? FileManager.default.removeItem(at: url)
         }
         recorder = nil
+        recorderLease = nil
         level = 0
         isRecording = false
     }
 
     func audioRecorderDidFinishRecording(_ recorder: AVAudioRecorder, successfully flag: Bool) {
         guard recorder === self.recorder else { return }
-        cancel()
-        if !flag { errorMessage = "Recording was interrupted. Please try again." }
+        preserveForRecovery(holdID: activeHoldID)
+        errorMessage = flag
+            ? "Recording ended unexpectedly and was kept for recovery."
+            : "Recording was interrupted and was kept for recovery."
+    }
+
+    func preserveForRecovery(holdID: UUID? = nil) {
+        if let holdID, activeHoldID != holdID { return }
+        activeHoldID = nil
+        startingHoldID = nil
+        isStarting = false
+        meterTask?.cancel()
+        meterTask = nil
+        if let recorder {
+            self.recorder = nil
+            recorder.stop()
+            recorderLease?.abandonForRecovery()
+        }
+        recorder = nil
+        recorderLease = nil
+        level = 0
+        isRecording = false
     }
 
     private func pendingDirectory() throws -> URL {
@@ -160,15 +189,17 @@ final class AudioRecorder: NSObject, ObservableObject, @preconcurrency AVAudioRe
 
     func resetAudioObjects() {
         cancel()
-        if let preparedRecorder {
-            try? FileManager.default.removeItem(at: preparedRecorder.url)
+        if let preparedRecorder, let preparedRecorderLease {
+            discard(preparedRecorder, lease: preparedRecorderLease)
         }
         preparedRecorder = nil
+        preparedRecorderLease = nil
     }
 
-    private func makeRecorder() throws -> AVAudioRecorder {
-        let url = try pendingDirectory().appendingPathComponent("working-recording.wav")
-        try? FileManager.default.removeItem(at: url)
+    private func makeRecorder() throws -> (AVAudioRecorder, ActiveRecordingFileLease) {
+        let filename = "working-recording-\(UUID().uuidString.lowercased()).wav"
+        let url = try pendingDirectory().appendingPathComponent(filename)
+        let lease = ActiveRecordingFileLease(url: url)
         let settings: [String: Any] = [
             AVFormatIDKey: kAudioFormatLinearPCM,
             AVSampleRateKey: 16_000,
@@ -177,18 +208,34 @@ final class AudioRecorder: NSObject, ObservableObject, @preconcurrency AVAudioRe
             AVLinearPCMIsFloatKey: false,
             AVLinearPCMIsBigEndianKey: false
         ]
-        let recorder = try AVAudioRecorder(url: url, settings: settings)
-        recorder.delegate = self
-        recorder.isMeteringEnabled = true
-        return recorder
+        do {
+            let recorder = try AVAudioRecorder(url: url, settings: settings)
+            recorder.delegate = self
+            recorder.isMeteringEnabled = true
+            return (recorder, lease)
+        } catch {
+            lease.relinquish()
+            try? FileManager.default.removeItem(at: url)
+            throw error
+        }
     }
 
-    private func beginRecording(_ recorder: AVAudioRecorder, holdID: UUID) -> Bool {
+    private func beginRecording(
+        _ recorder: AVAudioRecorder,
+        lease: ActiveRecordingFileLease,
+        holdID: UUID
+    ) -> Bool {
         guard activeHoldID == holdID else {
+            return false
+        }
+        do {
+            try lease.markStarted()
+        } catch {
             return false
         }
         guard recorder.record() else { return false }
         self.recorder = recorder
+        recorderLease = lease
         finishStarting(holdID)
         peakPct = 0
         isRecording = true
@@ -204,6 +251,12 @@ final class AudioRecorder: NSObject, ObservableObject, @preconcurrency AVAudioRe
             }
         }
         return true
+    }
+
+    private func discard(_ recorder: AVAudioRecorder, lease: ActiveRecordingFileLease) {
+        recorder.stop()
+        lease.relinquish()
+        try? FileManager.default.removeItem(at: recorder.url)
     }
 
     private func finishStarting(_ holdID: UUID) {

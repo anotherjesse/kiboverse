@@ -283,6 +283,33 @@ final class WatchAudioTests: XCTestCase {
         }
     }
 
+    func testSystemEventsPreserveActiveCaptureForRecovery() async {
+        for event in [WatchAudioSystemEvent.outputRouteUnavailable, .interruptionBegan] {
+            let log = WatchEventLog()
+            var inventoryRefreshes = 0
+            let session = WatchFakeSession(log: log)
+            let capture = WatchFakeCapture(log: log)
+            let coordinator = WatchAudioCoordinator(
+                recorder: capture,
+                session: session,
+                player: makePlayer { _ in },
+                observeNotifications: false,
+                recordingInventoryDidChange: { inventoryRefreshes += 1 }
+            )
+            coordinator.beginHold()
+            await eventually { capture.isRecording }
+            log.events.removeAll()
+
+            coordinator.handleSystemEvent(event)
+
+            XCTAssertTrue(log.events.contains("capture.preserve"))
+            XCTAssertFalse(log.events.contains("capture.cancel"))
+            XCTAssertEqual(inventoryRefreshes, 1)
+            XCTAssertFalse(coordinator.isHolding)
+            XCTAssertFalse(capture.isRecording)
+        }
+    }
+
     func testStopForInactivityCannotReactivateSessionLater() async {
         let log = WatchEventLog()
         let session = WatchFakeSession(log: log)
@@ -499,6 +526,10 @@ private final class WatchFakeCapture: WatchAudioCapturing {
     }
     func cancel(holdID: UUID?) {
         log.events.append("capture.cancel")
+        isRecording = false
+    }
+    func preserveForRecovery(holdID: UUID?) {
+        log.events.append("capture.preserve")
         isRecording = false
     }
     func resetAudioObjects() {

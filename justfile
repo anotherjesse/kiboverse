@@ -1,3 +1,6 @@
+build:
+    cargo build -p kibod
+
 generate-types:
     cargo run --quiet -p kibo-typegen
 

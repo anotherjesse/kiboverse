@@ -610,6 +610,49 @@ fn knowledge_root(store: &Store, project_id: &str) -> PathBuf {
         .join("knowledge")
 }
 
+/// Return the canonical, generated wiki directory that a read-only query
+/// agent may inspect. Project validation and initialization happen before the
+/// path is returned so route input can never select an arbitrary directory.
+pub fn wiki_root(store: &Store, project_id: &str) -> Result<PathBuf> {
+    if !valid_id(project_id) {
+        bail!("invalid project id");
+    }
+    let root = fs::canonicalize(store.root())?;
+    let projects = canonical_direct_child(&root, &root.join("projects"), "projects directory")?;
+    let project =
+        canonical_direct_child(&projects, &projects.join(project_id), "project directory")?;
+    let project_metadata = store.project(project_id)?;
+    if project_metadata.id != project_id {
+        bail!("project metadata does not match its directory");
+    }
+    let knowledge_path = project.join("knowledge");
+    if knowledge_path.exists() {
+        let knowledge = canonical_direct_child(&project, &knowledge_path, "knowledge directory")?;
+        let wiki_path = knowledge.join("wiki");
+        if wiki_path.exists() {
+            canonical_direct_child(&knowledge, &wiki_path, "wiki directory")?;
+        }
+    }
+
+    ensure_project(store, project_id)?;
+    let knowledge = canonical_direct_child(&project, &knowledge_path, "knowledge directory")?;
+    canonical_direct_child(&knowledge, &knowledge.join("wiki"), "wiki directory")
+}
+
+fn canonical_direct_child(parent: &Path, path: &Path, label: &str) -> Result<PathBuf> {
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("inspect {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!("{label} must not be a symbolic link");
+    }
+    let canonical =
+        fs::canonicalize(path).with_context(|| format!("resolve {}", path.display()))?;
+    if canonical.parent() != Some(parent) || canonical.file_name() != path.file_name() {
+        bail!("{label} resolves outside its expected parent");
+    }
+    Ok(canonical)
+}
+
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
     serde_json::from_slice(&bytes).with_context(|| format!("decode {}", path.display()))
@@ -678,6 +721,75 @@ mod tests {
         let after = conversation_document(&store, "kibo", &conversation.id).unwrap();
         assert_eq!(before.body, after.body);
         assert_eq!(before.content_sha256, after.content_sha256);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn query_wiki_root_rejects_a_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(temporary.path()).unwrap();
+        let wiki = wiki_root(&store, "kibo").unwrap();
+        fs::remove_dir_all(&wiki).unwrap();
+        let outside = temporary.path().join("outside-wiki");
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, &wiki).unwrap();
+
+        let error = wiki_root(&store, "kibo").unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("wiki directory must not be a symbolic link")
+        );
+        assert_eq!(fs::read_dir(outside).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn query_wiki_root_rejects_a_same_parent_project_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(temporary.path()).unwrap();
+        let other = store.create_project("Other").unwrap();
+        let other_wiki = wiki_root(&store, &other.id).unwrap();
+        fs::write(other_wiki.join("secret.md"), "sibling secret").unwrap();
+
+        let projects = temporary.path().join("projects");
+        let alias = projects.join("alias");
+        symlink(projects.join(&other.id), &alias).unwrap();
+
+        let error = wiki_root(&store, "alias").unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("project directory must not be a symbolic link")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn query_wiki_root_rejects_a_same_parent_wiki_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(temporary.path()).unwrap();
+        let wiki = wiki_root(&store, "kibo").unwrap();
+        let knowledge = wiki.parent().unwrap();
+        let sibling = knowledge.join("web");
+        fs::remove_dir_all(&wiki).unwrap();
+        symlink(&sibling, &wiki).unwrap();
+
+        let error = wiki_root(&store, "kibo").unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("wiki directory must not be a symbolic link")
+        );
     }
 
     #[test]

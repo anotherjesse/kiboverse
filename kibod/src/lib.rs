@@ -1,3 +1,4 @@
+pub mod agentic;
 pub mod ai;
 pub mod api;
 pub mod knowledge;

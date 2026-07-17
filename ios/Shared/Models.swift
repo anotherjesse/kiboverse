@@ -35,6 +35,26 @@ extension Array where Element == KiboEvent {
         }
     }
 
+    /// Server-side clips not yet claimed by any turn — the recordings the
+    /// next "Ask Kibo" would submit. Mirrors `pendingTurnIDs`.
+    var unclaimedClipIDs: Set<String> {
+        var clipIDs = Set<String>()
+        var claimed = Set<String>()
+        for event in self {
+            switch event.kind {
+            case "clip":
+                if let clipID = event.id { clipIDs.insert(clipID) }
+            case "turn":
+                claimed.formUnion(event.clips ?? [])
+            default:
+                continue
+            }
+        }
+        return clipIDs.subtracting(claimed)
+    }
+
+    var unclaimedClipCount: Int { unclaimedClipIDs.count }
+
     func timeline() -> [TimelineItem] {
         let projection = ConversationPresentation(events: self)
         var claimed = Set<String>()

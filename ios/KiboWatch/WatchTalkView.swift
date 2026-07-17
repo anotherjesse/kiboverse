@@ -153,11 +153,14 @@ struct WatchTalkView: View {
     var body: some View {
         NavigationStack {
             mainContent
-            .navigationTitle("Kibo")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Server", systemImage: "gearshape") { showingServer = true }
                         .labelStyle(.iconOnly)
+                        // The app-wide coral tint fills the circular toolbar
+                        // button; without a white glyph the coral gear
+                        // vanishes into the coral disc.
+                        .foregroundStyle(.white)
                 }
             }
             .sheet(isPresented: $showingServer) { WatchServerView(store: store) }
@@ -206,31 +209,32 @@ struct WatchTalkView: View {
         }
     }
 
+    /// Non-scrolling main screen: destination at top, dominant mic in the
+    /// center, compact Ask/Retry + one-line status at the bottom. Fits 42mm
+    /// and 46mm faces without scrolling.
     private var mainContent: some View {
-        ScrollView {
-            VStack(spacing: 7) {
-                selectionLink
-                talkButton
-                statusLabel
-                askButton
-                retryButton
-            }
-            .padding(.horizontal, 5)
+        VStack(spacing: 2) {
+            selectionLink
+            Spacer(minLength: 2)
+            talkButton
+            Spacer(minLength: 2)
+            bottomRow
         }
+        .padding(.horizontal, 6)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var selectionLink: some View {
         NavigationLink {
             WatchSelectionView(store: store)
         } label: {
-            VStack(spacing: 1) {
-                Text(selectedProjectName)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+            HStack(spacing: 3) {
                 Text(selectedConversationName)
-                    .font(.caption.weight(.semibold))
+                    .font(.footnote.weight(.semibold))
                     .lineLimit(1)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity)
         }
@@ -238,53 +242,82 @@ struct WatchTalkView: View {
         .disabled(audio.isRecording || audio.isStarting)
     }
 
+    private var bottomRow: some View {
+        VStack(spacing: 2) {
+            if let target = store.events.retryableFailure {
+                retryButton(target)
+            } else {
+                askButton
+            }
+            statusLabel
+        }
+    }
+
     private var statusLabel: some View {
-        Text(instructionText)
+        Text(statusText)
             .accessibilityIdentifier("watch-status")
             .font(.caption2)
             .foregroundStyle(errorText == nil ? Color.secondary : Color.red)
-            .lineLimit(2)
-            .multilineTextAlignment(.center)
-            .frame(minHeight: 24)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .frame(maxWidth: .infinity, minHeight: 14)
     }
 
     private var askButton: some View {
         Button(action: askKibo) {
-            HStack(spacing: 5) {
+            HStack(spacing: 4) {
                 if store.isAskingKibo || store.isSubmitting {
-                    ProgressView().controlSize(.small)
+                    ProgressView().controlSize(.mini)
                 } else {
                     Image(systemName: "sparkles")
                 }
-                Text(store.isAskingKibo ? "Thinking…" : "Ask Kibo")
+                Text(askLabel)
+                    .lineLimit(1)
             }
+            .font(.footnote.weight(.semibold))
+            .padding(.horizontal, 10)
         }
         .buttonStyle(.borderedProminent)
-        .tint(.orange)
+        .tint(.kiboCoral)
+        .controlSize(.mini)
         .disabled(askDisabled)
         .accessibilityIdentifier("watch-ask-button")
     }
 
-    @ViewBuilder
-    private var retryButton: some View {
-        if let target = store.events.retryableFailure {
-            Button {
-                retryFailedWork(target)
-            } label: {
+    private func retryButton(_ target: RetryTarget) -> some View {
+        Button {
+            retryFailedWork(target)
+        } label: {
+            HStack(spacing: 4) {
                 if store.isRetryingFailedWork {
-                    ProgressView().controlSize(.small)
+                    ProgressView().controlSize(.mini)
                 } else {
-                    Label("Retry failed work", systemImage: "arrow.clockwise")
+                    Image(systemName: "arrow.clockwise")
                 }
+                Text("Retry")
+                    .lineLimit(1)
             }
-            .buttonStyle(.bordered)
-            .disabled(store.isRetryingFailedWork)
-            .accessibilityIdentifier("watch-retry-button")
+            .font(.footnote.weight(.semibold))
+            .padding(.horizontal, 10)
         }
+        .buttonStyle(.borderedProminent)
+        .tint(.kiboCoral)
+        .controlSize(.mini)
+        .disabled(store.isRetryingFailedWork)
+        .accessibilityIdentifier("watch-retry-button")
     }
 
-    private var selectedProjectName: String {
-        store.selectedProject?.name ?? "Choose project"
+    private var askLabel: String {
+        if store.isAskingKibo { return "Thinking…" }
+        let count = askableClipCount
+        return count > 0 ? "Ask · \(count)" : "Ask"
+    }
+
+    /// Clips the next "Ask" would submit: unclaimed on the server plus any
+    /// queued on this watch for the SELECTED conversation — clips spooled
+    /// for other conversations and recovery items never count.
+    private var askableClipCount: Int {
+        store.events.unclaimedClipCount + store.localAskableClipCount
     }
 
     private var selectedConversationName: String {
@@ -299,21 +332,34 @@ struct WatchTalkView: View {
             || store.recoveryItemCount > 0
     }
 
+    /// Mic circle diameter sized to dominate the center on any watch face.
+    private var micDiameter: CGFloat {
+        WKInterfaceDevice.current().screenBounds.width * 0.46
+    }
+
     private var talkButton: some View {
         ZStack {
+            if audio.isRecording {
+                WatchRecordingRing(diameter: micDiameter, delay: 0.0)
+                WatchRecordingRing(diameter: micDiameter, delay: 0.45)
+                WatchRecordingRing(diameter: micDiameter, delay: 0.9)
+            }
             Circle()
-                .fill(.orange.opacity(audio.isRecording ? 0.22 : 0.12))
-                .frame(width: 104, height: 104)
+                .fill(audio.isRecording ? Color.red : Color.kiboCoral)
+                .frame(width: micDiameter, height: micDiameter)
+                .shadow(
+                    color: (audio.isRecording ? Color.red : Color.kiboCoral).opacity(0.35),
+                    radius: micDiameter * 0.11,
+                    y: micDiameter * 0.045
+                )
                 .scaleEffect(audio.isRecording ? 1 + audio.level * 0.12 : 1)
-            Circle()
-                .fill(audio.isRecording ? .red : .orange)
-                .frame(width: 78, height: 78)
-                .shadow(color: .orange.opacity(0.35), radius: 10, y: 4)
+                .animation(.easeOut(duration: 0.08), value: audio.level)
             Image(systemName: audio.isRecording ? "waveform" : "mic.fill")
-                .font(.system(size: 29, weight: .semibold))
+                .font(.system(size: micDiameter * 0.4, weight: .semibold))
                 .foregroundStyle(.white)
         }
-        .animation(.easeOut(duration: 0.08), value: audio.level)
+        .frame(width: micDiameter, height: micDiameter)
+        .opacity(store.selectedConversationID != nil ? 1 : 0.4)
         .accessibilityElement(children: .ignore)
         .accessibilityIdentifier("watch-talk-button")
         .accessibilityLabel("Hold to talk")
@@ -334,17 +380,19 @@ struct WatchTalkView: View {
         audio.recordingErrorMessage ?? audio.playbackErrorMessage ?? store.errorMessage
     }
 
-    private var instructionText: String {
+    /// Dynamic states only — no persistent instructional copy.
+    private var statusText: String {
         if let errorText { return errorText }
         if audio.isStarting { return "Opening microphone…" }
-        if audio.isRecording { return "Release to save" }
-        if store.isUploading { return "Sending recording…" }
+        if audio.isRecording { return "Listening…" }
+        if store.isUploading { return "Sending…" }
+        if store.isAskingKibo { return "Kibo is thinking…" }
         if audio.loadingID != nil { return "Loading reply…" }
         if audio.playingID != nil { return "Kibo is speaking" }
         if audio.lastFinishedID != nil { return "Reply played" }
         if store.recoveryItemCount > 0 { return "Recovery needed · open Server" }
-        if store.pendingUploadCount > 0 { return "Saved · tap Ask to retry" }
-        return "Hold while you speak"
+        if store.pendingUploadCount > 0 { return "Saved on watch" }
+        return ""
     }
 
     private func askKibo() {
@@ -472,25 +520,52 @@ struct WatchTalkView: View {
     }
 }
 
+/// One expanding, fading ring of the recording pulse — the same treatment as
+/// iOS's MicButton: red fill + staggered rings means a single static frame
+/// mid-recording still reads as "recording".
+private struct WatchRecordingRing: View {
+    let diameter: CGFloat
+    let delay: Double
+    @State private var expanded = false
+    @State private var faded = false
+
+    var body: some View {
+        // Rings start at 1.15x so a fresh ring immediately clears the fill
+        // (which grows to 1.12x with level), and opacity fades linearly
+        // while scale eases out — a static frame at any phase shows 2–3
+        // visible staggered rings.
+        Circle()
+            .stroke(Color.red.opacity(faded ? 0 : 0.6), lineWidth: 3)
+            .frame(width: diameter, height: diameter)
+            .scaleEffect(expanded ? 1.8 : 1.15)
+            .onAppear {
+                withAnimation(
+                    .easeOut(duration: 1.35)
+                        .repeatForever(autoreverses: false)
+                        .delay(delay)
+                ) {
+                    expanded = true
+                }
+                withAnimation(
+                    .linear(duration: 1.35)
+                        .repeatForever(autoreverses: false)
+                        .delay(delay)
+                ) {
+                    faded = true
+                }
+            }
+    }
+}
+
 struct WatchSelectionView: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var store: WatchStore
 
     var body: some View {
+        // The trigger on the main screen shows the conversation name, so the
+        // conversation picker leads; switching projects is the rarer action
+        // and lives below.
         List {
-            Section("Project") {
-                ForEach(store.projects) { project in
-                    Button {
-                        Task { await store.selectProject(project.id) }
-                    } label: {
-                        Label(
-                            project.name,
-                            systemImage: project.id == store.selectedProjectID
-                                ? "checkmark.circle.fill" : "circle"
-                        )
-                    }
-                }
-            }
             if !store.conversations.isEmpty {
                 Section("Conversation") {
                     ForEach(store.conversations) { conversation in
@@ -509,8 +584,21 @@ struct WatchSelectionView: View {
                     }
                 }
             }
+            Section("Project") {
+                ForEach(store.projects) { project in
+                    Button {
+                        Task { await store.selectProject(project.id) }
+                    } label: {
+                        Label(
+                            project.name,
+                            systemImage: project.id == store.selectedProjectID
+                                ? "checkmark.circle.fill" : "circle"
+                        )
+                    }
+                }
+            }
         }
-        .navigationTitle("Talk to…")
+        .navigationTitle("Choose")
     }
 }
 

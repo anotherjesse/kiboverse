@@ -3,7 +3,10 @@ import SwiftUI
 @main
 struct KiboWatchApp: App {
     var body: some Scene {
-        WindowGroup { WatchTalkView() }
+        WindowGroup {
+            WatchTalkView()
+                .tint(.kiboCoral)
+        }
     }
 }
 
@@ -36,6 +39,7 @@ final class WatchStore: ObservableObject {
     @Published private(set) var isChangingServer = false
     @Published var pendingUploadCount = 0
     @Published private(set) var recoveryItemCount = 0
+    @Published private(set) var pendingClips: [PendingClip] = []
 
     private let defaults = UserDefaults.standard
     private let spool = PendingUploadSpool(directoryName: PendingUploadSpool.watchDirectoryName)
@@ -64,6 +68,20 @@ final class WatchStore: ObservableObject {
         isSubmitting || !events.pendingTurnIDs.isEmpty
     }
 
+    /// Clips queued on this watch for the SELECTED conversation on the
+    /// current server — the only local recordings the next "Ask" can claim.
+    /// Recovery items and other conversations' clips are excluded so the
+    /// Ask badge never advertises work an ask cannot submit.
+    var localAskableClipCount: Int {
+        guard let projectID = selectedProjectID,
+              let conversationID = selectedConversationID else { return 0 }
+        let destinationKey = "\(projectID)/\(conversationID)"
+        let serverURL = self.serverURL
+        return pendingClips.lazy.filter {
+            $0.serverURL == serverURL && $0.destinationKey == destinationKey
+        }.count
+    }
+
     var requestDestination: KiboDestination? {
         guard let projectID = selectedProjectID,
               let conversationID = selectedConversationID else { return nil }
@@ -83,6 +101,7 @@ final class WatchStore: ObservableObject {
         let inventory = spool.inventory()
         pendingUploadCount = inventory.protectedCount(for: canonical)
         recoveryItemCount = inventory.recoveryItems.count
+        pendingClips = inventory.clips
     }
 
     deinit {
@@ -480,6 +499,7 @@ final class WatchStore: ObservableObject {
         let inventory = spool.inventory()
         pendingUploadCount = inventory.protectedCount(for: serverURL)
         recoveryItemCount = inventory.recoveryItems.count
+        pendingClips = inventory.clips
         if recoveryItemCount > 0 && !isUploading && errorMessage == nil {
             status = "Recording recovery needed"
         }

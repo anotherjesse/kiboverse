@@ -3,6 +3,8 @@ import SwiftUI
 struct ConversationDetailView: View {
     @EnvironmentObject private var store: AppStore
     @EnvironmentObject private var audio: AudioCoordinator
+    @EnvironmentObject private var router: KiboRouter
+    @StateObject private var session = ReplySession()
 
     var body: some View {
         Group {
@@ -16,7 +18,7 @@ struct ConversationDetailView: View {
                             if items.isEmpty {
                                 ContentUnavailableView(
                                     "No conversation yet", systemImage: "waveform",
-                                    description: Text("Use Talk to record a thought, then ask Kibo.")
+                                    description: Text("Hold the mic to record a thought, then ask Kibo.")
                                 ).padding(.top, 80)
                             }
                             ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
@@ -36,43 +38,60 @@ struct ConversationDetailView: View {
                         if let id = store.timeline.last?.id { withAnimation { proxy.scrollTo(id, anchor: .bottom) } }
                     }
                 }
-                .safeAreaInset(edge: .bottom) { compactComposer }
+                .safeAreaInset(edge: .bottom) { composer }
             }
         }
         .background(Color(.systemGroupedBackground))
         .navigationTitle(store.selectedConversation?.name ?? "Conversation")
+        .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
-                Label(store.status, systemImage: store.status == "Live" ? "checkmark.circle.fill" : "wifi.exclamationmark")
-                    .font(.caption).foregroundStyle(.secondary)
+                // Expand arrows, not a waveform: this enters the immersive
+                // full-screen talk mode (a waveform reads as playback or a
+                // visualizer).
+                Button("Talk mode", systemImage: "arrow.up.left.and.arrow.down.right") {
+                    router.isTalkModePresented = true
+                }
+                .disabled(store.selectedConversationID == nil)
+                .accessibilityIdentifier("talk-mode-button")
             }
         }
+        .replySessionDriver(
+            session,
+            overlayIsPresented: router.isTalkModePresented || router.isSettingsPresented
+        )
+        // Talk mode surfaces playback errors in its own status line; a modal
+        // here would re-show the same error, stale, after the cover closes.
         .alert("Audio unavailable", isPresented: Binding(
-            get: { audio.playbackErrorMessage != nil },
+            get: { audio.playbackErrorMessage != nil && !router.isTalkModePresented },
             set: { if !$0 { audio.playbackErrorMessage = nil } }
         )) { Button("OK") { audio.playbackErrorMessage = nil } }
         message: { Text(audio.playbackErrorMessage ?? "Unknown playback error") }
     }
 
-    private var compactComposer: some View {
-        HStack(spacing: 12) {
-            NavigationLink {
-                TalkView()
-            } label: {
-                Label("Talk", systemImage: "mic.fill")
-                    .font(.headline)
-            }
-            .buttonStyle(.borderedProminent)
-            Button("Ask Kibo", systemImage: "sparkles") { Task { await store.submitTurn() } }
-                .buttonStyle(.bordered)
-                .disabled(store.isUploading || store.isSubmitting)
+    // MARK: - Composer
+
+    private var composer: some View {
+        HStack(spacing: 16) {
+            MicButton(
+                diameter: 60,
+                isRecording: audio.isRecording,
+                isHolding: audio.isHolding,
+                level: audio.level,
+                isEnabled: store.selectedConversationID != nil,
+                beginHold: { session.beginHold() },
+                endHold: { session.endHold() }
+            )
+            Spacer()
+            AskKiboButton { session.startSubmit() }
         }
-        .onChange(of: store.selectedConversationID) { _, _ in audio.stop() }
-        .onDisappear { audio.stop() }
-        .padding()
+        .padding(.horizontal)
+        .padding(.vertical, 10)
         .frame(maxWidth: .infinity)
         .background(.ultraThinMaterial)
     }
+
+    // MARK: - Timeline cards
 
     @ViewBuilder
     private func MessageCard(item: TimelineItem, isGroupStart: Bool) -> some View {

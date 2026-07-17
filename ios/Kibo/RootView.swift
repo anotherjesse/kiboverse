@@ -4,27 +4,50 @@ import UIKit
 struct RootView: View {
     @Environment(\.scenePhase) private var scenePhase
     @EnvironmentObject private var store: AppStore
-    @State private var showingSettings = false
+    @EnvironmentObject private var router: KiboRouter
+    @State private var openConversationID: String?
 
     var body: some View {
-        TabView {
-            NavigationStack {
-                TalkView()
+        NavigationSplitView {
+            ConversationListView(openConversationID: $openConversationID)
+        } detail: {
+            if openConversationID != nil && store.selectedConversationID != nil {
+                ConversationDetailView()
+            } else {
+                ContentUnavailableView(
+                    "Choose a conversation",
+                    systemImage: "bubble.left.and.bubble.right"
+                )
             }
-            .tabItem { Label("Talk", systemImage: "mic.fill") }
-
-            LibraryView(showingSettings: $showingSettings)
-                .tabItem { Label("Conversations", systemImage: "bubble.left.and.bubble.right") }
         }
-        .sheet(isPresented: $showingSettings) { SettingsView() }
+        .fullScreenCover(isPresented: $router.isTalkModePresented) { TalkModeView() }
+        // While talk mode is up its status line owns error display; a modal
+        // here could not present over the cover anyway (the hosting
+        // controller is already presenting) and would pop up stale later.
         .alert("Kibo", isPresented: Binding(
-            get: { store.errorMessage != nil },
+            get: { store.errorMessage != nil && !router.isTalkModePresented },
             set: { if !$0 { store.errorMessage = nil } }
         )) { Button("OK") { store.errorMessage = nil } }
         message: { Text(store.errorMessage ?? "Unknown error") }
-        .onAppear { updateIdleTimer(for: scenePhase) }
+        .onAppear {
+            updateIdleTimer(for: scenePhase)
+            openTalkModeIfRequested()
+        }
         .onChange(of: scenePhase) { _, phase in updateIdleTimer(for: phase) }
+        .onChange(of: router.talkModeRequestedAt) { _, _ in openTalkModeIfRequested() }
+        .onChange(of: store.selectedConversationID) { _, _ in openTalkModeIfRequested() }
+        .onChange(of: store.hasRestoredSelection) { _, _ in openTalkModeIfRequested() }
         .onDisappear { UIApplication.shared.isIdleTimerDisabled = false }
+    }
+
+    /// TalkToKiboIntent latches a request that is honored once the store has
+    /// finished restoring its selection — opening the cover before
+    /// `selectProject` settles would let the startup selection reset abort a
+    /// hold that had already begun.
+    private func openTalkModeIfRequested() {
+        guard store.hasRestoredSelection, store.selectedConversationID != nil else { return }
+        guard router.consumeTalkModeRequest() else { return }
+        router.isTalkModePresented = true
     }
 
     private func updateIdleTimer(for phase: ScenePhase) {

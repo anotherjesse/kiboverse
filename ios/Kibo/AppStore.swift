@@ -39,6 +39,11 @@ final class AppStore: ObservableObject {
     @Published private(set) var isChangingServer = false
     @Published var pendingUploadCount = 0
     @Published private(set) var recoveryItemCount = 0
+    @Published private(set) var pendingClips: [PendingClip] = []
+    /// True once the launch selection restore (projects → conversations →
+    /// events) has settled — success or failure. RootView holds intent-driven
+    /// navigation until then.
+    @Published private(set) var hasRestoredSelection = false
     @Published var status = "Connecting…"
     @Published var errorMessage: String?
 
@@ -64,6 +69,7 @@ final class AppStore: ObservableObject {
         let inventory = spool.inventory()
         pendingUploadCount = inventory.protectedCount(for: savedURL)
         recoveryItemCount = inventory.recoveryItems.count
+        pendingClips = inventory.clips
     }
 
     deinit {
@@ -76,6 +82,23 @@ final class AppStore: ObservableObject {
     var selectedConversation: KiboConversation? { conversations.first { $0.id == selectedConversationID } }
     var timeline: [TimelineItem] { events.timeline() }
     var isAskingKibo: Bool { isSubmitting || !events.pendingTurnIDs.isEmpty }
+    /// Recordings the next "Ask Kibo" would claim: clips already on the
+    /// server that no turn has claimed, plus recordings queued on this device
+    /// for the SELECTED conversation. Clips spooled for other conversations
+    /// and recovery items never count — an ask cannot submit those, and
+    /// advertising them would re-enable the 409 path.
+    var askableClipCount: Int { events.unclaimedClipCount + localAskableClipCount }
+    /// Locally spooled clips destined for the selected conversation on the
+    /// current server.
+    var localAskableClipCount: Int {
+        guard let projectID = selectedProjectID,
+              let conversationID = selectedConversationID else { return 0 }
+        let destinationKey = "\(projectID)/\(conversationID)"
+        let serverURL = self.serverURL
+        return pendingClips.lazy.filter {
+            $0.serverURL == serverURL && $0.destinationKey == destinationKey
+        }.count
+    }
     var requestDestination: KiboDestination? {
         guard let projectID = selectedProjectID,
               let conversationID = selectedConversationID else { return nil }
@@ -88,6 +111,7 @@ final class AppStore: ObservableObject {
 
     func start() async {
         await reloadProjects()
+        hasRestoredSelection = true
         _ = await retryPendingUploads()
         beginPolling()
     }
@@ -118,8 +142,13 @@ final class AppStore: ObservableObject {
         projectSelectionVersion += 1
         eventSelectionVersion += 1
         let version = projectSelectionVersion
+        // Re-selecting the already-selected project (startup restore,
+        // reconnect after being offline) must not tear down the restored
+        // conversation: a transient nil destination would abort an
+        // in-progress hold into recovery.
+        let retainedConversationID = selectedProjectID == id ? selectedConversationID : nil
         selectedProjectID = id
-        selectedConversationID = nil
+        selectedConversationID = retainedConversationID
         conversations = []
         events = []
         persist(id, key: Key.projectID)
@@ -541,6 +570,7 @@ final class AppStore: ObservableObject {
         let inventory = spool.inventory()
         pendingUploadCount = inventory.protectedCount(for: serverURL)
         recoveryItemCount = inventory.recoveryItems.count
+        pendingClips = inventory.clips
         if recoveryItemCount > 0 && !isUploading && errorMessage == nil {
             status = "Recording recovery needed"
         }

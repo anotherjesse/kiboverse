@@ -32,7 +32,9 @@ private struct KiboComplicationView: View {
 
             Image(systemName: "waveform")
                 .font(.system(size: 19, weight: .semibold))
-                .foregroundStyle(.orange)
+                // kiboCoral, inlined: this extension target does not compile
+                // Shared/Theme.swift.
+                .foregroundStyle(Color(red: 0.94, green: 0.34, blue: 0.29))
                 .widgetAccentable()
         }
         .containerBackground(.clear, for: .widget)

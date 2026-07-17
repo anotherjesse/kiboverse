@@ -20,13 +20,9 @@ struct KiboApp: App {
             RootView()
                 .environmentObject(store)
                 .environmentObject(audio)
+                .environmentObject(KiboRouter.shared)
                 .tint(.kiboCoral)
                 .task { await store.start() }
         }
     }
-}
-
-extension Color {
-    static let kiboCoral = Color(red: 0.94, green: 0.34, blue: 0.29)
-    static let kiboInk = Color(red: 0.10, green: 0.12, blue: 0.18)
 }

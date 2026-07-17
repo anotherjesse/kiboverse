@@ -144,8 +144,10 @@ struct WatchTalkView: View {
 
     /// Swiping up past this arms release-to-ask.
     private static let swipeThreshold: CGFloat = 30
-    /// Releases faster than this are a flick (ask), not a recording.
-    private static let flickWindow: TimeInterval = 1.0
+    /// Sub-second releases never produce a recording: with a swipe they ask
+    /// with what's already pending, without one the capture is silently
+    /// discarded. Only holds of 1s+ are real recordings.
+    private static let recordThreshold: TimeInterval = 1.0
 
     init() {
         let store = WatchStore()
@@ -254,14 +256,37 @@ struct WatchTalkView: View {
     }
 
     /// Swipe up on the mic is the ask gesture, so no Ask button — the slot
-    /// holds Retry when recovery is possible, otherwise just the status line.
+    /// holds Retry when recovery is possible, a Review shortcut when saved
+    /// recordings are blocking asks, otherwise just the status line.
     private var bottomRow: some View {
         VStack(spacing: 2) {
             if let target = store.events.retryableFailure {
                 retryButton(target)
+            } else if store.recoveryItemCount > 0 {
+                reviewButton
             }
             statusLabel
         }
+    }
+
+    /// Recovery items block every ask until they are reviewed; give that
+    /// state a direct way out instead of a truncated instruction.
+    private var reviewButton: some View {
+        Button {
+            showingServer = true
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "exclamationmark.arrow.circlepath")
+                Text("Review saved")
+                    .lineLimit(1)
+            }
+            .font(.footnote.weight(.semibold))
+            .padding(.horizontal, 10)
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(.kiboCoral)
+        .controlSize(.mini)
+        .accessibilityIdentifier("watch-review-button")
     }
 
     private var statusLabel: some View {
@@ -364,22 +389,22 @@ struct WatchTalkView: View {
                     let startedAt = holdStartedAt
                     holdStartedAt = nil
                     swipeArmed = false
-                    guard value.translation.height <= -Self.swipeThreshold else {
-                        endHold()
-                        return
-                    }
                     let heldFor = startedAt.map { value.time.timeIntervalSince($0) } ?? 0
-                    if heldFor < Self.flickWindow {
-                        // A flick, not a recording: discard the sub-second
-                        // capture and ask with what was already pending.
+                    let swiped = value.translation.height <= -Self.swipeThreshold
+                    if heldFor < Self.recordThreshold {
                         audio.cancelHold()
                     } else {
                         endHold()
                     }
+                    guard swiped else { return }
                     // The hold just ended by our own hand — skip the
                     // capture-state guards, whose published values may not
                     // have settled on this exact tick.
-                    if askableClipCount > 0 { performAsk() }
+                    if askableClipCount > 0 {
+                        performAsk()
+                    } else {
+                        WKInterfaceDevice.current().play(.failure)
+                    }
                 }
         )
         .allowsHitTesting(store.selectedConversationID != nil)
@@ -405,7 +430,7 @@ struct WatchTalkView: View {
         if audio.loadingID != nil { return "Loading reply…" }
         if audio.playingID != nil { return "Kibo is speaking" }
         if audio.lastFinishedID != nil { return "Reply played" }
-        if store.recoveryItemCount > 0 { return "Recovery needed · open Server" }
+        if store.recoveryItemCount > 0 { return "Recording needs review" }
         if askableClipCount > 0 { return "\(askableClipCount) pending" }
         if store.pendingUploadCount > 0 { return "Saved on watch" }
         return ""

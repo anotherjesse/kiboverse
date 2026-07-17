@@ -23,8 +23,10 @@ struct MicButton: View {
 
     /// Swiping up past this arms release-to-ask.
     private static let swipeThreshold: CGFloat = 55
-    /// Releases faster than this are a flick (ask), not a recording.
-    private static let flickWindow: TimeInterval = 1.0
+    /// Sub-second releases never produce a recording: with a swipe they ask
+    /// with what's already pending, without one the capture is silently
+    /// discarded. Only holds of 1s+ are real recordings.
+    private static let recordThreshold: TimeInterval = 1.0
 
     @State private var holdStartedAt: Date?
     @State private var swipeArmed = false
@@ -78,19 +80,15 @@ struct MicButton: View {
                     let startedAt = holdStartedAt
                     holdStartedAt = nil
                     swipeArmed = false
-                    guard value.translation.height <= -Self.swipeThreshold else {
-                        endHold()
-                        return
-                    }
                     let heldFor = startedAt.map { value.time.timeIntervalSince($0) } ?? 0
-                    if heldFor < Self.flickWindow {
-                        // A flick, not a recording: discard the sub-second
-                        // capture and ask with what was already pending.
+                    let swiped = value.translation.height <= -Self.swipeThreshold
+                    if heldFor < Self.recordThreshold {
                         cancelHold()
+                        if swiped { askKibo() }
                     } else {
                         endHold()
+                        if swiped { askKibo() }
                     }
-                    askKibo()
                 }
         )
         .allowsHitTesting(isEnabled)

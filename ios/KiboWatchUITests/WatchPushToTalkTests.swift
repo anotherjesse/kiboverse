@@ -66,7 +66,8 @@ final class WatchPushToTalkTests: XCTestCase {
         XCTAssertTrue(talkButton.waitForExistence(timeout: 10))
         XCTAssertTrue(talkButton.isHittable)
 
-        talkButton.press(forDuration: 1.0)
+        // Safely past the 1s record threshold — sub-second holds discard.
+        talkButton.press(forDuration: 1.5)
 
         let pending = app.staticTexts.matching(
             NSPredicate(format: "label CONTAINS 'pending'")

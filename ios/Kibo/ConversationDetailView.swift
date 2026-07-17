@@ -42,6 +42,9 @@ struct ConversationDetailView: View {
             }
         }
         .background(Color(.systemGroupedBackground))
+        // The composer mic sits near the bottom edge; without this the home
+        // indicator claims the swipe-up-to-ask gesture.
+        .defersSystemGestures(on: .bottom)
         .navigationTitle(store.selectedConversation?.name ?? "Conversation")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -102,7 +105,16 @@ struct ConversationDetailView: View {
     /// in flight.
     @ViewBuilder
     private var composerStatus: some View {
-        if store.isAskingKibo {
+        if store.recoveryItemCount > 0 {
+            // Recovery blocks every ask; surface the way out where the ask
+            // gesture lives instead of leaving swipes silently ignored.
+            Button {
+                router.isSettingsPresented = true
+            } label: {
+                Label("Recovery needed", systemImage: "exclamationmark.arrow.circlepath")
+                    .font(.subheadline.weight(.medium))
+            }
+        } else if store.isAskingKibo {
             HStack(spacing: 8) {
                 ProgressView()
                 Text("Asking Kibo…")

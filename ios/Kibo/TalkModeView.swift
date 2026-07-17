@@ -77,6 +77,9 @@ struct TalkModeView: View {
             }
         }
         .preferredColorScheme(.dark)
+        // Swipe-up-to-ask starts on the giant mic; without this the home
+        // indicator claims upward swipes near the bottom of the screen.
+        .defersSystemGestures(on: .bottom)
         .replySessionDriver(session)
         .onDisappear {
             // Errors that occurred here were already shown in the status
@@ -132,6 +135,9 @@ struct TalkModeView: View {
         }
         if store.isAskingKibo || audio.loadingID?.hasPrefix("reply-") == true {
             return "Loading reply…"
+        }
+        if store.recoveryItemCount > 0 {
+            return "Recording needs review · see Settings"
         }
         if store.askableClipCount > 0 {
             return "\(store.askableClipCount) pending"

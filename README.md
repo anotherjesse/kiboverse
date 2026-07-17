@@ -132,10 +132,11 @@ aplay -D plughw:A01,0 /tmp/t.wav
   the last reply (simulated AI turn). No audio C libraries; `arecord`/`aplay`
   are used only as thin device shims.
 - `respeaker/` — PlatformIO firmware for the ReSpeaker Lite/XIAO ESP32-S3.
-  It records processed 16 kHz audio into PSRAM, queues clips to `kibod` over
-  LAN HTTP, and separately asks Kibo to answer all waiting clips while
-  resampling streamed 24 kHz replies for the onboard speaker. See its README
-  for the USR=record and MUTE=ask solder bridges and serial provisioning.
+  It records processed 16 kHz audio through a bounded PSRAM buffer ring,
+  uploads idempotent 20-second parts to `kibod` over LAN HTTP, commits one
+  logical clip on release, and separately asks Kibo to answer all waiting
+  clips while resampling streamed 24 kHz replies for the onboard speaker. See
+  its README for the USR=record and MUTE=ask solder bridges and provisioning.
 - `pi-config/` — files that live on the Pi, kept here so it's reproducible:
   the WirePlumber rule (→ `~/.config/wireplumber/main.lua.d/`) and the ptt
   systemd unit (→ `/etc/systemd/system/`).

@@ -1,10 +1,14 @@
 use crate::model::{
-    ConversationsEnvelope, CreateConversation, CreateNamed, CreateTurn, EventsEnvelope,
-    EventsQuery, KiboConversation, KiboEvent, KiboProject, ProjectsEnvelope, PutClipResponse,
-    SpeechQuery, TurnResponse, epoch, valid_id,
+    CompleteRecording, CompleteRecordingResponse, ConversationsEnvelope, CreateConversation,
+    CreateNamed, CreateTurn, EventsEnvelope, EventsQuery, KiboConversation, KiboEvent, KiboProject,
+    ProjectsEnvelope, PutClipResponse, PutRecordingPartResponse, SpeechQuery, TurnResponse, epoch,
+    valid_id,
 };
 use crate::state::AppState;
-use crate::store::{ClipConflict, ClipUpload, CreateTurnOutcome, NoPendingClips, PutClip};
+use crate::store::{
+    ClipConflict, ClipUpload, CompleteRecordingOutcome, CreateTurnOutcome, NoPendingClips, PutClip,
+    PutRecordingPart, RecordingCompletion, RecordingConflict, RecordingPartUpload,
+};
 use async_stream::stream;
 use axum::body::{Body, Bytes};
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
@@ -26,6 +30,14 @@ pub fn router() -> Router<AppState> {
         .route(
             "/v1/projects/{project_id}/conversations/{conversation_id}/clips/{clip_id}",
             put(put_clip),
+        )
+        .route(
+            "/v1/projects/{project_id}/conversations/{conversation_id}/recordings/{recording_id}/parts/{sequence}",
+            put(put_recording_part),
+        )
+        .route(
+            "/v1/projects/{project_id}/conversations/{conversation_id}/recordings/{recording_id}/complete",
+            post(complete_recording),
         )
         .route(
             "/v1/projects/{project_id}/conversations/{conversation_id}/clips/{clip_id}/audio",
@@ -133,6 +145,87 @@ async fn put_clip(
             created: outcome == PutClip::Created,
         }),
     ))
+}
+
+async fn put_recording_part(
+    State(state): State<AppState>,
+    Path((project_id, conversation_id, recording_id, sequence)): Path<(
+        String,
+        String,
+        String,
+        u32,
+    )>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, Json<PutRecordingPartResponse>), ApiError> {
+    let expected_sha256 = required_header(&headers, "x-content-sha256")?;
+    let sample_count = numeric_header(&headers, "x-sample-count")?;
+    let outcome = state
+        .store()
+        .put_recording_part(RecordingPartUpload {
+            project_id: &project_id,
+            conversation_id: &conversation_id,
+            recording_id: &recording_id,
+            sequence,
+            bytes: &body,
+            expected_sha256: &expected_sha256,
+            sample_count,
+        })
+        .map_err(recording_api_error)?;
+    let created = outcome == PutRecordingPart::Created;
+    Ok((
+        if created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        Json(PutRecordingPartResponse {
+            recording_id,
+            sequence,
+            created,
+        }),
+    ))
+}
+
+async fn complete_recording(
+    State(state): State<AppState>,
+    Path((project_id, conversation_id, recording_id)): Path<(String, String, String)>,
+    Json(request): Json<CompleteRecording>,
+) -> Result<(StatusCode, Json<CompleteRecordingResponse>), ApiError> {
+    let (outcome, event) = state
+        .store()
+        .complete_recording(RecordingCompletion {
+            project_id: &project_id,
+            conversation_id: &conversation_id,
+            recording_id: &recording_id,
+            part_count: request.part_count,
+            total_samples: request.total_samples,
+        })
+        .map_err(recording_api_error)?;
+    if let Some(event) = event {
+        state.publish(&project_id, &conversation_id, event);
+    }
+    state.start_transcription(project_id, conversation_id, recording_id.clone());
+    let created = outcome == CompleteRecordingOutcome::Created;
+    Ok((
+        if created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        Json(CompleteRecordingResponse {
+            clip_id: recording_id,
+            created,
+        }),
+    ))
+}
+
+fn recording_api_error(error: anyhow::Error) -> ApiError {
+    if error.downcast_ref::<RecordingConflict>().is_some() {
+        ApiError::new(StatusCode::CONFLICT, error)
+    } else {
+        ApiError::bad_request(error)
+    }
 }
 
 async fn create_turn(
@@ -411,5 +504,174 @@ where
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (self.status, self.message).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::Ai;
+    use crate::store::{Store, hex_sha256};
+    use axum::body::to_bytes;
+    use axum::extract::Request;
+    use serde_json::json;
+    use tower::ServiceExt;
+
+    fn test_wav(samples: &[i16]) -> Vec<u8> {
+        let data_len = u32::try_from(samples.len() * 2).unwrap();
+        let mut bytes = Vec::with_capacity(44 + data_len as usize);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&16_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&32_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&2_u16.to_le_bytes());
+        bytes.extend_from_slice(&16_u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        bytes.extend(samples.iter().flat_map(|sample| sample.to_le_bytes()));
+        bytes
+    }
+
+    fn part_request(uri: &str, samples: &[i16]) -> Request {
+        let bytes = test_wav(samples);
+        Request::builder()
+            .method("PUT")
+            .uri(uri)
+            .header("X-Content-Sha256", hex_sha256(&bytes))
+            .header("X-Sample-Count", samples.len())
+            .header("X-Peak-Pct", "99")
+            .body(Body::from(bytes))
+            .unwrap()
+    }
+
+    fn completion_request(uri: &str, part_count: u32, total_samples: u64) -> Request {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "part_count": part_count,
+                    "total_samples": total_samples,
+                    "peak_pct": 99
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn recording_routes_retry_conflict_and_commit_one_continuous_clip() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(temporary.path()).unwrap();
+        let conversation = store
+            .create_conversation("kibo", Some("Recording API test"))
+            .unwrap();
+        let service = router().with_state(AppState::new(store.clone(), Ai::mock()));
+        let base = format!(
+            "/v1/projects/kibo/conversations/{}/recordings/api-long",
+            conversation.id
+        );
+
+        let part_one = format!("{base}/parts/1");
+        assert_eq!(
+            service
+                .clone()
+                .oneshot(part_request(&part_one, &[3, 4]))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            service
+                .clone()
+                .oneshot(part_request(&part_one, &[3, 4]))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            service
+                .clone()
+                .oneshot(part_request(&part_one, &[4, 3]))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+
+        let complete = format!("{base}/complete");
+        let missing = service
+            .clone()
+            .oneshot(completion_request(&complete, 2, 4))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::CONFLICT);
+        let message = to_bytes(missing.into_body(), 1024).await.unwrap();
+        assert!(String::from_utf8_lossy(&message).contains("part 0 is missing"));
+        assert!(store.records("kibo", &conversation.id).unwrap().is_empty());
+
+        let part_zero = format!("{base}/parts/0");
+        assert_eq!(
+            service
+                .clone()
+                .oneshot(part_request(&part_zero, &[1, 2]))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            service
+                .clone()
+                .oneshot(completion_request(&complete, 2, 5))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            service
+                .clone()
+                .oneshot(completion_request(&complete, 2, 4))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            service
+                .clone()
+                .oneshot(completion_request(&complete, 2, 4))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        let records = store.records("kibo", &conversation.id).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record["kind"] == "clip")
+                .count(),
+            1
+        );
+        let mut wav = hound::WavReader::open(
+            store
+                .clip_path("kibo", &conversation.id, "api-long")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            wav.samples::<i16>().collect::<Result<Vec<_>, _>>().unwrap(),
+            [1, 2, 3, 4]
+        );
     }
 }

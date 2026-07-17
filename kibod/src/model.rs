@@ -165,6 +165,29 @@ pub struct PutClipResponse {
 
 #[typeshare(swift = "Hashable, Sendable")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PutRecordingPartResponse {
+    pub recording_id: String,
+    pub sequence: u32,
+    pub created: bool,
+}
+
+#[typeshare(swift = "Hashable, Sendable")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompleteRecording {
+    pub part_count: u32,
+    #[typeshare(serialized_as = "U53")]
+    pub total_samples: u64,
+}
+
+#[typeshare(swift = "Hashable, Sendable")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompleteRecordingResponse {
+    pub clip_id: String,
+    pub created: bool,
+}
+
+#[typeshare(swift = "Hashable, Sendable")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnResponse {
     pub turn_id: String,
     pub clips: Vec<String>,

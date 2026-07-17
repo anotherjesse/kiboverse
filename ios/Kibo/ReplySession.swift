@@ -189,12 +189,28 @@ final class ReplySession: ObservableObject {
         playAwaitedReplyIfReady()
     }
 
+    /// Discard the active capture without saving — a swipe-up flick asks
+    /// with what was already pending instead of recording.
+    func cancelHold() {
+        audio?.cancelHold()
+        playAwaitedReplyIfReady()
+    }
+
     func startSubmit() {
+        startSubmit(afterCaptureEnded: false)
+    }
+
+    /// `afterCaptureEnded` skips the capture-state guards: a swipe-up release
+    /// just ended (or discarded) the hold itself, and the recorder's
+    /// published state may not have settled yet on this exact tick.
+    func startSubmit(afterCaptureEnded: Bool) {
         guard let store, let audio else { return }
         // Guard here instead of relying on .disabled so a stale tap during a
         // push-to-talk cycle can never double-submit.
-        guard !audio.isRecording, !audio.isStarting,
-              !store.isUploading, !store.isAskingKibo,
+        if !afterCaptureEnded {
+            guard !audio.isRecording, !audio.isStarting else { return }
+        }
+        guard !store.isAskingKibo,
               let destination = store.requestDestination else { return }
         commandTask?.cancel()
         guard let claim = lifecycle.beginCommand(destination: destination) else { return }
@@ -202,6 +218,11 @@ final class ReplySession: ObservableObject {
         audio.resumeAutomaticPlayback()
         commandTask = Task { [weak self, weak store] in
             guard let self, let store, !Task.isCancelled,
+                  self.lifecycle.accepts(claim, destination: store.requestDestination) else { return }
+            // A swipe-up ask fires the instant the clip is queued: wait for
+            // its upload so the turn includes everything just said.
+            await store.waitForRecordingTasks()
+            guard !Task.isCancelled,
                   self.lifecycle.accepts(claim, destination: store.requestDestination) else { return }
             let turnID = await store.submitTurn()
             guard !Task.isCancelled,

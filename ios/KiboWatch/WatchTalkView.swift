@@ -139,6 +139,13 @@ struct WatchTalkView: View {
     @State private var replyCommandScope = WatchReplyCommandScope()
     @State private var replyCommandTask: Task<Void, Never>?
     @State private var showingServer = false
+    @State private var holdStartedAt: Date?
+    @State private var swipeArmed = false
+
+    /// Swiping up past this arms release-to-ask.
+    private static let swipeThreshold: CGFloat = 30
+    /// Releases faster than this are a flick (ask), not a recording.
+    private static let flickWindow: TimeInterval = 1.0
 
     init() {
         let store = WatchStore()
@@ -154,13 +161,25 @@ struct WatchTalkView: View {
         NavigationStack {
             mainContent
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
+                // Both are secondary actions: muted translucent discs, not
+                // coral — the mic and Ask own the accent color.
+                ToolbarItem(placement: .topBarLeading) {
                     Button("Server", systemImage: "gearshape") { showingServer = true }
                         .labelStyle(.iconOnly)
-                        // The app-wide coral tint fills the circular toolbar
-                        // button; without a white glyph the coral gear
-                        // vanishes into the coral disc.
-                        .foregroundStyle(.white)
+                        .tint(Color.white.opacity(0.15))
+                        .foregroundStyle(.white.opacity(0.85))
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    NavigationLink {
+                        WatchSelectionView(store: store)
+                    } label: {
+                        Label("Choose conversation", systemImage: "folder")
+                            .labelStyle(.iconOnly)
+                    }
+                    .tint(Color.white.opacity(0.15))
+                    .foregroundStyle(.white.opacity(0.85))
+                    .disabled(audio.isRecording || audio.isStarting)
+                    .accessibilityIdentifier("watch-choose-button")
                 }
             }
             .sheet(isPresented: $showingServer) { WatchServerView(store: store) }
@@ -214,7 +233,7 @@ struct WatchTalkView: View {
     /// and 46mm faces without scrolling.
     private var mainContent: some View {
         VStack(spacing: 2) {
-            selectionLink
+            conversationHeader
             Spacer(minLength: 2)
             talkButton
             Spacer(minLength: 2)
@@ -224,30 +243,22 @@ struct WatchTalkView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private var selectionLink: some View {
-        NavigationLink {
-            WatchSelectionView(store: store)
-        } label: {
-            HStack(spacing: 3) {
-                Text(selectedConversationName)
-                    .font(.footnote.weight(.semibold))
-                    .lineLimit(1)
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 9, weight: .bold))
-                    .foregroundStyle(.secondary)
-            }
+    /// Display-only destination label; switching lives behind the folder
+    /// button in the toolbar.
+    private var conversationHeader: some View {
+        Text(selectedConversationName)
+            .font(.footnote.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
             .frame(maxWidth: .infinity)
-        }
-        .buttonStyle(.plain)
-        .disabled(audio.isRecording || audio.isStarting)
     }
 
+    /// Swipe up on the mic is the ask gesture, so no Ask button — the slot
+    /// holds Retry when recovery is possible, otherwise just the status line.
     private var bottomRow: some View {
         VStack(spacing: 2) {
             if let target = store.events.retryableFailure {
                 retryButton(target)
-            } else {
-                askButton
             }
             statusLabel
         }
@@ -261,27 +272,6 @@ struct WatchTalkView: View {
             .lineLimit(1)
             .truncationMode(.tail)
             .frame(maxWidth: .infinity, minHeight: 14)
-    }
-
-    private var askButton: some View {
-        Button(action: askKibo) {
-            HStack(spacing: 4) {
-                if store.isAskingKibo || store.isSubmitting {
-                    ProgressView().controlSize(.mini)
-                } else {
-                    Image(systemName: "sparkles")
-                }
-                Text(askLabel)
-                    .lineLimit(1)
-            }
-            .font(.footnote.weight(.semibold))
-            .padding(.horizontal, 10)
-        }
-        .buttonStyle(.borderedProminent)
-        .tint(.kiboCoral)
-        .controlSize(.mini)
-        .disabled(askDisabled)
-        .accessibilityIdentifier("watch-ask-button")
     }
 
     private func retryButton(_ target: RetryTarget) -> some View {
@@ -307,12 +297,6 @@ struct WatchTalkView: View {
         .accessibilityIdentifier("watch-retry-button")
     }
 
-    private var askLabel: String {
-        if store.isAskingKibo { return "Thinking…" }
-        let count = askableClipCount
-        return count > 0 ? "Ask · \(count)" : "Ask"
-    }
-
     /// Clips the next "Ask" would submit: unclaimed on the server plus any
     /// queued on this watch for the SELECTED conversation — clips spooled
     /// for other conversations and recovery items never count.
@@ -324,17 +308,9 @@ struct WatchTalkView: View {
         store.selectedConversation?.name ?? "Choose conversation"
     }
 
-    private var askDisabled: Bool {
-        store.selectedConversationID == nil
-            || audio.isRecording
-            || audio.isStarting
-            || store.isSubmitting
-            || store.recoveryItemCount > 0
-    }
-
     /// Mic circle diameter sized to dominate the center on any watch face.
     private var micDiameter: CGFloat {
-        WKInterfaceDevice.current().screenBounds.width * 0.46
+        WKInterfaceDevice.current().screenBounds.width * 0.55
     }
 
     private var talkButton: some View {
@@ -354,7 +330,7 @@ struct WatchTalkView: View {
                 )
                 .scaleEffect(audio.isRecording ? 1 + audio.level * 0.12 : 1)
                 .animation(.easeOut(duration: 0.08), value: audio.level)
-            Image(systemName: audio.isRecording ? "waveform" : "mic.fill")
+            Image(systemName: micGlyph)
                 .font(.system(size: micDiameter * 0.4, weight: .semibold))
                 .foregroundStyle(.white)
         }
@@ -368,12 +344,50 @@ struct WatchTalkView: View {
         .accessibilityAction {
             if audio.isHolding { endHold() } else { beginHold() }
         }
+        // With no separate Ask button, the swipe gesture needs an
+        // accessibility equivalent.
+        .accessibilityAction(named: "Ask Kibo") { askKibo() }
         .gesture(
             DragGesture(minimumDistance: 0)
-                .onChanged { _ in beginHold() }
-                .onEnded { _ in endHold() }
+                .onChanged { value in
+                    if holdStartedAt == nil {
+                        holdStartedAt = value.time
+                        beginHold()
+                    }
+                    let armed = value.translation.height <= -Self.swipeThreshold
+                    if armed != swipeArmed {
+                        swipeArmed = armed
+                        if armed { WKInterfaceDevice.current().play(.directionUp) }
+                    }
+                }
+                .onEnded { value in
+                    let startedAt = holdStartedAt
+                    holdStartedAt = nil
+                    swipeArmed = false
+                    guard value.translation.height <= -Self.swipeThreshold else {
+                        endHold()
+                        return
+                    }
+                    let heldFor = startedAt.map { value.time.timeIntervalSince($0) } ?? 0
+                    if heldFor < Self.flickWindow {
+                        // A flick, not a recording: discard the sub-second
+                        // capture and ask with what was already pending.
+                        audio.cancelHold()
+                    } else {
+                        endHold()
+                    }
+                    // The hold just ended by our own hand — skip the
+                    // capture-state guards, whose published values may not
+                    // have settled on this exact tick.
+                    if askableClipCount > 0 { performAsk() }
+                }
         )
         .allowsHitTesting(store.selectedConversationID != nil)
+    }
+
+    private var micGlyph: String {
+        if swipeArmed { return "sparkles" }
+        return audio.isRecording ? "waveform" : "mic.fill"
     }
 
     private var errorText: String? {
@@ -383,6 +397,7 @@ struct WatchTalkView: View {
     /// Dynamic states only — no persistent instructional copy.
     private var statusText: String {
         if let errorText { return errorText }
+        if swipeArmed { return "Release to ask" }
         if audio.isStarting { return "Opening microphone…" }
         if audio.isRecording { return "Listening…" }
         if store.isUploading { return "Sending…" }
@@ -391,13 +406,18 @@ struct WatchTalkView: View {
         if audio.playingID != nil { return "Kibo is speaking" }
         if audio.lastFinishedID != nil { return "Reply played" }
         if store.recoveryItemCount > 0 { return "Recovery needed · open Server" }
+        if askableClipCount > 0 { return "\(askableClipCount) pending" }
         if store.pendingUploadCount > 0 { return "Saved on watch" }
         return ""
     }
 
     private func askKibo() {
-        guard !audio.isRecording, !audio.isStarting,
-              let claim = replyCommandScope.beginCommand(
+        guard !audio.isRecording, !audio.isStarting else { return }
+        performAsk()
+    }
+
+    private func performAsk() {
+        guard let claim = replyCommandScope.beginCommand(
                 serverURL: store.serverURL,
                 projectID: store.selectedProjectID,
                 conversationID: store.selectedConversationID

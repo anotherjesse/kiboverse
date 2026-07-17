@@ -50,16 +50,19 @@ struct TalkModeView: View {
                         level: audio.level,
                         isEnabled: store.selectedConversationID != nil,
                         beginHold: { session.beginHold() },
-                        endHold: { session.endHold() }
+                        endHold: { session.endHold() },
+                        cancelHold: { session.cancelHold() },
+                        askKibo: {
+                            if store.askableClipCount > 0 {
+                                session.startSubmit(afterCaptureEnded: true)
+                            }
+                        }
                     )
                     .frame(
                         width: geometry.size.width,
                         height: geometry.size.height
                     )
                 }
-
-                askButton
-                    .padding(.horizontal, 40)
 
                 Text(statusLine)
                     .font(.footnote)
@@ -103,10 +106,6 @@ struct TalkModeView: View {
         .padding(.top, 8)
     }
 
-    private var askButton: some View {
-        AskKiboButton { session.startSubmit() }
-    }
-
     private var statusIsError: Bool {
         audio.recordingErrorMessage != nil
             || audio.playbackErrorMessage != nil
@@ -133,6 +132,9 @@ struct TalkModeView: View {
         }
         if store.isAskingKibo || audio.loadingID?.hasPrefix("reply-") == true {
             return "Loading reply…"
+        }
+        if store.askableClipCount > 0 {
+            return "\(store.askableClipCount) pending"
         }
         return ""
     }

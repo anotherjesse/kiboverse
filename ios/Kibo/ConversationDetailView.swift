@@ -80,15 +80,40 @@ struct ConversationDetailView: View {
                 level: audio.level,
                 isEnabled: store.selectedConversationID != nil,
                 beginHold: { session.beginHold() },
-                endHold: { session.endHold() }
+                endHold: { session.endHold() },
+                cancelHold: { session.cancelHold() },
+                askKibo: {
+                    if store.askableClipCount > 0 {
+                        session.startSubmit(afterCaptureEnded: true)
+                    }
+                }
             )
             Spacer()
-            AskKiboButton { session.startSubmit() }
+            composerStatus
         }
         .padding(.horizontal)
         .padding(.vertical, 10)
         .frame(maxWidth: .infinity)
         .background(.ultraThinMaterial)
+    }
+
+    /// Swipe up on the mic is the ask gesture; this replaces the old Ask
+    /// button with passive feedback — what a swipe would submit, or the ask
+    /// in flight.
+    @ViewBuilder
+    private var composerStatus: some View {
+        if store.isAskingKibo {
+            HStack(spacing: 8) {
+                ProgressView()
+                Text("Asking Kibo…")
+            }
+            .font(.subheadline.weight(.medium))
+            .foregroundStyle(.secondary)
+        } else if store.askableClipCount > 0 {
+            Text("\(store.askableClipCount) pending")
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(.secondary)
+        }
     }
 
     // MARK: - Timeline cards

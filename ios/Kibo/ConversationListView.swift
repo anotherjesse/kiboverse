@@ -39,21 +39,25 @@ struct ConversationListView: View {
                 )
             }
         }
-        .navigationTitle("Kibo")
+        .navigationTitle(store.selectedProject?.name ?? "Kibo")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
-                Button("Settings", systemImage: "gearshape") { router.isSettingsPresented = true }
-                    .accessibilityIdentifier("settings-button")
+                Button { router.isSettingsPresented = true } label: {
+                    Image(systemName: "gearshape")
+                        .foregroundStyle(.secondary)
+                }
+                .accessibilityLabel("Settings")
+                .accessibilityIdentifier("settings-button")
             }
-            ToolbarItem(placement: .principal) { projectMenu }
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItemGroup(placement: .topBarTrailing) {
                 Button("New conversation", systemImage: "plus.bubble") {
                     name = ""
                     showingNewConversation = true
                 }
                 .disabled(store.selectedProjectID == nil)
                 .accessibilityIdentifier("new-conversation-button")
+                projectMenu
             }
         }
         .sheet(isPresented: $router.isSettingsPresented) { SettingsView() }
@@ -92,9 +96,9 @@ struct ConversationListView: View {
         )
     }
 
-    /// Projects > Conversations: the current project is the switchable
-    /// header of this screen. Folder icon + chevron mark it as a menu, not a
-    /// static label.
+    /// Projects > Conversations: the title names the current project and this
+    /// folder menu in the upper right switches it. A secondary treatment —
+    /// switching projects is rarer than starting a conversation.
     private var projectMenu: some View {
         Menu {
             ForEach(store.projects) { project in
@@ -115,17 +119,10 @@ struct ConversationListView: View {
                 showingNewProject = true
             }
         } label: {
-            HStack(spacing: 5) {
-                Image(systemName: "folder.fill")
-                    .imageScale(.small)
-                Text(store.selectedProject?.name ?? "Choose a project")
-                    .lineLimit(1)
-                Image(systemName: "chevron.down")
-                    .font(.caption2.weight(.bold))
-                    .foregroundStyle(.secondary)
-            }
-            .font(.headline)
+            Image(systemName: "folder")
+                .foregroundStyle(.secondary)
         }
+        .accessibilityLabel("Project: \(store.selectedProject?.name ?? "none")")
         .accessibilityIdentifier("project-menu")
     }
 

@@ -5,6 +5,11 @@ import SwiftUI
 /// red, staggered rings expand and fade continuously, and the circle scales
 /// with the input level — a single static frame mid-recording still reads as
 /// "recording" (red + visible rings).
+///
+/// Release gestures (Telegram-style):
+/// - hold, release in place → save the clip
+/// - hold 1s+, swipe up, release → save the clip and ask Kibo with it
+/// - press and flick up within 1s → ask Kibo with what's already pending
 struct MicButton: View {
     let diameter: CGFloat
     let isRecording: Bool
@@ -13,6 +18,16 @@ struct MicButton: View {
     let isEnabled: Bool
     let beginHold: () -> Void
     let endHold: () -> Void
+    let cancelHold: () -> Void
+    let askKibo: () -> Void
+
+    /// Swiping up past this arms release-to-ask.
+    private static let swipeThreshold: CGFloat = 55
+    /// Releases faster than this are a flick (ask), not a recording.
+    private static let flickWindow: TimeInterval = 1.0
+
+    @State private var holdStartedAt: Date?
+    @State private var swipeArmed = false
 
     var body: some View {
         ZStack {
@@ -37,6 +52,8 @@ struct MicButton: View {
         }
         .frame(width: diameter, height: diameter)
         .opacity(isEnabled ? 1 : 0.4)
+        .overlay(alignment: .top) { swipeHint }
+        .sensoryFeedback(.impact(weight: .medium), trigger: swipeArmed)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Hold to talk")
         .accessibilityValue(isRecording ? "Recording" : "Ready")
@@ -44,12 +61,64 @@ struct MicButton: View {
         .accessibilityAction {
             if isHolding { endHold() } else { beginHold() }
         }
-        .gesture(DragGesture(minimumDistance: 0)
-            .onChanged { _ in beginHold() }
-            .onEnded { _ in endHold() }
+        // With no separate Ask button, the swipe gesture needs an
+        // accessibility equivalent.
+        .accessibilityAction(named: "Ask Kibo") { askKibo() }
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { value in
+                    if holdStartedAt == nil {
+                        holdStartedAt = value.time
+                        beginHold()
+                    }
+                    let armed = value.translation.height <= -Self.swipeThreshold
+                    if armed != swipeArmed { swipeArmed = armed }
+                }
+                .onEnded { value in
+                    let startedAt = holdStartedAt
+                    holdStartedAt = nil
+                    swipeArmed = false
+                    guard value.translation.height <= -Self.swipeThreshold else {
+                        endHold()
+                        return
+                    }
+                    let heldFor = startedAt.map { value.time.timeIntervalSince($0) } ?? 0
+                    if heldFor < Self.flickWindow {
+                        // A flick, not a recording: discard the sub-second
+                        // capture and ask with what was already pending.
+                        cancelHold()
+                    } else {
+                        endHold()
+                    }
+                    askKibo()
+                }
         )
         .allowsHitTesting(isEnabled)
         .accessibilityIdentifier("talk-button")
+    }
+
+    /// Transient, hold-only affordance for the release gesture — appears
+    /// while the finger is down and highlights once the swipe is armed.
+    @ViewBuilder
+    private var swipeHint: some View {
+        if isHolding || isRecording {
+            HStack(spacing: 5) {
+                Image(systemName: swipeArmed ? "sparkles" : "chevron.up")
+                Text(swipeArmed ? "Release to ask" : "Swipe up to ask")
+            }
+            .font(.footnote.weight(.semibold))
+            .foregroundStyle(swipeArmed ? Color.white : Color.secondary)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .background(
+                swipeArmed ? AnyShapeStyle(Color.kiboCoral) : AnyShapeStyle(.thinMaterial),
+                in: Capsule()
+            )
+            .offset(y: -(diameter * 0.24 + 44))
+            .allowsHitTesting(false)
+            .animation(.easeOut(duration: 0.15), value: swipeArmed)
+            .transition(.opacity)
+        }
     }
 }
 

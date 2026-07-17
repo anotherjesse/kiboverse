@@ -34,7 +34,33 @@ final class WatchPushToTalkTests: XCTestCase {
         app.launch()
     }
 
-    func testSustainedPushToTalkUploadsAndPlaysReply() async throws {
+    /// Hold 1s+, swipe up, release: the clip is saved and Kibo is asked in
+    /// one gesture — no separate Ask tap.
+    func testSwipeUpReleaseAsksKiboWithRecording() async throws {
+        let baseline = try await fetchEvents().latestSeq
+        let talkButton = app.buttons["watch-talk-button"]
+        XCTAssertTrue(talkButton.waitForExistence(timeout: 10))
+        XCTAssertTrue(talkButton.isHittable)
+
+        let start = talkButton.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+        let end = talkButton.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: -1.6))
+        start.press(forDuration: 1.5, thenDragTo: end)
+
+        let replyPlayed = app.staticTexts["Reply played"]
+        XCTAssertTrue(
+            replyPlayed.waitForExistence(timeout: 15),
+            "Swipe-up release should submit the recording and autoplay the reply."
+        )
+
+        let newKinds = Set(try await fetchEvents().events
+            .filter { $0.seq > baseline }
+            .map(\.kind))
+        XCTAssertTrue(newKinds.isSuperset(of: ["clip", "transcript", "turn", "reply", "speech_ready"]))
+    }
+
+    /// Sustained press saves the clip; a quick flick up afterwards asks Kibo
+    /// with the pending clip (the Ask button is gone — swipe up IS ask).
+    func testSustainedPushToTalkThenFlickUpAsksKibo() async throws {
         let baseline = try await fetchEvents().latestSeq
         let talkButton = app.buttons["watch-talk-button"]
         XCTAssertTrue(talkButton.waitForExistence(timeout: 10))
@@ -42,12 +68,16 @@ final class WatchPushToTalkTests: XCTestCase {
 
         talkButton.press(forDuration: 1.0)
 
-        let askButton = app.buttons["watch-ask-button"]
-        XCTAssertTrue(askButton.waitForExistence(timeout: 5))
-        XCTAssertTrue(askButton.isEnabled)
+        let pending = app.staticTexts.matching(
+            NSPredicate(format: "label CONTAINS 'pending'")
+        ).firstMatch
+        XCTAssertTrue(pending.waitForExistence(timeout: 5))
         XCTAssertFalse(app.staticTexts["Hold a little longer to record."].exists)
 
-        askButton.tap()
+        // Flick: sub-second press released above the swipe threshold.
+        let start = talkButton.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+        let end = talkButton.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: -1.6))
+        start.press(forDuration: 0.2, thenDragTo: end)
 
         let replyPlayed = app.staticTexts["Reply played"]
         XCTAssertTrue(

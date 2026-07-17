@@ -51,6 +51,8 @@ be exercised without credentials. Set these environment variables as needed:
 | `KIBO_AI_MODE` | automatic | Set to `mock` to force deterministic local AI |
 | `KIBO_DATA_DIR` | `~/kibo-data` | Durable projects, logs, clips, and speech |
 | `KIBO_BIND` | `127.0.0.1:3000` | Listen address; use `0.0.0.0:3000` on a trusted LAN/tailnet |
+| `KIBO_CODEX_BIN` | `codex` | Codex CLI used for agentic knowledge queries |
+| `KIBO_CODEX_HOME` | normal Codex home | Optional source directory for Codex `auth.json`; config and instructions are isolated |
 
 The browser records mono WAV, commits each clip to an IndexedDB retry spool
 before uploading, and will not submit a turn until its pending uploads are
@@ -67,8 +69,11 @@ phase-two TODO; manual names will remain authoritative.
 Each project also has a **Knowledge** workspace in the browser. It compiles
 changed conversations into Markdown source notes, can force-regenerate one
 note, imports or refreshes public webpages and PDFs through Jina Reader, and
-renders generated Markdown alongside its raw text. The notes and successful
-content-hash checkpoints live under the project's `knowledge/` directory.
+renders generated Markdown alongside its raw text. **Ask knowledge** opens a
+read-only, multi-turn Codex agent that follows connections across those notes,
+streams its research trail, and cites the wiki files it used. The notes and
+successful content-hash checkpoints live under the project's `knowledge/`
+directory.
 
 This phase has no user authentication and is intended only for localhost or a
 trusted tailnet. Browser microphone capture works on localhost; remote browser

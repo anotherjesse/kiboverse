@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 
 const CSS: &str = include_str!("../assets/app.css");
 const JS: &str = include_str!("../assets/app.js");
+const KNOWLEDGE_QUERY_JS: &str = include_str!("../assets/knowledge-query.js");
 const HTMX: &str = include_str!("../assets/htmx.min.js");
 
 pub fn router() -> Router<AppState> {
@@ -29,6 +30,10 @@ pub fn router() -> Router<AppState> {
             get(timeline_fragment),
         )
         .route("/app/{project_id}/knowledge", get(knowledge_page))
+        .route(
+            "/app/{project_id}/knowledge/query",
+            get(knowledge_query_page),
+        )
         .route(
             "/app/{project_id}/knowledge/files/{*path}",
             get(knowledge_file_page),
@@ -60,6 +65,7 @@ pub fn router() -> Router<AppState> {
         )
         .route("/assets/app.css", get(asset_css))
         .route("/assets/app.js", get(asset_js))
+        .route("/assets/knowledge-query.js", get(asset_knowledge_query_js))
         .route("/assets/htmx.min.js", get(asset_htmx))
 }
 
@@ -119,6 +125,16 @@ async fn knowledge_page(
     Query(query): Query<KnowledgeQuery>,
 ) -> Response {
     match render_knowledge_page(&state, &project_id, query.notice.as_deref()) {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => (StatusCode::NOT_FOUND, error.to_string()).into_response(),
+    }
+}
+
+async fn knowledge_query_page(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> Response {
+    match render_knowledge_query_page(&state, &project_id) {
         Ok(html) => Html(html).into_response(),
         Err(error) => (StatusCode::NOT_FOUND, error.to_string()).into_response(),
     }
@@ -228,7 +244,7 @@ fn knowledge_redirect(project_id: &str, notice: &str) -> Response {
 
 fn knowledge_action_error(project_id: &str, error: anyhow::Error) -> Response {
     let body = format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><link rel=\"stylesheet\" href=\"/assets/app.css?v=3\"><title>Knowledge error · Kibo</title></head><body><main class=\"action-error\"><p class=\"eyebrow\">Knowledge ingestion</p><h1>That didn’t work.</h1><p>{}</p><a class=\"primary-link\" href=\"/app/{}/knowledge\">Back to knowledge</a></main></body></html>",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><link rel=\"stylesheet\" href=\"/assets/app.css?v=4\"><title>Knowledge error · Kibo</title></head><body><main class=\"action-error\"><p class=\"eyebrow\">Knowledge ingestion</p><h1>That didn’t work.</h1><p>{}</p><a class=\"primary-link\" href=\"/app/{}/knowledge\">Back to knowledge</a></main></body></html>",
         escape(&error.to_string()),
         url_component(project_id)
     );
@@ -243,6 +259,13 @@ async fn asset_js() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
         JS,
+    )
+}
+
+async fn asset_knowledge_query_js() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        KNOWLEDGE_QUERY_JS,
     )
 }
 
@@ -288,7 +311,7 @@ fn render_page(
 <html lang=\"en\"><head>
 <meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\">
 <title>{conversation} · Kibo</title><meta name=\"description\" content=\"A durable voice conversation with Kibo\">
-	<link rel=\"stylesheet\" href=\"/assets/app.css?v=3\"><script src=\"/assets/htmx.min.js\" defer></script><script src=\"/assets/app.js?v=4\" defer></script>
+	<link rel=\"stylesheet\" href=\"/assets/app.css?v=4\"><script src=\"/assets/htmx.min.js\" defer></script><script src=\"/assets/app.js?v=4\" defer></script>
 	</head><body data-project-id=\"{project_id}\" data-conversation-id=\"{conversation_id}\" data-last-seq=\"{last_seq}\" data-conversation-url=\"{base}\" data-timeline-url=\"{page_url}/timeline\" data-events-url=\"{base}/events\">
 	<div class=\"app-shell\"><aside class=\"sidebar\"><div class=\"brand\"><span class=\"brand-mark\">k</span>Kibo</div>{navigation}
 	<details class=\"new-item\"><summary>New project</summary><form method=\"post\" action=\"/ui/projects\"><label>Name<input name=\"name\" maxlength=\"100\" required></label><button> create </button></form></details>
@@ -342,7 +365,7 @@ fn render_project_page(state: &AppState, project_id: &str) -> anyhow::Result<Str
 <html lang=\"en\"><head>
 <meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\">
 <title>{project} · Kibo</title><meta name=\"description\" content=\"Voice chats organized in Kibo projects\">
-<link rel=\"stylesheet\" href=\"/assets/app.css?v=3\"><script src=\"/assets/htmx.min.js\" defer></script><script src=\"/assets/app.js?v=4\" defer></script>
+<link rel=\"stylesheet\" href=\"/assets/app.css?v=4\"><script src=\"/assets/htmx.min.js\" defer></script><script src=\"/assets/app.js?v=4\" defer></script>
 </head><body data-project-id=\"{project_id}\">
 <div class=\"app-shell\"><aside class=\"sidebar\"><div class=\"brand\"><span class=\"brand-mark\">k</span>Kibo</div>{navigation}
 <details class=\"new-item\"><summary>New project</summary><form method=\"post\" action=\"/ui/projects\"><label>Name<input name=\"name\" maxlength=\"100\" required></label><button> create </button></form></details>
@@ -412,11 +435,11 @@ fn render_knowledge_page(
 <html lang=\"en\"><head>
 <meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
 <title>Knowledge · {project}</title><meta name=\"description\" content=\"Ingest conversations and web sources into project Markdown\">
-<link rel=\"stylesheet\" href=\"/assets/app.css?v=3\"><script src=\"/assets/app.js?v=4\" defer></script>
+<link rel=\"stylesheet\" href=\"/assets/app.css?v=4\"><script src=\"/assets/app.js?v=4\" defer></script>
 </head><body data-project-id=\"{project_id}\"><div class=\"app-shell\"><aside class=\"sidebar\"><div class=\"brand\"><span class=\"brand-mark\">k</span>Kibo</div>{navigation}
 <details class=\"new-item\"><summary>New project</summary><form method=\"post\" action=\"/ui/projects\"><label>Name<input name=\"name\" maxlength=\"100\" required></label><button> create </button></form></details>
 </aside><main class=\"main knowledge-main\"><div class=\"knowledge-wrap\">
-<header class=\"knowledge-header\"><div><p class=\"eyebrow\">{project} {jina_badge}</p><h1>Knowledge</h1><p>Compile conversations and pages into durable, readable Markdown.</p></div><form method=\"post\" action=\"/ui/projects/{project_id}/knowledge/ingest\" data-knowledge-action data-progress-title=\"Ingesting changed sources\" data-progress-detail=\"Kibo is checking each source and generating notes for anything new.\" data-progress-long=\"Gemini is still building the changed notes. This can take a little while.\"><button class=\"primary-button\" type=\"submit\">Ingest changed <span>{dirty}</span></button></form></header>
+<header class=\"knowledge-header\"><div><p class=\"eyebrow\">{project} {jina_badge}</p><h1>Knowledge</h1><p>Compile conversations and pages into durable, readable Markdown.</p></div><div class=\"knowledge-header-actions\"><a class=\"primary-link ask-knowledge-link\" href=\"/app/{project_id}/knowledge/query\">Ask knowledge</a><form method=\"post\" action=\"/ui/projects/{project_id}/knowledge/ingest\" data-knowledge-action data-progress-title=\"Ingesting changed sources\" data-progress-detail=\"Kibo is checking each source and generating notes for anything new.\" data-progress-long=\"Gemini is still building the changed notes. This can take a little while.\"><button class=\"primary-button\" type=\"submit\">Ingest changed <span>{dirty}</span></button></form></div></header>
 {notice}
 <div id=\"knowledge-progress\" class=\"knowledge-progress\" role=\"status\" aria-live=\"polite\" hidden><span class=\"knowledge-spinner\" aria-hidden=\"true\"></span><div><strong id=\"knowledge-progress-title\">Updating knowledge</strong><p id=\"knowledge-progress-detail\">This may take a moment.</p><span class=\"knowledge-progress-track\" aria-hidden=\"true\"><i></i></span></div></div>
 <section class=\"knowledge-stats\" aria-label=\"Knowledge status\"><div><strong>{sources}</strong><span>available sources</span></div><div><strong>{ingested}</strong><span>ingested</span></div><div><strong>{dirty}</strong><span>changed</span></div><div><strong>{files_count}</strong><span>Markdown files</span></div></section>
@@ -430,6 +453,31 @@ fn render_knowledge_page(
         notice = render_knowledge_notice(notice),
         sources = statuses.len(),
         files_count = files.len(),
+    ))
+}
+
+fn render_knowledge_query_page(state: &AppState, project_id: &str) -> anyhow::Result<String> {
+    let project = state.store().project(project_id)?;
+    let navigation = render_navigation(state, project_id, None, true)?;
+    Ok(format!(
+        "<!doctype html>
+<html lang=\"en\"><head>
+<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\">
+<base href=\"/app/{project_id}/knowledge/files/wiki/\">
+<title>Ask knowledge · {project}</title><meta name=\"description\" content=\"Ask an agent to investigate this project's knowledge base\">
+<link rel=\"stylesheet\" href=\"/assets/app.css?v=4\"><script src=\"/assets/knowledge-query.js?v=1\" defer></script>
+</head><body data-project-id=\"{project_id}\" data-query-url=\"/v1/projects/{project_id}/knowledge/query\"><div class=\"app-shell\"><aside class=\"sidebar\"><div class=\"brand\"><span class=\"brand-mark\">k</span>Kibo</div>{navigation}
+<details class=\"new-item\"><summary>New project</summary><form method=\"post\" action=\"/ui/projects\"><label>Name<input name=\"name\" maxlength=\"100\" required></label><button> create </button></form></details>
+</aside><main class=\"main knowledge-query-main\"><div class=\"knowledge-query-shell\">
+<header class=\"knowledge-query-header\"><div><p class=\"eyebrow\">{project} · Knowledge</p><h1>Ask your knowledge</h1><p>Let an agent follow connections across the notes and cite the files it used.</p></div><div class=\"knowledge-query-header-actions\"><button id=\"knowledge-query-new\" class=\"quiet-button query-new-button\" type=\"button\" aria-controls=\"knowledge-query-timeline\" hidden>New conversation</button><a class=\"quiet-link\" href=\"/app/{project_id}/knowledge\">Manage sources</a></div></header>
+<section id=\"knowledge-query-timeline\" class=\"knowledge-query-timeline\" role=\"log\" aria-label=\"Knowledge query conversation\" aria-live=\"polite\" aria-relevant=\"additions text\">
+<div id=\"knowledge-query-empty\" class=\"knowledge-query-empty\"><div class=\"query-orbit\" aria-hidden=\"true\"><span></span></div><p class=\"eyebrow\">Read-only research</p><h2>What would you like to understand?</h2><p>The agent can inspect this project's generated Markdown, connect ideas across sources, and link you back to the relevant notes.</p><div class=\"query-suggestions\" role=\"group\" aria-label=\"Example questions\"><button type=\"button\" data-query-suggestion=\"What themes recur across my knowledge base?\">Find recurring themes</button><button type=\"button\" data-query-suggestion=\"Which sources disagree, and what are the key differences?\">Compare disagreements</button><button type=\"button\" data-query-suggestion=\"What important questions are still unanswered in these notes?\">Find open questions</button></div></div>
+</section>
+<form id=\"knowledge-query-form\" class=\"knowledge-query-composer\" aria-label=\"Ask the knowledge base\"><label class=\"visually-hidden\" for=\"knowledge-query-input\">Question</label><textarea id=\"knowledge-query-input\" name=\"question\" rows=\"2\" placeholder=\"Ask a question about your knowledge…\" autocomplete=\"off\" aria-describedby=\"knowledge-query-hint knowledge-query-status\" required></textarea><div class=\"query-composer-row\"><p id=\"knowledge-query-hint\">Enter to ask · Shift+Enter for a new line</p><div class=\"query-composer-actions\"><button id=\"knowledge-query-cancel\" class=\"quiet-button query-cancel-button\" type=\"button\" aria-controls=\"knowledge-query-timeline\" hidden>Stop</button><button id=\"knowledge-query-submit\" class=\"primary-button\" type=\"submit\">Ask knowledge</button></div></div></form>
+<p id=\"knowledge-query-status\" class=\"knowledge-query-status\" role=\"status\" aria-live=\"polite\">Ready for a question.</p>
+</div></main></div></body></html>",
+        project = escape(&project.name),
+        project_id = escape_attr(project_id),
     ))
 }
 
@@ -527,17 +575,7 @@ fn render_knowledge_file_page(
     let markdown = knowledge::read_markdown(state.store(), project_id, path)?;
     let files = knowledge::markdown_files(state.store(), project_id)?;
     let navigation = render_navigation(state, project_id, None, true)?;
-    let mut options = Options::empty();
-    options.insert(Options::ENABLE_TABLES);
-    options.insert(Options::ENABLE_STRIKETHROUGH);
-    options.insert(Options::ENABLE_TASKLISTS);
-    options.insert(Options::ENABLE_FOOTNOTES);
-    let mut rendered = String::new();
-    html::push_html(
-        &mut rendered,
-        Parser::new_ext(markdown_without_frontmatter(&markdown), options),
-    );
-    let rendered = ammonia::clean(&rendered);
+    let rendered = render_markdown(markdown_without_frontmatter(&markdown));
     let file_links = files
         .iter()
         .map(|file| {
@@ -556,12 +594,58 @@ fn render_knowledge_file_page(
         })
         .collect::<String>();
     Ok(format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><base href=\"/app/{project_id}/knowledge/files/wiki/\"><title>{path} · {project}</title><link rel=\"stylesheet\" href=\"/assets/app.css?v=3\"></head><body data-project-id=\"{project_id}\"><div class=\"app-shell\"><aside class=\"sidebar\"><div class=\"brand\"><span class=\"brand-mark\">k</span>Kibo</div>{navigation}</aside><main class=\"main markdown-main\"><div class=\"markdown-shell\"><aside class=\"file-rail\"><a class=\"back-link\" href=\"/app/{project_id}/knowledge\">← Knowledge</a><p class=\"eyebrow\">Markdown files</p><ul>{file_links}</ul></aside><article class=\"markdown-document\"><header><p class=\"eyebrow\">{path}</p></header><div class=\"markdown-body\">{rendered}</div><details class=\"raw-markdown\"><summary>View raw Markdown</summary><pre>{raw}</pre></details></article></div></main></div></body></html>",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><base href=\"/app/{project_id}/knowledge/files/wiki/\"><title>{path} · {project}</title><link rel=\"stylesheet\" href=\"/assets/app.css?v=4\"></head><body data-project-id=\"{project_id}\"><div class=\"app-shell\"><aside class=\"sidebar\"><div class=\"brand\"><span class=\"brand-mark\">k</span>Kibo</div>{navigation}</aside><main class=\"main markdown-main\"><div class=\"markdown-shell\"><aside class=\"file-rail\"><a class=\"back-link\" href=\"/app/{project_id}/knowledge\">← Knowledge</a><p class=\"eyebrow\">Markdown files</p><ul>{file_links}</ul></aside><article class=\"markdown-document\"><header><p class=\"eyebrow\">{path}</p></header><div class=\"markdown-body\">{rendered}</div><details class=\"raw-markdown\"><summary>View raw Markdown</summary><pre>{raw}</pre></details></article></div></main></div></body></html>",
         project = escape(&project.name),
         project_id = escape_attr(project_id),
         path = escape(path),
         raw = escape(&markdown),
     ))
+}
+
+pub(crate) fn render_markdown(markdown: &str) -> String {
+    ammonia::clean(&markdown_html(markdown))
+}
+
+pub(crate) fn render_query_markdown(markdown: &str) -> String {
+    let mut sanitizer = ammonia::Builder::default();
+    sanitizer
+        .rm_tags(["img", "map", "area"])
+        .url_schemes(HashSet::new())
+        .attribute_filter(|element, attribute, value| match (element, attribute) {
+            ("a", "href") if safe_query_citation(value) => Some(value.into()),
+            ("a", "href") | (_, "src") | (_, "cite") => None,
+            _ => Some(value.into()),
+        });
+    sanitizer.clean(&markdown_html(markdown)).to_string()
+}
+
+fn markdown_html(markdown: &str) -> String {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+    options.insert(Options::ENABLE_FOOTNOTES);
+    let mut rendered = String::new();
+    html::push_html(&mut rendered, Parser::new_ext(markdown, options));
+    rendered
+}
+
+fn safe_query_citation(value: &str) -> bool {
+    if value.starts_with('#') {
+        return true;
+    }
+    let path = value.split(['?', '#']).next().unwrap_or_default();
+    if path == "index.md" {
+        return true;
+    }
+    path.strip_prefix("sources/").is_some_and(|relative| {
+        !relative.is_empty()
+            && !relative.contains('%')
+            && !relative.contains('\\')
+            && relative
+                .split('/')
+                .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+    })
 }
 
 fn markdown_without_frontmatter(markdown: &str) -> &str {
@@ -833,6 +917,59 @@ mod tests {
         assert!(html.contains("wiki/index.md"));
         assert!(html.contains("id=\"knowledge-progress\""));
         assert!(html.contains("data-progress-title=\"Importing with Jina Reader\""));
+        assert!(html.contains("href=\"/app/kibo/knowledge/query\""));
+        assert!(html.contains("Ask knowledge"));
+    }
+
+    #[test]
+    fn knowledge_query_page_exposes_an_accessible_streaming_conversation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state = AppState::new(Store::open(temporary.path()).unwrap(), Ai::mock());
+
+        let html = render_knowledge_query_page(&state, "kibo").unwrap();
+
+        assert!(html.contains("<base href=\"/app/kibo/knowledge/files/wiki/\">"));
+        assert!(html.contains("data-query-url=\"/v1/projects/kibo/knowledge/query\""));
+        assert!(html.contains("src=\"/assets/knowledge-query.js?v=1\""));
+        assert!(html.contains("id=\"knowledge-query-timeline\""));
+        assert!(html.contains("aria-live=\"polite\""));
+        assert!(html.contains("id=\"knowledge-query-input\""));
+        assert!(html.contains("id=\"knowledge-query-cancel\""));
+        assert!(html.contains("id=\"knowledge-query-new\""));
+        assert!(html.contains("New conversation"));
+        assert!(html.contains("Read-only research"));
+        assert!(!html.contains("app-server"));
+        assert!(!html.contains("sandboxPolicy"));
+        assert!(!html.contains("thread/start"));
+    }
+
+    #[test]
+    fn knowledge_query_script_preserves_threads_and_renders_streams_safely() {
+        assert!(KNOWLEDGE_QUERY_JS.contains("const payload = { question: normalized };"));
+        assert!(KNOWLEDGE_QUERY_JS.contains("if (threadId) payload.thread_id = threadId;"));
+        assert!(KNOWLEDGE_QUERY_JS.contains("threadId = event.query_id;"));
+        assert!(KNOWLEDGE_QUERY_JS.contains("threadId = \"\";"));
+        assert!(KNOWLEDGE_QUERY_JS.matches("threadId = \"\";").count() >= 4);
+        assert!(KNOWLEDGE_QUERY_JS.contains("turn.answerText.appendData(event.text);"));
+        assert!(KNOWLEDGE_QUERY_JS.contains("turn.answerBody.innerHTML = event.html;"));
+        assert!(KNOWLEDGE_QUERY_JS.contains("link.target = \"_blank\";"));
+        assert!(KNOWLEDGE_QUERY_JS.contains("link.rel = \"noopener noreferrer\";"));
+        assert!(KNOWLEDGE_QUERY_JS.contains("\"Accept\": \"application/x-ndjson\""));
+    }
+
+    #[test]
+    fn query_markdown_is_sanitized_and_keeps_relative_citations() {
+        let rendered = render_query_markdown(
+            "# Answer\n\n[Source](sources/conversation--research.md)\n\n[Bad](javascript:alert(1))\n\n[Remote](https://attacker.invalid/leak)\n\n[Network path](//attacker.invalid/leak)\n\n[Traversal](sources/../../secret)\n\n![Tracking pixel](https://attacker.invalid/pixel)\n\n<script>alert('no')</script>",
+        );
+
+        assert!(rendered.contains("<h1>Answer</h1>"));
+        assert!(rendered.contains("href=\"sources/conversation--research.md\""));
+        assert!(!rendered.contains("<script>"));
+        assert!(!rendered.contains("href=\"javascript:"));
+        assert!(!rendered.contains("attacker.invalid"));
+        assert!(!rendered.contains("../../secret"));
+        assert!(!rendered.contains("<img"));
     }
 
     #[test]

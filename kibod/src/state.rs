@@ -1,7 +1,8 @@
+use crate::agentic::{CodexKnowledgeAgent, QueryEvent, RunningQuery};
 use crate::ai::{Ai, HistoryTurn, TTS_RATE};
 use crate::journal::JournalWrite;
 use crate::knowledge::{self, Document, IngestReceipt, JinaReader, ReaderDocument, WebSource};
-use crate::model::epoch_millis;
+use crate::model::{epoch, epoch_millis, make_id};
 use crate::store::{AutoNameOutcome, Store, hex_sha256};
 use crate::workflow::{
     ConversationWorkflow, FailureStage, HistoryContext, ReplyRecord, ReplyState, SpeechState,
@@ -13,9 +14,11 @@ use serde_json::Value;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
-use tokio::sync::{Mutex as AsyncMutex, Semaphore, broadcast, watch};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, Semaphore, broadcast, watch};
+
+const MAX_QUERY_THREADS: usize = 128;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -33,6 +36,8 @@ struct Inner {
     knowledge_locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
     provider_permits: Semaphore,
     workflow_policy: WorkflowPolicy,
+    knowledge_agent: CodexKnowledgeAgent,
+    query_threads: Mutex<HashMap<String, QueryThread>>,
 }
 
 /// Coalesces wakeups without making the in-memory claim authoritative state.
@@ -129,6 +134,116 @@ impl Default for WorkflowPolicy {
     }
 }
 
+#[derive(Clone)]
+struct QueryThread {
+    project_id: String,
+    app_server_id: String,
+    lock: Arc<AsyncMutex<()>>,
+    last_used_at: u64,
+}
+
+pub struct KnowledgeQuery {
+    query_id: String,
+    running: RunningQuery,
+    _thread_guard: OwnedMutexGuard<()>,
+    state: Weak<Inner>,
+    completed: bool,
+}
+
+struct QueryStartupLease {
+    query_id: String,
+    state: Weak<Inner>,
+    armed: bool,
+}
+
+impl QueryStartupLease {
+    fn new(query_id: &str, state: &Arc<Inner>) -> Self {
+        Self {
+            query_id: query_id.to_string(),
+            state: Arc::downgrade(state),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for QueryStartupLease {
+    fn drop(&mut self) {
+        if self.armed {
+            remove_query_thread(&self.state, &self.query_id);
+        }
+    }
+}
+
+impl KnowledgeQuery {
+    pub fn query_id(&self) -> &str {
+        &self.query_id
+    }
+
+    pub async fn next_event(&mut self) -> Result<Option<QueryEvent>> {
+        let event = self.running.next_event().await;
+        match &event {
+            Ok(Some(QueryEvent::Completed(_))) => self.completed = true,
+            Ok(None) | Err(_) => self.invalidate_continuation(),
+            Ok(Some(QueryEvent::Activity { .. } | QueryEvent::Delta(_))) => {}
+        }
+        event
+    }
+
+    fn invalidate_continuation(&self) {
+        remove_query_thread(&self.state, &self.query_id);
+    }
+}
+
+impl Drop for KnowledgeQuery {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.invalidate_continuation();
+        }
+    }
+}
+
+fn remove_query_thread(state: &Weak<Inner>, query_id: &str) {
+    if let Some(state) = state.upgrade() {
+        // Dropping an HTTP response or startup future must not leave a
+        // resumable token for a Codex turn whose final state is unknown. Avoid
+        // panicking in Drop if another task poisoned the registry lock.
+        match state.query_threads.lock() {
+            Ok(mut threads) => {
+                threads.remove(query_id);
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().remove(query_id);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct UnknownQueryThread;
+
+impl std::fmt::Display for UnknownQueryThread {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("query conversation was not found; start a new conversation")
+    }
+}
+
+impl std::error::Error for UnknownQueryThread {}
+
+#[derive(Debug)]
+pub struct QueryThreadBusy;
+
+impl std::fmt::Display for QueryThreadBusy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("this query conversation already has a turn in progress")
+    }
+}
+
+impl std::error::Error for QueryThreadBusy {}
+
 pub struct SpeechStream {
     generation: String,
     generation_index: u32,
@@ -208,6 +323,15 @@ impl AppState {
     }
 
     fn with_workflow_policy(store: Store, ai: Ai, workflow_policy: WorkflowPolicy) -> Self {
+        Self::build(store, ai, workflow_policy, CodexKnowledgeAgent::from_env())
+    }
+
+    fn build(
+        store: Store,
+        ai: Ai,
+        workflow_policy: WorkflowPolicy,
+        knowledge_agent: CodexKnowledgeAgent,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 store,
@@ -220,8 +344,19 @@ impl AppState {
                 knowledge_locks: Mutex::new(HashMap::new()),
                 provider_permits: Semaphore::new(3),
                 workflow_policy,
+                knowledge_agent,
+                query_threads: Mutex::new(HashMap::new()),
             }),
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_test_knowledge_agent(
+        store: Store,
+        ai: Ai,
+        knowledge_agent: CodexKnowledgeAgent,
+    ) -> Self {
+        Self::build(store, ai, WorkflowPolicy::default(), knowledge_agent)
     }
 
     pub fn store(&self) -> &Store {
@@ -234,6 +369,88 @@ impl AppState {
 
     pub fn jina_has_api_key(&self) -> bool {
         self.inner.jina.has_api_key()
+    }
+
+    pub async fn start_knowledge_query(
+        &self,
+        project_id: &str,
+        question: &str,
+        query_id: Option<&str>,
+    ) -> Result<KnowledgeQuery> {
+        let wiki_root = knowledge::wiki_root(&self.inner.store, project_id)?;
+        if let Some(query_id) = query_id {
+            let thread = self
+                .inner
+                .query_threads
+                .lock()
+                .unwrap()
+                .get(query_id)
+                .filter(|thread| thread.project_id == project_id)
+                .cloned()
+                .ok_or_else(|| anyhow!(UnknownQueryThread))?;
+            let guard = thread
+                .lock
+                .clone()
+                .try_lock_owned()
+                .map_err(|_| anyhow!(QueryThreadBusy))?;
+            let mut startup_lease = QueryStartupLease::new(query_id, &self.inner);
+            let running = self
+                .inner
+                .knowledge_agent
+                .start(&wiki_root, question, Some(&thread.app_server_id))
+                .await?;
+            if let Some(thread) = self.inner.query_threads.lock().unwrap().get_mut(query_id) {
+                thread.last_used_at = epoch();
+            }
+            let query = KnowledgeQuery {
+                query_id: query_id.to_string(),
+                running,
+                _thread_guard: guard,
+                state: Arc::downgrade(&self.inner),
+                completed: false,
+            };
+            startup_lease.disarm();
+            return Ok(query);
+        }
+
+        let query_id = make_id("query");
+        let lock = Arc::new(AsyncMutex::new(()));
+        let guard = lock
+            .clone()
+            .try_lock_owned()
+            .expect("a new query lock is available");
+        let running = self
+            .inner
+            .knowledge_agent
+            .start(&wiki_root, question, None)
+            .await?;
+        let app_server_id = running.app_server_thread_id().to_string();
+        let mut threads = self.inner.query_threads.lock().unwrap();
+        if threads.len() >= MAX_QUERY_THREADS
+            && let Some(oldest) = threads
+                .iter()
+                .min_by_key(|(_, thread)| thread.last_used_at)
+                .map(|(id, _)| id.clone())
+        {
+            threads.remove(&oldest);
+        }
+        threads.insert(
+            query_id.clone(),
+            QueryThread {
+                project_id: project_id.to_string(),
+                app_server_id,
+                lock,
+                last_used_at: epoch(),
+            },
+        );
+        drop(threads);
+        Ok(KnowledgeQuery {
+            query_id,
+            running,
+            _thread_guard: guard,
+            state: Arc::downgrade(&self.inner),
+            completed: false,
+        })
     }
 
     pub async fn ingest_changed(&self, project_id: &str) -> Result<IngestSummary> {
@@ -1462,6 +1679,7 @@ fn key3(project_id: &str, conversation_id: &str, item_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agentic::{CodexKnowledgeAgent, QueryEvent};
     use crate::store::{ClipUpload, CreateTurnOutcome, hex_sha256};
 
     #[test]
@@ -1498,6 +1716,167 @@ mod tests {
             context.previous_interaction_id.as_deref(),
             Some("provider-1")
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn knowledge_query_tokens_resume_only_within_their_project() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(temporary.path()).unwrap();
+        store.create_project("Other").unwrap();
+        let wiki = knowledge::wiki_root(&store, "kibo").unwrap();
+        let wiki_json = serde_json::to_string(&wiki.to_string_lossy()).unwrap();
+        let log = temporary.path().join("operations.log");
+        let log_shell = log.to_string_lossy().replace('\'', "'\\''");
+        let script = temporary.path().join("fake-codex");
+        let body = format!(
+            r##"#!/bin/sh
+read initialize
+printf '%s\n' '{{"id":0,"result":{{"userAgent":"fake"}}}}'
+read initialized
+read thread_request
+printf '%s\n' "$thread_request" >> '{log_shell}'
+permission_id=$(printf '%s\n' "$thread_request" | sed -n 's/.*"permissions":"\([^"]*\)".*/\1/p')
+printf '%s\n' '{{"id":1,"result":{{"thread":{{"id":"app-thread-1"}},"cwd":{wiki_json},"runtimeWorkspaceRoots":[{wiki_json}],"approvalPolicy":"never","sandbox":{{"type":"readOnly","networkAccess":false}},"activePermissionProfile":{{"id":"PROFILE_ID"}},"instructionSources":[]}}}}' | sed "s/PROFILE_ID/$permission_id/"
+read mcp_status
+printf '%s\n' '{{"id":2,"result":{{"data":[],"nextCursor":null}}}}'
+read turn_start
+printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"turn-1"}}}}}}'
+printf '%s\n' '{{"method":"item/completed","params":{{"threadId":"app-thread-1","turnId":"turn-1","item":{{"type":"agentMessage","id":"answer-1","text":"answer"}}}}}}'
+printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"app-thread-1","turn":{{"id":"turn-1","status":"completed","items":[],"error":null}}}}}}'
+while read ignored; do :; done
+"##
+        );
+        fs::write(&script, body).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let state = AppState::with_test_knowledge_agent(
+            store,
+            Ai::mock(),
+            CodexKnowledgeAgent::for_test(script.into_os_string()),
+        );
+
+        let mut first = state
+            .start_knowledge_query("kibo", "first", None)
+            .await
+            .unwrap();
+        let query_id = first.query_id().to_string();
+        while !matches!(
+            first.next_event().await.unwrap(),
+            Some(QueryEvent::Completed(_))
+        ) {}
+        drop(first);
+
+        let mut follow_up = state
+            .start_knowledge_query("kibo", "follow up", Some(&query_id))
+            .await
+            .unwrap();
+        while !matches!(
+            follow_up.next_event().await.unwrap(),
+            Some(QueryEvent::Completed(_))
+        ) {}
+        drop(follow_up);
+
+        let other = state.store().list_projects().unwrap();
+        let other_id = other
+            .iter()
+            .find(|project| project.name == "Other")
+            .unwrap()
+            .id
+            .clone();
+        let error = state
+            .start_knowledge_query(&other_id, "leak", Some(&query_id))
+            .await
+            .err()
+            .unwrap();
+        assert!(error.downcast_ref::<UnknownQueryThread>().is_some());
+
+        let operations = fs::read_to_string(log).unwrap();
+        assert!(operations.lines().next().unwrap().contains("thread/start"));
+        assert!(operations.lines().nth(1).unwrap().contains("thread/resume"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_during_follow_up_start_revokes_the_token() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(temporary.path()).unwrap();
+        let wiki = knowledge::wiki_root(&store, "kibo").unwrap();
+        let wiki_json = serde_json::to_string(&wiki.to_string_lossy()).unwrap();
+        let resume_started = temporary.path().join("resume-started");
+        let resume_started_shell = resume_started.to_string_lossy().replace('\'', "'\\''");
+        let script = temporary.path().join("fake-codex-stalled-resume");
+        let body = format!(
+            r##"#!/bin/sh
+read initialize
+printf '%s\n' '{{"id":0,"result":{{"userAgent":"fake"}}}}'
+read initialized
+read thread_request
+case "$thread_request" in
+  *'"method":"thread/resume"'*)
+    printf '%s\n' started > '{resume_started_shell}'
+    while read ignored; do :; done
+    exit 0
+    ;;
+esac
+permission_id=$(printf '%s\n' "$thread_request" | sed -n 's/.*"permissions":"\([^"]*\)".*/\1/p')
+printf '%s\n' '{{"id":1,"result":{{"thread":{{"id":"app-thread-stall"}},"cwd":{wiki_json},"runtimeWorkspaceRoots":[{wiki_json}],"approvalPolicy":"never","sandbox":{{"type":"readOnly","networkAccess":false}},"activePermissionProfile":{{"id":"PROFILE_ID"}},"instructionSources":[]}}}}' | sed "s/PROFILE_ID/$permission_id/"
+read mcp_status
+printf '%s\n' '{{"id":2,"result":{{"data":[],"nextCursor":null}}}}'
+read turn_start
+printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"turn-1"}}}}}}'
+printf '%s\n' '{{"method":"item/completed","params":{{"threadId":"app-thread-stall","turnId":"turn-1","item":{{"type":"agentMessage","id":"answer-1","text":"answer"}}}}}}'
+printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"app-thread-stall","turn":{{"id":"turn-1","status":"completed","items":[],"error":null}}}}}}'
+while read ignored; do :; done
+"##
+        );
+        fs::write(&script, body).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let state = AppState::with_test_knowledge_agent(
+            store,
+            Ai::mock(),
+            CodexKnowledgeAgent::for_test(script.into_os_string()),
+        );
+
+        let mut first = state
+            .start_knowledge_query("kibo", "first", None)
+            .await
+            .unwrap();
+        let query_id = first.query_id().to_string();
+        while !matches!(
+            first.next_event().await.unwrap(),
+            Some(QueryEvent::Completed(_))
+        ) {}
+        drop(first);
+
+        let follow_up_state = state.clone();
+        let follow_up_id = query_id.clone();
+        let follow_up = tokio::spawn(async move {
+            follow_up_state
+                .start_knowledge_query("kibo", "follow up", Some(&follow_up_id))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !resume_started.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        follow_up.abort();
+        assert!(matches!(follow_up.await, Err(error) if error.is_cancelled()));
+        let error = state
+            .start_knowledge_query("kibo", "try again", Some(&query_id))
+            .await
+            .err()
+            .unwrap();
+        assert!(error.downcast_ref::<UnknownQueryThread>().is_some());
     }
 
     #[tokio::test]

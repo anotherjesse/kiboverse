@@ -18,21 +18,64 @@ targets:
       properties:
         CFBundleDisplayName: Kibo
         NSMicrophoneUsageDescription: Kibo records your voice so it can send your question to your selected conversation.
+        NSCameraUsageDescription: Kibo uses the camera to photograph things you want to ask about.
         NSLocalNetworkUsageDescription: Kibo connects to your Kibo server on your local network.
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
         UILaunchScreen: {}
+    entitlements:
+      path: Generated/Kibo.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.anotherjesse.kibo
     sources:
       - path: Shared
       - path: Kibo
     dependencies:
       - target: KiboWatch
         embed: true
+      - target: KiboShare
+        embed: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.anotherjesse.kibo
         PRODUCT_NAME: Kibo
         TARGETED_DEVICE_FAMILY: "1,2"
+  KiboShare:
+    type: app-extension
+    platform: iOS
+    info:
+      path: Generated/KiboShare-Info.plist
+      properties:
+        CFBundleDisplayName: Kibo
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.share-services
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).ShareViewController
+          NSExtensionAttributes:
+            NSExtensionActivationRule:
+              NSExtensionActivationSupportsImageWithMaxCount: 10
+    entitlements:
+      path: Generated/KiboShare.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.anotherjesse.kibo
+    sources:
+      - path: KiboShare
+      # Only the extension-safe Shared files the intake needs — keeping this
+      # list narrow keeps APPLICATION_EXTENSION_API_ONLY honest and the
+      # extension binary small.
+      - path: Shared/SpoolPrimitives.swift
+      - path: Shared/PendingAttachmentSpool.swift
+      - path: Shared/ImageNormalizer.swift
+      - path: Shared/AppGroup.swift
+      - path: Shared/DestinationCache.swift
+      - path: Shared/ShareIntake.swift
+    settings:
+      base:
+        APPLICATION_EXTENSION_API_ONLY: YES
+        PRODUCT_BUNDLE_IDENTIFIER: com.anotherjesse.kibo.share
+        PRODUCT_NAME: KiboShare
+        SKIP_INSTALL: YES
   KiboWatch:
     type: application
     platform: watchOS

@@ -147,6 +147,22 @@ pub struct KiboEvent {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+    /// Image IDs claimed by a `turn` event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<String>>,
+    /// Owner key of the `description_*` event family.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_version: Option<u32>,
 }
 
 #[typeshare(swift = "Hashable, Sendable")]
@@ -201,9 +217,20 @@ pub struct CompleteRecordingResponse {
 
 #[typeshare(swift = "Hashable, Sendable")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PutImageResponse {
+    pub image_id: String,
+    pub created: bool,
+}
+
+#[typeshare(swift = "Hashable, Sendable")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnResponse {
     pub turn_id: String,
     pub clips: Vec<String>,
+    /// Optional so a new client decoding an old server's response does not
+    /// wedge its persisted turn command; absent means empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<String>>,
     pub created: bool,
 }
 
@@ -279,6 +306,27 @@ mod tests {
         assert_eq!(conversation.name_source, ConversationNameSource::Manual);
         assert_eq!(conversation.last_activity_at, 0);
         assert_eq!(conversation.activity_at(), 1);
+    }
+
+    #[test]
+    fn turn_response_tolerates_an_old_server_without_images() {
+        // R10: `images` stays optional so a client of an old server decodes
+        // absent as None instead of wedging its persisted turn command.
+        let old: TurnResponse = serde_json::from_value(serde_json::json!({
+            "turn_id": "turn-1",
+            "clips": ["clip-1"],
+            "created": true
+        }))
+        .unwrap();
+        assert_eq!(old.images, None);
+        let new: TurnResponse = serde_json::from_value(serde_json::json!({
+            "turn_id": "turn-1",
+            "clips": [],
+            "images": ["img-1"],
+            "created": true
+        }))
+        .unwrap();
+        assert_eq!(new.images.as_deref(), Some(["img-1".to_string()].as_slice()));
     }
 
     #[test]

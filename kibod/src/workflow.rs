@@ -59,7 +59,7 @@ pub enum AttemptState<T, F = WorkFailure> {
 }
 
 impl<T, F> AttemptState<T, F> {
-    fn scheduled_work(&self) -> Option<(u32, u64)> {
+    pub(crate) fn scheduled_work(&self) -> Option<(u32, u64)> {
         match self {
             Self::Due { next_attempt } => Some((*next_attempt, 0)),
             Self::RetryScheduled {
@@ -89,13 +89,40 @@ pub struct ReplyRecord {
 
 pub type ReplyState = AttemptState<ReplyRecord, ReplyFailure>;
 pub type SpeechState = AttemptState<()>;
+pub type DescriptionState = AttemptState<DescriptionRecord>;
+
+/// The durable text projection of an image, produced once by the AI layer.
+/// First success is authoritative, exactly like transcripts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescriptionRecord {
+    pub text: String,
+    pub model: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClipWork {
     pub id: String,
     pub peak: Option<u64>,
     pub sha256: Option<String>,
+    pub recorded_at: u64,
+    pub seq: u64,
     pub transcript: TranscriptState,
+}
+
+/// An image is a blob commitment plus values; its only attempt state is the
+/// advisory description, which never gates turn readiness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageWork {
+    pub id: String,
+    pub file: String,
+    pub mime: String,
+    pub sha256: Option<String>,
+    pub recorded_at: u64,
+    pub seq: u64,
+    pub width: Option<u64>,
+    pub height: Option<u64>,
+    pub caption: Option<String>,
+    pub description: DescriptionState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,9 +133,80 @@ pub struct TranscriptionWork {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescriptionWork {
+    pub image_id: String,
+    pub next_attempt: u32,
+    pub retry_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryImage {
+    pub id: String,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectedHistoryTurn {
     pub user: String,
     pub assistant: String,
+    pub images: Vec<HistoryImage>,
+}
+
+/// One ordered projection of a claimed turn's media for every consumer:
+/// prompt construction, history fallback, knowledge, and UIs all render the
+/// same `(recorded_at, seq)` merge of clips and images.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnContent {
+    pub items: Vec<TurnMedia>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnMedia {
+    Transcript { clip: String, text: String },
+    Image(TurnImage),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnImage {
+    pub id: String,
+    pub file: String,
+    pub mime: String,
+    pub sha256: Option<String>,
+    pub caption: Option<String>,
+    pub description: Option<String>,
+}
+
+impl TurnContent {
+    /// Caption uniformity rule: a caption is user text and appears exactly
+    /// once, at its media position. Image reference lines rendered elsewhere
+    /// carry the description or a bare id — never the caption.
+    pub fn user_text(&self) -> String {
+        self.items
+            .iter()
+            .filter_map(|item| match item {
+                TurnMedia::Transcript { text, .. } => {
+                    meaningful_user_text(text).then(|| text.clone())
+                }
+                TurnMedia::Image(image) => image
+                    .caption
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|caption| !caption.is_empty())
+                    .map(str::to_string),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    pub fn images(&self) -> Vec<&TurnImage> {
+        self.items
+            .iter()
+            .filter_map(|item| match item {
+                TurnMedia::Image(image) => Some(image),
+                TurnMedia::Transcript { .. } => None,
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +227,7 @@ pub enum TurnInput {
 pub struct TurnWork {
     pub id: String,
     pub clips: Vec<String>,
+    pub images: Vec<String>,
     pub input: TurnInput,
     pub reply: ReplyState,
     /// `None` means the durable reply does not advertise speech.
@@ -142,12 +241,18 @@ pub struct TurnWork {
     pub speech_generation_index: u32,
 }
 
+/// The single authority for "does this user text carry content": trimmed, so
+/// a padded sentinel cannot slip past one consumer and not another.
+pub(crate) fn meaningful_user_text(text: &str) -> bool {
+    !matches!(text.trim(), "" | "[silent]" | "[no speech]")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnAction {
     AwaitingEvent,
     WaitUntil { deadline_ms: u64 },
     RecordTranscriptFailure { error: String },
-    GenerateReply { attempt: u32, user_text: String },
+    GenerateReply { attempt: u32 },
     GenerateSpeech { attempt: u32, reply: ReplyRecord },
     Complete,
 }
@@ -169,15 +274,14 @@ impl TurnWork {
                 },
             };
         }
-        let user_text = match &self.input {
-            TurnInput::Ready(user_text) => user_text,
+        match &self.input {
+            TurnInput::Ready(_) => {}
             TurnInput::Awaiting => return TurnAction::AwaitingEvent,
             TurnInput::Failed(_) => unreachable!("failed input returned above"),
-        };
+        }
         match &self.reply {
             ReplyState::Due { next_attempt } => TurnAction::GenerateReply {
                 attempt: *next_attempt,
-                user_text: user_text.clone(),
             },
             ReplyState::RetryScheduled {
                 next_attempt,
@@ -185,7 +289,6 @@ impl TurnWork {
                 ..
             } if *retry_at_ms <= now_ms => TurnAction::GenerateReply {
                 attempt: *next_attempt,
-                user_text: user_text.clone(),
             },
             ReplyState::RetryScheduled { retry_at_ms, .. } => TurnAction::WaitUntil {
                 deadline_ms: *retry_at_ms,
@@ -230,6 +333,36 @@ enum JournalEvent {
         id: String,
         peak: Option<u64>,
         sha256: Option<String>,
+        recorded_at: u64,
+    },
+    Image {
+        id: String,
+        file: String,
+        mime: String,
+        sha256: Option<String>,
+        recorded_at: u64,
+        width: Option<u64>,
+        height: Option<u64>,
+        caption: Option<String>,
+    },
+    DescriptionStarted {
+        image: String,
+        attempt: u32,
+    },
+    DescriptionRetryRequested {
+        image: String,
+    },
+    DescriptionError {
+        image: String,
+        attempt: Option<u32>,
+        retry_at_ms: u64,
+        terminal: bool,
+        error: String,
+    },
+    Description {
+        image: String,
+        text: String,
+        model: Option<String>,
     },
     TranscriptStarted {
         clip: String,
@@ -252,6 +385,7 @@ enum JournalEvent {
     Turn {
         id: String,
         clips: Vec<String>,
+        images: Vec<String>,
     },
     ReplyStarted {
         turn: String,
@@ -323,14 +457,72 @@ impl JournalEvent {
         {
             return Self::Unknown;
         }
+        let string_list = |field: &str| {
+            value[field]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
         match kind {
             Some("clip") => match string("id") {
                 Some(id) => Self::Clip {
                     id,
                     peak: value["peak"].as_u64(),
                     sha256: string("sha256"),
+                    recorded_at: value["recorded_at"].as_u64().unwrap_or(0),
                 },
                 None => Self::Unknown,
+            },
+            Some("image") => match string("id") {
+                Some(id) => Self::Image {
+                    file: string("file").unwrap_or_else(|| format!("images/{id}.jpg")),
+                    mime: string("mime").unwrap_or_else(|| "image/jpeg".into()),
+                    sha256: string("sha256"),
+                    recorded_at: value["recorded_at"].as_u64().unwrap_or(0),
+                    width: value["width"].as_u64(),
+                    height: value["height"].as_u64(),
+                    caption: string("caption"),
+                    id,
+                },
+                None => Self::Unknown,
+            },
+            Some("description_started") => match (string("image"), attempt()) {
+                (Some(image), Some(attempt)) => Self::DescriptionStarted { image, attempt },
+                _ => Self::Unknown,
+            },
+            Some("description_retry_requested") => string("image")
+                .map(|image| Self::DescriptionRetryRequested { image })
+                .unwrap_or(Self::Unknown),
+            Some("description_error") => match string("image") {
+                Some(image) => Self::DescriptionError {
+                    image,
+                    attempt: attempt(),
+                    retry_at_ms: retry_at_ms(),
+                    terminal: value["terminal"].as_bool().unwrap_or(false),
+                    error: string("error").unwrap_or_else(|| "description failed".into()),
+                },
+                None => Self::Unknown,
+            },
+            Some("description_retry_scheduled") => match string("image") {
+                Some(image) => Self::DescriptionError {
+                    image,
+                    attempt: attempt(),
+                    retry_at_ms: retry_at_ms(),
+                    terminal: false,
+                    error: string("error").unwrap_or_else(|| "description failed".into()),
+                },
+                None => Self::Unknown,
+            },
+            Some("description") => match (string("image"), string("text")) {
+                (Some(image), Some(text)) => Self::Description {
+                    image,
+                    text,
+                    model: string("model"),
+                },
+                _ => Self::Unknown,
             },
             Some("transcript_started") => match (string("clip"), attempt()) {
                 (Some(clip), Some(attempt)) => Self::TranscriptStarted { clip, attempt },
@@ -367,13 +559,10 @@ impl JournalEvent {
             Some("turn") => match string("id") {
                 Some(id) => Self::Turn {
                     id,
-                    clips: value["clips"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect(),
+                    clips: string_list("clips"),
+                    // Absent on every legacy turn: audio-only journals parse
+                    // identically to how they always have.
+                    images: string_list("images"),
                 },
                 None => Self::Unknown,
             },
@@ -464,6 +653,7 @@ impl JournalEvent {
 struct MutableTurn {
     id: String,
     clips: Vec<String>,
+    images: Vec<String>,
     reply: ReplyState,
     speech: Option<SpeechState>,
     speech_generation: Option<String>,
@@ -475,6 +665,8 @@ struct MutableTurn {
 pub struct ConversationWorkflow {
     clip_order: Vec<String>,
     clips: HashMap<String, ClipWork>,
+    image_order: Vec<String>,
+    images: HashMap<String, ImageWork>,
     turns: Vec<TurnWork>,
     reply_event_sequence: HashMap<String, u64>,
 }
@@ -483,6 +675,8 @@ impl ConversationWorkflow {
     pub fn from_records(records: &[Value]) -> Self {
         let mut clip_order = Vec::new();
         let mut clips = HashMap::<String, ClipWork>::new();
+        let mut image_order = Vec::new();
+        let mut images = HashMap::<String, ImageWork>::new();
         let mut turn_order = Vec::new();
         let mut turns = HashMap::<String, MutableTurn>::new();
         let mut reply_event_sequence = HashMap::new();
@@ -493,7 +687,12 @@ impl ConversationWorkflow {
                 .as_u64()
                 .unwrap_or_else(|| (event_index as u64).saturating_add(1));
             match event {
-                JournalEvent::Clip { id, peak, sha256 } => {
+                JournalEvent::Clip {
+                    id,
+                    peak,
+                    sha256,
+                    recorded_at,
+                } => {
                     if !clips.contains_key(&id) {
                         clip_order.push(id.clone());
                         clips.insert(
@@ -502,9 +701,93 @@ impl ConversationWorkflow {
                                 id,
                                 peak,
                                 sha256,
+                                recorded_at,
+                                seq: event_sequence,
                                 transcript: TranscriptState::Due { next_attempt: 1 },
                             },
                         );
+                    }
+                }
+                JournalEvent::Image {
+                    id,
+                    file,
+                    mime,
+                    sha256,
+                    recorded_at,
+                    width,
+                    height,
+                    caption,
+                } => {
+                    if !images.contains_key(&id) {
+                        image_order.push(id.clone());
+                        images.insert(
+                            id.clone(),
+                            ImageWork {
+                                id,
+                                file,
+                                mime,
+                                sha256,
+                                recorded_at,
+                                seq: event_sequence,
+                                width,
+                                height,
+                                caption,
+                                description: DescriptionState::Due { next_attempt: 1 },
+                            },
+                        );
+                    }
+                }
+                JournalEvent::DescriptionStarted { image, attempt } => {
+                    if let Some(work) = images.get_mut(&image)
+                        && !matches!(
+                            work.description,
+                            DescriptionState::Succeeded(_) | DescriptionState::TerminalFailure(_)
+                        )
+                    {
+                        work.description = DescriptionState::Attempting { attempt };
+                    }
+                }
+                JournalEvent::DescriptionRetryRequested { image } => {
+                    // Descriptions are advisory values: reopening one never
+                    // touches reply state, so there is no cascade here.
+                    if let Some(work) = images.get_mut(&image)
+                        && !matches!(work.description, DescriptionState::Succeeded(_))
+                    {
+                        work.description = DescriptionState::Due { next_attempt: 1 };
+                    }
+                }
+                JournalEvent::DescriptionError {
+                    image,
+                    attempt,
+                    retry_at_ms,
+                    terminal,
+                    error,
+                } => {
+                    if let Some(work) = images.get_mut(&image)
+                        && !matches!(
+                            work.description,
+                            DescriptionState::Succeeded(_) | DescriptionState::TerminalFailure(_)
+                        )
+                    {
+                        apply_error(
+                            &mut work.description,
+                            attempt,
+                            retry_at_ms,
+                            terminal,
+                            error,
+                            std::convert::identity,
+                        );
+                    }
+                }
+                JournalEvent::Description { image, text, model } => {
+                    if let Some(work) = images.get_mut(&image)
+                        && !matches!(
+                            work.description,
+                            DescriptionState::Succeeded(_) | DescriptionState::TerminalFailure(_)
+                        )
+                    {
+                        work.description =
+                            DescriptionState::Succeeded(DescriptionRecord { text, model });
                     }
                 }
                 JournalEvent::TranscriptStarted { clip, attempt } => {
@@ -594,6 +877,7 @@ impl ConversationWorkflow {
                 JournalEvent::Turn {
                     id,
                     clips: turn_clips,
+                    images: turn_images,
                 } => {
                     if !turns.contains_key(&id) {
                         turn_order.push(id.clone());
@@ -602,6 +886,7 @@ impl ConversationWorkflow {
                             MutableTurn {
                                 id,
                                 clips: turn_clips,
+                                images: turn_images,
                                 reply: ReplyState::Due { next_attempt: 1 },
                                 speech: None,
                                 speech_generation: None,
@@ -779,6 +1064,8 @@ impl ConversationWorkflow {
         Self {
             clip_order,
             clips,
+            image_order,
+            images,
             turns,
             reply_event_sequence,
         }
@@ -786,6 +1073,10 @@ impl ConversationWorkflow {
 
     pub fn clip(&self, clip_id: &str) -> Option<&ClipWork> {
         self.clips.get(clip_id)
+    }
+
+    pub fn image(&self, image_id: &str) -> Option<&ImageWork> {
+        self.images.get(image_id)
     }
 
     pub fn turn(&self, turn_id: &str) -> Option<&TurnWork> {
@@ -821,6 +1112,81 @@ impl ConversationWorkflow {
             })
             .cloned()
             .collect()
+    }
+
+    pub fn description_work(&self) -> Vec<DescriptionWork> {
+        self.image_order
+            .iter()
+            .filter_map(|image_id| {
+                let (next_attempt, retry_at_ms) =
+                    self.images.get(image_id)?.description.scheduled_work()?;
+                Some(DescriptionWork {
+                    image_id: image_id.clone(),
+                    next_attempt,
+                    retry_at_ms,
+                })
+            })
+            .collect()
+    }
+
+    pub fn interrupted_descriptions(&self) -> Vec<String> {
+        self.image_order
+            .iter()
+            .filter(|image_id| {
+                self.images
+                    .get(*image_id)
+                    .is_some_and(|image| image.description.is_attempting())
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Project one turn's claimed media as a single ordered list, merged by
+    /// `(recorded_at, seq)` across clips and images. Only settled values are
+    /// included: successful transcripts and durable image records.
+    pub fn turn_content(&self, turn_id: &str) -> Option<TurnContent> {
+        let turn = self.turn(turn_id)?;
+        let mut ordered: Vec<(u64, u64, TurnMedia)> = Vec::new();
+        for clip_id in &turn.clips {
+            let Some(clip) = self.clips.get(clip_id) else {
+                continue;
+            };
+            if let TranscriptState::Succeeded(text) = &clip.transcript {
+                ordered.push((
+                    clip.recorded_at,
+                    clip.seq,
+                    TurnMedia::Transcript {
+                        clip: clip_id.clone(),
+                        text: text.clone(),
+                    },
+                ));
+            }
+        }
+        for image_id in &turn.images {
+            let Some(image) = self.images.get(image_id) else {
+                continue;
+            };
+            let description = match &image.description {
+                DescriptionState::Succeeded(record) => Some(record.text.clone()),
+                _ => None,
+            };
+            ordered.push((
+                image.recorded_at,
+                image.seq,
+                TurnMedia::Image(TurnImage {
+                    id: image.id.clone(),
+                    file: image.file.clone(),
+                    mime: image.mime.clone(),
+                    sha256: image.sha256.clone(),
+                    caption: image.caption.clone(),
+                    description,
+                }),
+            ));
+        }
+        ordered.sort_by_key(|(recorded_at, seq, _)| (*recorded_at, *seq));
+        Some(TurnContent {
+            items: ordered.into_iter().map(|(_, _, item)| item).collect(),
+        })
     }
 
     pub fn interrupted_turn_stages(&self) -> Vec<(String, FailureStage)> {
@@ -865,16 +1231,30 @@ impl ConversationWorkflow {
             if turn.id == current_turn {
                 break;
             }
-            let (TurnInput::Ready(user), ReplyState::Succeeded(reply)) = (&turn.input, &turn.reply)
+            let (TurnInput::Ready(_), ReplyState::Succeeded(reply)) = (&turn.input, &turn.reply)
             else {
                 continue;
             };
-            if user.is_empty() || reply.text.is_empty() {
+            // The history user side is the same ordered TurnContent every other
+            // consumer renders: transcripts and captions in media order, plus
+            // image references the AI layer frames per the caption rule.
+            let content = self.turn_content(&turn.id).unwrap_or_default();
+            let user = content.user_text();
+            let images: Vec<HistoryImage> = content
+                .images()
+                .into_iter()
+                .map(|image| HistoryImage {
+                    id: image.id.clone(),
+                    description: image.description.clone(),
+                })
+                .collect();
+            if (user.is_empty() && images.is_empty()) || reply.text.is_empty() {
                 continue;
             }
             history.push(ProjectedHistoryTurn {
-                user: user.clone(),
+                user,
                 assistant: reply.text.clone(),
+                images,
             });
 
             let event_sequence = self
@@ -934,7 +1314,7 @@ fn project_turn(turn: MutableTurn, clips: &HashMap<String, ClipWork>) -> TurnWor
         TurnInput::Ready(
             texts
                 .into_iter()
-                .filter(|text| !matches!(text.as_str(), "" | "[silent]" | "[no speech]"))
+                .filter(|text| meaningful_user_text(text))
                 .collect::<Vec<_>>()
                 .join("\n"),
         )
@@ -956,6 +1336,7 @@ fn project_turn(turn: MutableTurn, clips: &HashMap<String, ClipWork>) -> TurnWor
     TurnWork {
         id: turn.id,
         clips: turn.clips,
+        images: turn.images,
         input,
         reply,
         speech: turn.speech,
@@ -1188,7 +1569,8 @@ mod tests {
             context.turns,
             [ProjectedHistoryTurn {
                 user: "hello".into(),
-                assistant: "hi".into()
+                assistant: "hi".into(),
+                images: vec![],
             }]
         );
         assert_eq!(
@@ -1324,8 +1706,11 @@ mod tests {
         ));
         assert!(matches!(
             workflow.next_turn_action(0),
-            Some((turn, TurnAction::GenerateReply { user_text, .. }))
-                if turn == "turn-1" && user_text == "recovered"
+            Some((turn, TurnAction::GenerateReply { .. })) if turn == "turn-1"
+        ));
+        assert!(matches!(
+            &workflow.turn("turn-1").unwrap().input,
+            TurnInput::Ready(text) if text == "recovered"
         ));
 
         let completed = ConversationWorkflow::from_records(&[
@@ -1373,5 +1758,229 @@ mod tests {
             closed.turn("turn-1").unwrap().reply,
             ReplyState::TerminalFailure(ReplyFailure::Transcription(_))
         ));
+    }
+
+    #[test]
+    fn image_only_turn_is_ready_immediately() {
+        let workflow = ConversationWorkflow::from_records(&[
+            json!({"kind":"image", "id":"img-1", "file":"images/img-1.jpg", "mime":"image/jpeg", "sha256":"abc", "recorded_at":1}),
+            json!({"kind":"turn", "id":"turn-1", "images":["img-1"], "clips":[]}),
+        ]);
+        // No transcript gate: the turn is runnable with empty user text and
+        // the reply stage decides answerability from TurnContent.
+        assert!(matches!(
+            workflow.next_turn_action(0),
+            Some((turn, TurnAction::GenerateReply { .. })) if turn == "turn-1"
+        ));
+        assert!(matches!(
+            &workflow.turn("turn-1").unwrap().input,
+            TurnInput::Ready(text) if text.is_empty()
+        ));
+        let content = workflow.turn_content("turn-1").unwrap();
+        assert_eq!(content.images().len(), 1);
+        assert_eq!(content.user_text(), "");
+    }
+
+    #[test]
+    fn images_never_gate_turn_input() {
+        let mut records = vec![
+            json!({"kind":"clip", "id":"clip-1", "recorded_at":1}),
+            json!({"kind":"image", "id":"img-1", "file":"images/img-1.jpg", "mime":"image/jpeg", "sha256":"abc", "recorded_at":2}),
+            json!({"kind":"turn", "id":"turn-1", "clips":["clip-1"], "images":["img-1"]}),
+        ];
+        let awaiting = ConversationWorkflow::from_records(&records);
+        assert!(matches!(
+            awaiting.turn("turn-1").unwrap().input,
+            TurnInput::Awaiting
+        ));
+
+        records.insert(
+            1,
+            json!({"kind":"transcript", "clip":"clip-1", "text":"hello"}),
+        );
+        let ready = ConversationWorkflow::from_records(&records);
+        assert!(matches!(
+            &ready.turn("turn-1").unwrap().input,
+            TurnInput::Ready(text) if text == "hello"
+        ));
+        // The pending description never blocks the turn.
+        assert!(matches!(
+            ready.image("img-1").unwrap().description,
+            DescriptionState::Due { next_attempt: 1 }
+        ));
+    }
+
+    #[test]
+    fn description_first_success_is_authoritative_over_duplicates_and_stale_events() {
+        let workflow = ConversationWorkflow::from_records(&[
+            json!({"kind":"image", "id":"img-1", "file":"images/img-1.jpg", "mime":"image/jpeg", "sha256":"abc", "recorded_at":1}),
+            json!({"kind":"description", "image":"img-1", "text":"first", "attempt":1, "model":"gemini", "prompt_version":1}),
+            json!({"kind":"description", "image":"img-1", "text":"stale duplicate", "attempt":2, "model":"gemini", "prompt_version":1}),
+            json!({"kind":"description_started", "image":"img-1", "attempt":3}),
+            json!({"kind":"description_error", "image":"img-1", "attempt":3, "terminal":true, "error":"stale failure"}),
+            json!({"kind":"description_retry_requested", "image":"img-1"}),
+        ]);
+        assert!(matches!(
+            &workflow.image("img-1").unwrap().description,
+            DescriptionState::Succeeded(record) if record.text == "first"
+        ));
+        assert!(workflow.description_work().is_empty());
+
+        let terminal = ConversationWorkflow::from_records(&[
+            json!({"kind":"image", "id":"img-1", "file":"images/img-1.jpg", "mime":"image/jpeg", "sha256":"abc", "recorded_at":1}),
+            json!({"kind":"description_error", "image":"img-1", "attempt":1, "terminal":true, "error":"blocked"}),
+            json!({"kind":"description", "image":"img-1", "text":"must stay ignored", "attempt":2, "model":"gemini", "prompt_version":1}),
+        ]);
+        assert!(matches!(
+            terminal.image("img-1").unwrap().description,
+            DescriptionState::TerminalFailure(_)
+        ));
+    }
+
+    #[test]
+    fn description_stage_derives_due_attempting_scheduled_and_terminal_work() {
+        let image = json!({"kind":"image", "id":"img-1", "file":"images/img-1.jpg", "mime":"image/jpeg", "sha256":"abc", "recorded_at":1});
+
+        let due = ConversationWorkflow::from_records(&[image.clone()]);
+        assert_eq!(due.description_work()[0].next_attempt, 1);
+
+        let attempting = ConversationWorkflow::from_records(&[
+            image.clone(),
+            json!({"kind":"description_started", "image":"img-1", "attempt":1}),
+        ]);
+        assert!(attempting.description_work().is_empty());
+        assert_eq!(attempting.interrupted_descriptions(), ["img-1"]);
+
+        let scheduled = ConversationWorkflow::from_records(&[
+            image.clone(),
+            json!({"kind":"description_retry_scheduled", "image":"img-1", "attempt":1, "error":"busy", "retry_at_ms":9000}),
+        ]);
+        let work = &scheduled.description_work()[0];
+        assert_eq!((work.next_attempt, work.retry_at_ms), (2, 9000));
+
+        let terminal = ConversationWorkflow::from_records(&[
+            image.clone(),
+            json!({"kind":"description_error", "image":"img-1", "attempt":3, "terminal":true, "error":"blocked"}),
+        ]);
+        assert!(terminal.description_work().is_empty());
+        let reopened = ConversationWorkflow::from_records(&[
+            image,
+            json!({"kind":"description_error", "image":"img-1", "attempt":3, "terminal":true, "error":"blocked"}),
+            json!({"kind":"description_retry_requested", "image":"img-1"}),
+        ]);
+        assert_eq!(reopened.description_work()[0].next_attempt, 1);
+    }
+
+    #[test]
+    fn turn_content_merges_media_by_recorded_at_with_captions_in_place() {
+        let workflow = ConversationWorkflow::from_records(&[
+            json!({"kind":"clip", "id":"clip-late", "recorded_at":30}),
+            json!({"kind":"transcript", "clip":"clip-late", "text":"and after"}),
+            json!({"kind":"image", "id":"img-1", "file":"images/img-1.png", "mime":"image/png", "sha256":"abc", "recorded_at":20, "caption":"the whiteboard"}),
+            json!({"kind":"description", "image":"img-1", "text":"a full whiteboard", "attempt":1, "model":"gemini", "prompt_version":1}),
+            json!({"kind":"clip", "id":"clip-early", "recorded_at":10}),
+            json!({"kind":"transcript", "clip":"clip-early", "text":"before"}),
+            json!({"kind":"turn", "id":"turn-1", "clips":["clip-late", "clip-early"], "images":["img-1"]}),
+        ]);
+
+        let content = workflow.turn_content("turn-1").unwrap();
+        let kinds: Vec<&str> = content
+            .items
+            .iter()
+            .map(|item| match item {
+                TurnMedia::Transcript { clip, .. } => clip.as_str(),
+                TurnMedia::Image(image) => image.id.as_str(),
+            })
+            .collect();
+        assert_eq!(kinds, ["clip-early", "img-1", "clip-late"]);
+        // The caption is user text exactly once, at its media position.
+        assert_eq!(content.user_text(), "before\nthe whiteboard\nand after");
+        let images = content.images();
+        assert_eq!(images[0].description.as_deref(), Some("a full whiteboard"));
+        assert_eq!(images[0].mime, "image/png");
+    }
+
+    #[test]
+    fn history_includes_image_bearing_turns() {
+        let workflow = ConversationWorkflow::from_records(&[
+            json!({"kind":"image", "id":"img-1", "file":"images/img-1.jpg", "mime":"image/jpeg", "sha256":"abc", "recorded_at":1, "caption":"my cat"}),
+            json!({"kind":"description", "image":"img-1", "text":"a tabby cat", "attempt":1, "model":"gemini", "prompt_version":1}),
+            json!({"kind":"turn", "id":"turn-1", "clips":[], "images":["img-1"]}),
+            json!({"kind":"reply", "turn":"turn-1", "text":"What a nice cat."}),
+            json!({"kind":"image", "id":"img-2", "file":"images/img-2.jpg", "mime":"image/jpeg", "sha256":"def", "recorded_at":2}),
+            json!({"kind":"turn", "id":"turn-2", "clips":[], "images":["img-2"]}),
+            json!({"kind":"reply", "turn":"turn-2", "text":"Another photo."}),
+            json!({"kind":"turn", "id":"turn-3", "clips":[]}),
+        ]);
+        let context = workflow.history_before("turn-3");
+        assert_eq!(
+            context.turns,
+            [
+                ProjectedHistoryTurn {
+                    user: "my cat".into(),
+                    assistant: "What a nice cat.".into(),
+                    images: vec![HistoryImage {
+                        id: "img-1".into(),
+                        description: Some("a tabby cat".into()),
+                    }],
+                },
+                // Captionless and undescribed: included purely for its image.
+                ProjectedHistoryTurn {
+                    user: String::new(),
+                    assistant: "Another photo.".into(),
+                    images: vec![HistoryImage {
+                        id: "img-2".into(),
+                        description: None,
+                    }],
+                },
+            ]
+        );
+    }
+
+    /// R14 forward-only journals: this fixture documents what an old binary
+    /// does with a new journal, and how the new binary reads the result back.
+    /// An old reader sees `image` as Unknown and `turn.images` as noise, so an
+    /// image-only turn fails visibly ("turn has no clips") and heals through
+    /// turn-retry after upgrade; a mixed turn it answered keeps its pixel-less
+    /// reply — first success stays authoritative and ordinary retry does not
+    /// reopen it.
+    #[test]
+    fn forward_only_journal_degradations_are_visible_and_recoverable() {
+        // Image-only turn closed by an old binary: terminal, retry-recoverable.
+        let failed = ConversationWorkflow::from_records(&[
+            json!({"kind":"image", "id":"img-1", "file":"images/img-1.jpg", "mime":"image/jpeg", "sha256":"abc", "recorded_at":1}),
+            json!({"kind":"turn", "id":"turn-1", "clips":[], "images":["img-1"]}),
+            json!({"kind":"reply_error", "turn":"turn-1", "attempt":1, "terminal":true, "stage":"reply", "error":"turn has no clips"}),
+        ]);
+        assert!(matches!(
+            failed.turn("turn-1").unwrap().reply,
+            ReplyState::TerminalFailure(ReplyFailure::Generation(_))
+        ));
+        let healed = ConversationWorkflow::from_records(&[
+            json!({"kind":"image", "id":"img-1", "file":"images/img-1.jpg", "mime":"image/jpeg", "sha256":"abc", "recorded_at":1}),
+            json!({"kind":"turn", "id":"turn-1", "clips":[], "images":["img-1"]}),
+            json!({"kind":"reply_error", "turn":"turn-1", "attempt":1, "terminal":true, "stage":"reply", "error":"turn has no clips"}),
+            json!({"kind":"reply_retry_requested", "turn":"turn-1", "reason":"turn_retry"}),
+        ]);
+        assert!(matches!(
+            healed.next_turn_action(0),
+            Some((turn, TurnAction::GenerateReply { .. })) if turn == "turn-1"
+        ));
+
+        // Mixed turn answered pixel-less by an old binary: the durable reply
+        // stays authoritative; nothing reopens it implicitly.
+        let mixed = ConversationWorkflow::from_records(&[
+            json!({"kind":"clip", "id":"clip-1", "recorded_at":1}),
+            json!({"kind":"transcript", "clip":"clip-1", "text":"look at this"}),
+            json!({"kind":"image", "id":"img-1", "file":"images/img-1.jpg", "mime":"image/jpeg", "sha256":"abc", "recorded_at":2}),
+            json!({"kind":"turn", "id":"turn-1", "clips":["clip-1"], "images":["img-1"]}),
+            json!({"kind":"reply", "turn":"turn-1", "text":"answered without pixels"}),
+        ]);
+        assert!(matches!(
+            &mixed.turn("turn-1").unwrap().reply,
+            ReplyState::Succeeded(reply) if reply.text == "answered without pixels"
+        ));
+        assert!(mixed.next_turn_action(0).is_none());
+        assert_eq!(mixed.turn_content("turn-1").unwrap().images().len(), 1);
     }
 }

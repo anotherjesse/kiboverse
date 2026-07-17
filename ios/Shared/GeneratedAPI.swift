@@ -119,8 +119,17 @@ public struct KiboEvent: Codable, Hashable, Sendable {
 	public let recovered: Bool?
 	public let name: String?
 	public let source: String?
+	public let width: UInt32?
+	public let height: UInt32?
+	public let caption: String?
+	/// Image IDs claimed by a `turn` event.
+	public let images: [String]?
+	/// Owner key of the `description_*` event family.
+	public let image: String?
+	public let model: String?
+	public let prompt_version: UInt32?
 
-	public init(seq: UInt64, kind: String, id: String?, at: UInt64?, clip: String?, turn: String?, text: String?, error: String?, attempt: UInt32?, generation: String?, retry_at_ms: UInt64?, terminal: Bool?, stage: String?, reason: String?, audio: String?, clips: [String]?, answers: [String]?, ms: UInt64?, peak: UInt32?, file: String?, mime: String?, recorded_at: UInt64?, sha256: String?, interaction_id: String?, samples: UInt64?, rate: UInt32?, recovered: Bool?, name: String?, source: String?) {
+	public init(seq: UInt64, kind: String, id: String?, at: UInt64?, clip: String?, turn: String?, text: String?, error: String?, attempt: UInt32?, generation: String?, retry_at_ms: UInt64?, terminal: Bool?, stage: String?, reason: String?, audio: String?, clips: [String]?, answers: [String]?, ms: UInt64?, peak: UInt32?, file: String?, mime: String?, recorded_at: UInt64?, sha256: String?, interaction_id: String?, samples: UInt64?, rate: UInt32?, recovered: Bool?, name: String?, source: String?, width: UInt32?, height: UInt32?, caption: String?, images: [String]?, image: String?, model: String?, prompt_version: UInt32?) {
 		self.seq = seq
 		self.kind = kind
 		self.id = id
@@ -150,6 +159,13 @@ public struct KiboEvent: Codable, Hashable, Sendable {
 		self.recovered = recovered
 		self.name = name
 		self.source = source
+		self.width = width
+		self.height = height
+		self.caption = caption
+		self.images = images
+		self.image = image
+		self.model = model
+		self.prompt_version = prompt_version
 	}
 }
 
@@ -221,14 +237,28 @@ public struct CompleteRecordingResponse: Codable, Hashable, Sendable {
 	}
 }
 
+public struct PutImageResponse: Codable, Hashable, Sendable {
+	public let image_id: String
+	public let created: Bool
+
+	public init(image_id: String, created: Bool) {
+		self.image_id = image_id
+		self.created = created
+	}
+}
+
 public struct TurnResponse: Codable, Hashable, Sendable {
 	public let turn_id: String
 	public let clips: [String]
+	/// Optional so a new client decoding an old server's response does not
+	/// wedge its persisted turn command; absent means empty.
+	public let images: [String]?
 	public let created: Bool
 
-	public init(turn_id: String, clips: [String], created: Bool) {
+	public init(turn_id: String, clips: [String], images: [String]?, created: Bool) {
 		self.turn_id = turn_id
 		self.clips = clips
+		self.images = images
 		self.created = created
 	}
 }

@@ -33,7 +33,13 @@ struct RootView: View {
             updateIdleTimer(for: scenePhase)
             openTalkModeIfRequested()
         }
-        .onChange(of: scenePhase) { _, phase in updateIdleTimer(for: phase) }
+        .onChange(of: scenePhase) { _, phase in
+            updateIdleTimer(for: phase)
+            // Foreground sweep: attachment spool maintenance (staging GC,
+            // migration-root drain) plus the upload ladder for anything a
+            // future share extension deposited while the app was closed.
+            if phase == .active { store.resumePendingWork() }
+        }
         .onChange(of: router.talkModeRequestedAt) { _, _ in openTalkModeIfRequested() }
         .onChange(of: store.selectedConversationID) { _, _ in openTalkModeIfRequested() }
         .onChange(of: store.hasRestoredSelection) { _, _ in openTalkModeIfRequested() }

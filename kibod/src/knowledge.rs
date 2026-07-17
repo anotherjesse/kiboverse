@@ -1,10 +1,11 @@
+use crate::journal::bound_description_text;
 use crate::model::{epoch, make_id, valid_id};
 use crate::store::{Store, hex_sha256};
+use crate::workflow::{AttemptState, ConversationWorkflow};
 use anyhow::{Context, Result, anyhow, bail};
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -47,6 +48,19 @@ pub struct Document {
     pub body: String,
     pub content_sha256: String,
     pub origin: Option<String>,
+    /// Every image the canonical body references, in body order. The
+    /// committed note's `## Images` appendix is a mechanical derivative of
+    /// this list; because each entry's id and description also appear in the
+    /// body text, `content_sha256` covers everything the appendix renders.
+    pub images: Vec<NoteImage>,
+}
+
+/// One image reference in the canonical body: the id plus the first-success
+/// description value, `None` when the description failed terminally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteImage {
+    pub id: String,
+    pub description: Option<String>,
 }
 
 impl Document {
@@ -57,6 +71,7 @@ impl Document {
         title: String,
         body: String,
         origin: Option<String>,
+        images: Vec<NoteImage>,
     ) -> Self {
         let content_sha256 = hex_sha256(body.as_bytes());
         Self {
@@ -67,6 +82,7 @@ impl Document {
             body,
             content_sha256,
             origin,
+            images,
         }
     }
 
@@ -255,55 +271,78 @@ pub fn conversation_document(
 ) -> Result<Document> {
     let conversation = store.conversation(project_id, conversation_id)?;
     let records = store.records(project_id, conversation_id)?;
-    let transcripts: HashMap<&str, &str> = records
-        .iter()
-        .filter(|event| event["kind"] == "transcript")
-        .filter_map(|event| Some((event["clip"].as_str()?, event["text"].as_str()?)))
-        .collect();
-    let replies: HashMap<&str, &str> = records
-        .iter()
-        .filter(|event| event["kind"] == "reply")
-        .filter_map(|event| Some((event["turn"].as_str()?, event["text"].as_str()?)))
-        .collect();
+    // Claimed media renders through the workflow's single ordered projection:
+    // TurnContent order for transcripts and captions, first-success precedence
+    // for descriptions — the same view every other consumer renders.
+    let workflow = ConversationWorkflow::from_records(&records);
     let mut claimed = HashSet::new();
     let mut sections = Vec::new();
+    let mut images = Vec::new();
 
-    for turn in records.iter().filter(|event| event["kind"] == "turn") {
-        let clip_ids: Vec<&str> = turn["clips"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .collect();
-        claimed.extend(clip_ids.iter().copied());
-        let user = clip_ids
-            .iter()
-            .filter_map(|clip_id| transcripts.get(clip_id).copied())
-            .filter(|text| meaningful(text))
-            .collect::<Vec<_>>()
-            .join("\n");
-        if !user.is_empty() {
-            sections.push(format!("## You\n\n{}", user.trim()));
+    for turn in workflow.turns() {
+        claimed.extend(turn.clips.iter().cloned());
+        claimed.extend(turn.images.iter().cloned());
+        let content = workflow.turn_content(&turn.id).unwrap_or_default();
+        let mut lines = Vec::new();
+        let user = content.user_text();
+        let user = user.trim();
+        if meaningful(user) {
+            lines.push(user.to_string());
         }
-        if let Some(reply) = turn["id"]
-            .as_str()
-            .and_then(|turn_id| replies.get(turn_id).copied())
-            .filter(|text| meaningful(text))
+        for image in content.images() {
+            // Caption uniformity: captions already sit in `user_text` at
+            // their media position, so the reference line never repeats them.
+            if let Some(line) = image_reference(&workflow, &image.id, &mut images) {
+                lines.push(line);
+            }
+        }
+        if !lines.is_empty() {
+            sections.push(format!("## You\n\n{}", lines.join("\n")));
+        }
+        if let AttemptState::Succeeded(reply) = &turn.reply
+            && meaningful(&reply.text)
         {
-            sections.push(format!("## Kibo\n\n{}", reply.trim()));
+            sections.push(format!("## Kibo\n\n{}", reply.text.trim()));
         }
     }
 
+    // Unclaimed transcripts keep reading the raw event so legacy journals
+    // (and fixtures) without clip commitments still render; unclaimed images
+    // always have an image event, so both trail in journal order.
     let mut seen_unclaimed = HashSet::new();
-    for event in records.iter().filter(|event| event["kind"] == "transcript") {
-        let Some(clip_id) = event["clip"].as_str() else {
-            continue;
-        };
-        if claimed.contains(clip_id) || !seen_unclaimed.insert(clip_id) {
-            continue;
-        }
-        if let Some(text) = event["text"].as_str().filter(|text| meaningful(text)) {
-            sections.push(format!("## You\n\n{}", text.trim()));
+    for event in &records {
+        match event["kind"].as_str() {
+            Some("transcript") => {
+                let Some(clip_id) = event["clip"].as_str() else {
+                    continue;
+                };
+                if claimed.contains(clip_id) || !seen_unclaimed.insert(clip_id.to_string()) {
+                    continue;
+                }
+                if let Some(text) = event["text"].as_str().filter(|text| meaningful(text)) {
+                    sections.push(format!("## You\n\n{}", text.trim()));
+                }
+            }
+            Some("image") => {
+                let Some(image_id) = event["id"].as_str() else {
+                    continue;
+                };
+                if claimed.contains(image_id) || !seen_unclaimed.insert(image_id.to_string()) {
+                    continue;
+                }
+                // Only successfully described unclaimed images contribute,
+                // exactly like unclaimed successful transcripts; an empty
+                // description is as meaningless as an empty transcript.
+                if matches!(
+                    workflow.image(image_id).map(|work| &work.description),
+                    Some(AttemptState::Succeeded(record))
+                        if !bound_description_text(&record.text).is_empty()
+                ) && let Some(line) = image_reference(&workflow, image_id, &mut images)
+                {
+                    sections.push(format!("## You\n\n{line}"));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -315,14 +354,47 @@ pub fn conversation_document(
         conversation.name,
         body,
         None,
+        images,
     ))
 }
 
+/// Render one image reference line for the canonical body and record the
+/// appendix entry it implies. Successful descriptions render
+/// `[Image {id}: {text}]`, terminal failures render the bare `[Image {id}]`,
+/// and pending descriptions contribute nothing yet — the note recompiles when
+/// the description value lands.
+fn image_reference(
+    workflow: &ConversationWorkflow,
+    image_id: &str,
+    images: &mut Vec<NoteImage>,
+) -> Option<String> {
+    match &workflow.image(image_id)?.description {
+        AttemptState::Succeeded(record) => {
+            let text = bound_description_text(&record.text);
+            let (line, description) = if text.is_empty() {
+                (format!("[Image {image_id}]"), None)
+            } else {
+                (format!("[Image {image_id}: {text}]"), Some(text))
+            };
+            images.push(NoteImage {
+                id: image_id.to_string(),
+                description,
+            });
+            Some(line)
+        }
+        AttemptState::TerminalFailure(_) => {
+            images.push(NoteImage {
+                id: image_id.to_string(),
+                description: None,
+            });
+            Some(format!("[Image {image_id}]"))
+        }
+        _ => None,
+    }
+}
+
 fn meaningful(text: &str) -> bool {
-    !matches!(
-        text.trim(),
-        "" | "[silent]" | "[no speech]" | "[nothing to answer]"
-    )
+    crate::workflow::meaningful_user_text(text) && text.trim() != "[nothing to answer]"
 }
 
 pub fn import_reader_document(
@@ -384,6 +456,7 @@ pub fn web_document(store: &Store, project_id: &str, source_id: &str) -> Result<
         source.title,
         body,
         Some(source.url),
+        Vec::new(),
     ))
 }
 
@@ -457,7 +530,8 @@ pub fn commit_ingestion(
         kind: document.kind.as_str().to_string(),
         wiki_file: document.wiki_file(),
     };
-    let note = provenance_frontmatter(document, generation, generated_markdown);
+    let mut note = provenance_frontmatter(document, generation, generated_markdown);
+    note.push_str(&images_appendix(project_id, document));
     write_text_atomic(&root.join("wiki").join(&receipt.wiki_file), &note)?;
     checkpoint
         .documents
@@ -491,6 +565,76 @@ fn yaml_string(value: &str) -> String {
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', " ")
+}
+
+/// The `## Images` appendix is machine-written like frontmatter: every image
+/// the canonical body references reappears under a stable `#img-{id}` anchor
+/// with an `<img>` at the immutable content route and its description text in
+/// an escaped blockquote. Emitted only when the body references images, so
+/// image-free notes stay byte-identical to the appendix-free format.
+fn images_appendix(project_id: &str, document: &Document) -> String {
+    let mut seen = HashSet::new();
+    let mut entries = String::new();
+    for image in &document.images {
+        // Upload enforces `valid_id`; a handcrafted journal id that fails it
+        // must never reach an HTML attribute or URL.
+        if !valid_id(&image.id) || !seen.insert(image.id.as_str()) {
+            continue;
+        }
+        entries.push_str(&format!(
+            "\n### Image {id} <a id=\"img-{id}\"></a>\n\n![Image {id}](/v1/projects/{project_id}/conversations/{conversation_id}/images/{id}/content)\n",
+            id = image.id,
+            conversation_id = document.id,
+        ));
+        if let Some(text) = &image.description {
+            entries.push_str(&format!("\n{}\n", escaped_blockquote(text)));
+        }
+    }
+    if entries.is_empty() {
+        String::new()
+    } else {
+        // The separator is the note's trust boundary: the renderer gives only
+        // the region after the LAST occurrence the anchor-bearing policy, and
+        // commit_ingestion always writes the appendix last, so body content
+        // that reproduces the separator only donates itself to the untrusted
+        // body region.
+        format!("\n{}\n## Images\n{entries}", IMAGES_APPENDIX_SEPARATOR)
+    }
+}
+
+/// Exact separator line committed between a note's body and its
+/// machine-written images appendix. The renderer splits on the last
+/// occurrence; see `images_appendix`.
+pub(crate) const IMAGES_APPENDIX_SEPARATOR: &str = "<!-- kibod:images -->";
+
+/// Mechanically neutralize untrusted description text for the committed note:
+/// HTML is entity-escaped, Markdown structure characters are
+/// backslash-escaped, and every line is folded into a blockquote, so a
+/// hostile description cannot form headings, anchors, links, or raw HTML.
+fn escaped_blockquote(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '\\' | '`' | '*' | '_' | '[' | ']' | '#' => {
+                escaped.push('\\');
+                escaped.push(character);
+            }
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+        .lines()
+        .map(|line| {
+            if line.is_empty() {
+                ">".to_string()
+            } else {
+                format!("> {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn write_index(path: &Path, checkpoint: &KnowledgeCheckpoint) -> Result<()> {
@@ -696,7 +840,221 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
+
+    fn seeded(events: &[Value]) -> (tempfile::TempDir, Store, String) {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(temporary.path()).unwrap();
+        let conversation = store.create_conversation("kibo", Some("Ideas")).unwrap();
+        for event in events {
+            store
+                .append_fixture("kibo", &conversation.id, event.clone())
+                .unwrap();
+        }
+        (temporary, store, conversation.id)
+    }
+
+    #[test]
+    fn image_turns_render_reference_lines_in_turn_content_order() {
+        let (_dir, store, conversation_id) = seeded(&[
+            json!({"kind":"clip", "id":"clip-1", "recorded_at":1000}),
+            json!({"kind":"transcript", "clip":"clip-1", "text":"look at the whiteboard"}),
+            json!({"kind":"image", "id":"img-1", "recorded_at":2000, "caption":"standup board"}),
+            json!({"kind":"turn", "id":"turn-1", "clips":["clip-1"], "images":["img-1"]}),
+            json!({"kind":"description", "image":"img-1", "text":"A whiteboard covered in sticky notes"}),
+            json!({"kind":"reply", "turn":"turn-1", "text":"Nice board!"}),
+        ]);
+
+        let document = conversation_document(&store, "kibo", &conversation_id).unwrap();
+
+        assert_eq!(
+            document.body,
+            "## You\n\nlook at the whiteboard\nstandup board\n[Image img-1: A whiteboard covered in sticky notes]\n\n## Kibo\n\nNice board!"
+        );
+        assert_eq!(
+            document.images,
+            vec![NoteImage {
+                id: "img-1".into(),
+                description: Some("A whiteboard covered in sticky notes".into()),
+            }]
+        );
+        let again = conversation_document(&store, "kibo", &conversation_id).unwrap();
+        assert_eq!(document.body, again.body);
+        assert_eq!(document.content_sha256, again.content_sha256);
+    }
+
+    #[test]
+    fn image_identity_is_part_of_the_canonical_hash() {
+        let description = "the exact same description";
+        let events = |id: &str| {
+            [
+                json!({"kind":"image", "id":id, "recorded_at":1000}),
+                json!({"kind":"turn", "id":"turn-1", "images":[id]}),
+                json!({"kind":"description", "image":id, "text":description}),
+            ]
+        };
+        let (_dir_a, store_a, conversation_a) = seeded(&events("img-a"));
+        let (_dir_b, store_b, conversation_b) = seeded(&events("img-b"));
+
+        let first = conversation_document(&store_a, "kibo", &conversation_a).unwrap();
+        let second = conversation_document(&store_b, "kibo", &conversation_b).unwrap();
+
+        assert_ne!(first.body, second.body);
+        assert_ne!(first.content_sha256, second.content_sha256);
+    }
+
+    #[test]
+    fn pending_descriptions_are_omitted_until_the_value_lands() {
+        let (_dir, store, conversation_id) = seeded(&[
+            json!({"kind":"image", "id":"img-1", "recorded_at":1000, "caption":"from my desk"}),
+            json!({"kind":"turn", "id":"turn-1", "images":["img-1"]}),
+            json!({"kind":"reply", "turn":"turn-1", "text":"On it."}),
+        ]);
+
+        let pending = conversation_document(&store, "kibo", &conversation_id).unwrap();
+        assert_eq!(pending.body, "## You\n\nfrom my desk\n\n## Kibo\n\nOn it.");
+        assert!(pending.images.is_empty());
+
+        store
+            .append_fixture(
+                "kibo",
+                &conversation_id,
+                json!({"kind":"description", "image":"img-1", "text":"a tidy desk"}),
+            )
+            .unwrap();
+        let described = conversation_document(&store, "kibo", &conversation_id).unwrap();
+
+        assert_eq!(
+            described.body,
+            "## You\n\nfrom my desk\n[Image img-1: a tidy desk]\n\n## Kibo\n\nOn it."
+        );
+        assert_ne!(pending.content_sha256, described.content_sha256);
+    }
+
+    #[test]
+    fn terminal_description_failures_render_a_bare_reference_without_the_caption() {
+        let (_dir, store, conversation_id) = seeded(&[
+            json!({"kind":"image", "id":"img-1", "recorded_at":1000, "caption":"standup board"}),
+            json!({"kind":"turn", "id":"turn-1", "images":["img-1"]}),
+            json!({"kind":"description_error", "image":"img-1", "attempt":3, "terminal":true, "error":"blocked"}),
+        ]);
+
+        let document = conversation_document(&store, "kibo", &conversation_id).unwrap();
+
+        assert_eq!(document.body, "## You\n\nstandup board\n[Image img-1]");
+        // Caption uniformity: the caption appears once as user text and never
+        // inside the image reference line.
+        assert_eq!(document.body.matches("standup board").count(), 1);
+        assert_eq!(
+            document.images,
+            vec![NoteImage {
+                id: "img-1".into(),
+                description: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn description_authority_is_first_success() {
+        let (_dir, store, conversation_id) = seeded(&[
+            json!({"kind":"image", "id":"img-1", "recorded_at":1000}),
+            json!({"kind":"turn", "id":"turn-1", "images":["img-1"]}),
+            json!({"kind":"description", "image":"img-1", "text":"first description"}),
+            json!({"kind":"description", "image":"img-1", "text":"second description"}),
+        ]);
+
+        let document = conversation_document(&store, "kibo", &conversation_id).unwrap();
+
+        assert_eq!(document.body, "## You\n\n[Image img-1: first description]");
+    }
+
+    #[test]
+    fn unclaimed_described_images_render_trailing_sections() {
+        let (_dir, store, conversation_id) = seeded(&[
+            json!({"kind":"image", "id":"img-9", "recorded_at":1000}),
+            json!({"kind":"image", "id":"img-10", "recorded_at":2000}),
+            json!({"kind":"image", "id":"img-11", "recorded_at":3000}),
+            json!({"kind":"description", "image":"img-9", "text":"a stray photo"}),
+            json!({"kind":"description_error", "image":"img-11", "attempt":3, "terminal":true, "error":"blocked"}),
+        ]);
+
+        let document = conversation_document(&store, "kibo", &conversation_id).unwrap();
+
+        assert_eq!(document.body, "## You\n\n[Image img-9: a stray photo]");
+        assert_eq!(
+            document.images,
+            vec![NoteImage {
+                id: "img-9".into(),
+                description: Some("a stray photo".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn images_appendix_survives_hostile_descriptions() {
+        let hostile = format!(
+            "### Fake heading\n<a id=\"img-fake\"></a><script>alert(1)</script>[claim](sources/evil.md) {}",
+            "x".repeat(5000)
+        );
+        let (_dir, store, conversation_id) = seeded(&[
+            json!({"kind":"image", "id":"img-1", "recorded_at":1000}),
+            json!({"kind":"turn", "id":"turn-1", "images":["img-1"]}),
+            json!({"kind":"description", "image":"img-1", "text":hostile}),
+        ]);
+        let document = conversation_document(&store, "kibo", &conversation_id).unwrap();
+        let (_, instructions_hash) = instructions(&store, "kibo").unwrap();
+
+        let receipt =
+            commit_ingestion(&store, "kibo", &document, &instructions_hash, "# Note").unwrap();
+        let note = read_markdown(&store, "kibo", &format!("wiki/{}", receipt.wiki_file)).unwrap();
+
+        assert!(note.contains("\n## Images\n"));
+        assert!(note.contains("### Image img-1 <a id=\"img-img-1\"></a>"));
+        assert!(note.contains(&format!(
+            "![Image img-1](/v1/projects/kibo/conversations/{conversation_id}/images/img-1/content)"
+        )));
+        // The description renders as one escaped blockquote line: no raw
+        // HTML, no fake anchor, no heading, and the oversize tail is bounded.
+        let blockquote = note
+            .lines()
+            .find(|line| line.starts_with("> "))
+            .expect("appendix blockquote");
+        assert!(blockquote.starts_with("> \\#\\#\\# Fake heading"));
+        assert!(blockquote.contains("&lt;a id="));
+        assert!(!note.contains("<script"));
+        assert!(!note.contains("<a id=\"img-fake\""));
+        assert!(!note.contains("[claim]"));
+        assert!(blockquote.len() < 3 * 4096 + 16);
+    }
+
+    #[test]
+    fn image_free_notes_are_byte_identical_to_the_legacy_format() {
+        let (_dir, store, conversation_id) = seeded(&[
+            json!({"kind":"clip", "id":"clip-1", "recorded_at":1000}),
+            json!({"kind":"transcript", "clip":"clip-1", "text":"Keep it simple."}),
+            json!({"kind":"turn", "id":"turn-1", "clips":["clip-1"]}),
+            json!({"kind":"reply", "turn":"turn-1", "text":"Use values."}),
+            json!({"kind":"transcript", "clip":"clip-9", "text":"stray thought"}),
+        ]);
+        let document = conversation_document(&store, "kibo", &conversation_id).unwrap();
+        assert_eq!(
+            document.body,
+            "## You\n\nKeep it simple.\n\n## Kibo\n\nUse values.\n\n## You\n\nstray thought"
+        );
+
+        let receipt =
+            commit_ingestion(&store, "kibo", &document, "instructions-hash", "# Note\n\nBody.")
+                .unwrap();
+        let note = read_markdown(&store, "kibo", &format!("wiki/{}", receipt.wiki_file)).unwrap();
+
+        assert_eq!(
+            note,
+            format!(
+                "---\nsource_id: \"conversation:{conversation_id}\"\nsource_kind: conversation\ncontent_sha256: {}\ngeneration: 1\n---\n\n# Note\n\nBody.\n",
+                document.content_sha256
+            )
+        );
+    }
 
     #[test]
     fn conversation_hash_ignores_processing_events() {

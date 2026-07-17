@@ -1,7 +1,8 @@
-use crate::journal::JournalWrite;
+use crate::journal::{ImageFormat, JournalWrite};
 use crate::model::{
     ConversationNameSource, KiboConversation, KiboProject, epoch, make_id, valid_id,
 };
+use crate::workflow::{AttemptState, ConversationWorkflow};
 use anyhow::{Context, Result, anyhow, bail};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,13 @@ pub enum PutClip {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PutImage {
+    Created,
+    Repaired,
+    AlreadyExists,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PutRecordingPart {
     Created,
     AlreadyExists,
@@ -52,8 +60,16 @@ pub enum CompleteRecordingOutcome {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CreateTurnOutcome {
-    Created { record: Value, clips: Vec<String> },
-    Existing { record: Value, clips: Vec<String> },
+    Created {
+        record: Value,
+        clips: Vec<String>,
+        images: Vec<String>,
+    },
+    Existing {
+        record: Value,
+        clips: Vec<String>,
+        images: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +88,17 @@ impl std::fmt::Display for ClipConflict {
 }
 
 impl std::error::Error for ClipConflict {}
+
+#[derive(Debug)]
+pub struct ImageConflict;
+
+impl std::fmt::Display for ImageConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("image ID already exists with different content")
+    }
+}
+
+impl std::error::Error for ImageConflict {}
 
 #[derive(Debug)]
 pub struct RecordingConflict(pub String);
@@ -105,6 +132,19 @@ pub struct ClipUpload<'a> {
     pub duration_ms: u64,
     pub peak_pct: u32,
     pub recorded_at: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImageUpload<'a> {
+    pub project_id: &'a str,
+    pub conversation_id: &'a str,
+    pub image_id: &'a str,
+    pub bytes: &'a [u8],
+    pub expected_sha256: &'a str,
+    pub recorded_at: u64,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub caption: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -430,6 +470,15 @@ impl Store {
         self.append_value_unlocked(project_id, conversation_id, record.into_value()?)
     }
 
+    #[cfg(test)]
+    fn take_injected_append_failure(&self) -> bool {
+        self.fail_appends
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                (remaining > 0).then(|| remaining - 1)
+            })
+            == Ok(1)
+    }
+
     fn append_value_unlocked(
         &self,
         project_id: &str,
@@ -437,13 +486,7 @@ impl Store {
         mut record: Value,
     ) -> Result<Value> {
         #[cfg(test)]
-        if self
-            .fail_appends
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                (remaining > 0).then(|| remaining - 1)
-            })
-            == Ok(1)
-        {
+        if self.take_injected_append_failure() {
             bail!("injected journal append failure");
         }
         let path = self
@@ -459,6 +502,54 @@ impl Store {
         append_jsonl(&path, &record)?;
         self.record_activity_best_effort(project_id, conversation_id, record["at"].as_u64());
         Ok(record)
+    }
+
+    /// Append a batch of records as ONE multi-line write with a single fsync.
+    /// This buys convergent repairability, not atomic visibility: a crash
+    /// mid-batch leaves at most a torn final line for the tail repair, so an
+    /// idempotent re-entry can skip the durable prefix and append what is
+    /// missing. Returns every appended record in sequence order.
+    fn append_all_unlocked(
+        &self,
+        project_id: &str,
+        conversation_id: &str,
+        records: Vec<JournalWrite>,
+    ) -> Result<Vec<Value>> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        #[cfg(test)]
+        if self.take_injected_append_failure() {
+            bail!("injected journal append failure");
+        }
+        let path = self
+            .conversation_dir(project_id, conversation_id)
+            .join("turns.jsonl");
+        repair_jsonl_tail(&path)?;
+        let mut seq = next_seq(&path)?;
+        let at = epoch();
+        let mut values = Vec::with_capacity(records.len());
+        let mut lines = Vec::new();
+        for record in records {
+            let mut value = record.into_value()?;
+            let object = value
+                .as_object_mut()
+                .ok_or_else(|| anyhow!("event must be a JSON object"))?;
+            object.insert("seq".into(), seq.into());
+            object.entry("at").or_insert_with(|| at.into());
+            lines.extend(serde_json::to_vec(&value)?);
+            lines.push(b'\n');
+            values.push(value);
+            seq = seq
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("event sequence exhausted"))?;
+        }
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        file.write_all(&lines)?;
+        file.sync_all()?;
+        sync_parent(&path)?;
+        self.record_activity_best_effort(project_id, conversation_id, Some(at));
+        Ok(values)
     }
 
     /// Raw journal input is deliberately available only to tests that need to
@@ -526,11 +617,19 @@ impl Store {
         let existing = self
             .records_unlocked(upload.project_id, upload.conversation_id)?
             .into_iter()
-            .find(|record| record["kind"] == "clip" && record["id"] == upload.clip_id);
+            .find(|record| {
+                (record["kind"] == "clip" || record["kind"] == "image")
+                    && record["id"] == upload.clip_id
+            });
         let directory = self.conversation_dir(upload.project_id, upload.conversation_id);
         let filename = format!("{}.wav", upload.clip_id);
         let final_path = directory.join("clips").join(&filename);
         if let Some(existing) = existing {
+            // One media-ID namespace per conversation: an image already owns
+            // this ID, whatever the bytes.
+            if existing["kind"] == "image" {
+                return Err(ClipConflict.into());
+            }
             if existing["sha256"].as_str() == Some(&actual_sha) {
                 // Restore a missing/corrupt payload after an interrupted write or
                 // external damage. Persist the reopen intent before replacing
@@ -578,6 +677,140 @@ impl Store {
             ),
         )?;
         Ok((PutClip::Created, Some(record)))
+    }
+
+    /// Commit an image with the clip durability contract: sha verify →
+    /// conversation lock → existing-event scan → atomic payload write → append.
+    /// Returns every event appended by this request in sequence order so the
+    /// API can publish them without a broadcast gap.
+    pub fn put_image(&self, upload: ImageUpload<'_>) -> Result<(PutImage, Vec<Value>)> {
+        self.conversation(upload.project_id, upload.conversation_id)?;
+        self.check_id(upload.image_id)?;
+        let format = sniff_image_format(upload.bytes)
+            .ok_or_else(|| anyhow!("body must be a JPEG, PNG, or WebP image"))?;
+        let actual_sha = hex_sha256(upload.bytes);
+        if !actual_sha.eq_ignore_ascii_case(upload.expected_sha256) {
+            bail!("content SHA-256 does not match X-Content-Sha256");
+        }
+        let lock = self.conversation_lock(upload.project_id, upload.conversation_id);
+        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let records = self.records_unlocked(upload.project_id, upload.conversation_id)?;
+        // One media-ID namespace: the scan covers clips too, and a clip with
+        // this ID is always a conflict.
+        let existing = records
+            .iter()
+            .find(|record| {
+                (record["kind"] == "image" || record["kind"] == "clip")
+                    && record["id"] == upload.image_id
+            })
+            .cloned();
+        let directory = self.conversation_dir(upload.project_id, upload.conversation_id);
+        let images_directory = directory.join("images");
+        fs::create_dir_all(&images_directory)?;
+        sync_directory_chain(&images_directory, &directory)?;
+
+        if let Some(existing) = existing {
+            if existing["kind"] == "clip" {
+                return Err(ImageConflict.into());
+            }
+            if existing["sha256"].as_str() != Some(actual_sha.as_str()) {
+                return Err(ImageConflict.into());
+            }
+            // Same bytes always sniff to the durable format, so the event's
+            // extension is authoritative; fall back to the sniff defensively.
+            let extension = existing["file"]
+                .as_str()
+                .and_then(|file| file.rsplit('.').next())
+                .filter(|extension| IMAGE_EXTENSIONS.contains(extension))
+                .unwrap_or(format.extension());
+            self.check_alternate_image_extensions(&images_directory, upload.image_id, extension)?;
+            let final_path = images_directory.join(format!("{}.{extension}", upload.image_id));
+            if file_sha256(&final_path).as_deref() == Some(actual_sha.as_str()) {
+                return Ok((PutImage::AlreadyExists, Vec::new()));
+            }
+            // Restore a missing/corrupt payload. Persist every reopen intent
+            // BEFORE replacing the bytes, as one batched single-fsync append:
+            // a crash or append failure must not turn a completed repair into
+            // an indistinguishable, workflow-inert replay, and a failed batch
+            // leaves the bytes unrestored so the client's retry re-enters this
+            // idempotent path (already-open work is skipped, the missing
+            // intents are appended, then the bytes land).
+            let workflow = ConversationWorkflow::from_records(&records);
+            let mut reopens = Vec::new();
+            for turn in workflow.turns() {
+                if turn.images.iter().any(|image| image == upload.image_id)
+                    && reopen_after_repair(&turn.reply)
+                {
+                    reopens.push(JournalWrite::reply_retry_requested(
+                        &turn.id,
+                        "payload_repaired",
+                    ));
+                }
+            }
+            if workflow
+                .image(upload.image_id)
+                .is_some_and(|image| reopen_after_repair(&image.description))
+            {
+                reopens.push(JournalWrite::description_retry_requested(
+                    upload.image_id,
+                    "payload_repaired",
+                ));
+            }
+            let events =
+                self.append_all_unlocked(upload.project_id, upload.conversation_id, reopens)?;
+            write_file_atomic(&final_path, upload.bytes, "upload")?;
+            return Ok((PutImage::Repaired, events));
+        }
+
+        // No durable event: the sniffed format is the extension authority. A
+        // crash-left payload under a different extension is a conflict, never
+        // silently superseded; a matching-extension payload without an event
+        // is adopted only when its content agrees with this retry.
+        self.check_alternate_image_extensions(
+            &images_directory,
+            upload.image_id,
+            format.extension(),
+        )?;
+        let final_path =
+            images_directory.join(format!("{}.{}", upload.image_id, format.extension()));
+        if final_path.exists() {
+            if file_sha256(&final_path).as_deref() != Some(actual_sha.as_str()) {
+                return Err(ImageConflict.into());
+            }
+        } else {
+            write_file_atomic(&final_path, upload.bytes, "upload")?;
+        }
+        let record = self.append_unlocked(
+            upload.project_id,
+            upload.conversation_id,
+            JournalWrite::image(
+                upload.image_id,
+                format,
+                actual_sha,
+                upload.recorded_at,
+                upload.width,
+                upload.height,
+                upload.caption.clone(),
+            ),
+        )?;
+        Ok((PutImage::Created, vec![record]))
+    }
+
+    fn check_alternate_image_extensions(
+        &self,
+        images_directory: &Path,
+        image_id: &str,
+        extension: &str,
+    ) -> Result<()> {
+        for other in IMAGE_EXTENSIONS.iter().filter(|other| **other != extension) {
+            if images_directory
+                .join(format!("{image_id}.{other}"))
+                .exists()
+            {
+                return Err(ImageConflict.into());
+            }
+        }
+        Ok(())
     }
 
     /// Durably stage one independently retryable piece of a recording. Staged
@@ -641,6 +874,7 @@ impl Store {
     /// Assemble all staged parts into one canonical WAV and expose it with one
     /// ordinary clip event. The final WAV rename precedes the event append, so
     /// the only crash orphan is a complete payload that a retry can verify.
+    /// Recording IDs share the one media-ID namespace with clips and images.
     pub fn complete_recording(
         &self,
         completion: RecordingCompletion<'_>,
@@ -664,8 +898,17 @@ impl Store {
         let existing = self
             .records_unlocked(completion.project_id, completion.conversation_id)?
             .into_iter()
-            .find(|record| record["kind"] == "clip" && record["id"] == completion.recording_id);
+            .find(|record| {
+                (record["kind"] == "clip" || record["kind"] == "image")
+                    && record["id"] == completion.recording_id
+            });
 
+        if existing
+            .as_ref()
+            .is_some_and(|record| record["kind"] == "image")
+        {
+            return Err(RecordingConflict("recording ID already names an image".into()).into());
+        }
         if let Some(existing) = existing.as_ref() {
             if existing["part_count"].as_u64() != Some(u64::from(completion.part_count))
                 || existing["samples"].as_u64() != Some(completion.total_samples)
@@ -781,6 +1024,30 @@ impl Store {
             .join(format!("{clip_id}.wav")))
     }
 
+    /// Resolve an image payload path. Bytes for an ID are hash-pinned and at
+    /// most one extension can ever exist (alternates are upload conflicts), so
+    /// the existing file is authoritative; a missing payload resolves to the
+    /// canonical JPEG path so callers surface an ordinary read error.
+    pub fn image_path(
+        &self,
+        project_id: &str,
+        conversation_id: &str,
+        image_id: &str,
+    ) -> Result<PathBuf> {
+        self.check_pair(project_id, conversation_id)?;
+        self.check_id(image_id)?;
+        let images_directory = self
+            .conversation_dir(project_id, conversation_id)
+            .join("images");
+        for extension in IMAGE_EXTENSIONS {
+            let path = images_directory.join(format!("{image_id}.{extension}"));
+            if path.exists() {
+                return Ok(path);
+            }
+        }
+        Ok(images_directory.join(format!("{image_id}.jpg")))
+    }
+
     fn recording_parts_dir(
         &self,
         project_id: &str,
@@ -812,9 +1079,9 @@ impl Store {
         Ok(unclaimed_clip_ids(&records))
     }
 
-    /// Atomically create an AI turn and claim every clip that was pending at
-    /// that instant. A retry with the same turn ID returns the original claim;
-    /// a new turn with no pending clips is rejected.
+    /// Atomically create an AI turn and claim every clip and image that was
+    /// pending at that instant. A retry with the same turn ID returns the
+    /// original claim; a new turn with nothing to claim is rejected.
     pub fn create_turn(
         &self,
         project_id: &str,
@@ -836,23 +1103,27 @@ impl Store {
             .find(|record| record["kind"] == "turn" && record["id"] == turn_id)
         {
             let clips = turn_clips(record)?;
+            let images = turn_images(record);
             return Ok(CreateTurnOutcome::Existing {
                 record: record.clone(),
                 clips,
+                images,
             });
         }
 
         let clips = unclaimed_clip_ids(&records);
-        if clips.is_empty() {
+        let images = unclaimed_image_ids(&records);
+        if clips.is_empty() && images.is_empty() {
             return Err(NoPendingClips.into());
         }
         let record = self.append_unlocked(
             project_id,
             conversation_id,
-            JournalWrite::turn(turn_id, clips),
+            JournalWrite::turn(turn_id, clips, images),
         )?;
         Ok(CreateTurnOutcome::Created {
             clips: turn_clips(&record)?,
+            images: turn_images(&record),
             record,
         })
     }
@@ -936,6 +1207,33 @@ impl Store {
 const RECORDING_SAMPLE_RATE: u32 = 16_000;
 const CANONICAL_WAV_HEADER_LEN: usize = 44;
 const MAX_RECORDING_PARTS: u32 = 10_000;
+const IMAGE_EXTENSIONS: [&str; 3] = ["jpg", "png", "webp"];
+
+/// Magic-byte sniff for the accepted image encodings; the sniff is the mime
+/// authority, so anything else (HEIC included) is rejected at the door.
+pub(crate) fn sniff_image_format(bytes: &[u8]) -> Option<ImageFormat> {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some(ImageFormat::Jpeg)
+    } else if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        Some(ImageFormat::Png)
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some(ImageFormat::Webp)
+    } else {
+        None
+    }
+}
+
+/// Which stages a payload repair reopens. Due work is already open and will
+/// rerun with the restored bytes (the inert-replay rule), and a durable
+/// success stays authoritative; everything else — attempting, scheduled, or
+/// terminal — may rest on the corrupt payload and is reopened. In-flight
+/// attempts are superseded by the conditional result protocol.
+fn reopen_after_repair<T, F>(state: &AttemptState<T, F>) -> bool {
+    !matches!(
+        state,
+        AttemptState::Succeeded(_) | AttemptState::Due { .. }
+    )
+}
 
 #[derive(Debug, Clone, Copy)]
 struct CanonicalWav {
@@ -1195,20 +1493,28 @@ fn turn_clips(record: &Value) -> Result<Vec<String>> {
 }
 
 fn unclaimed_clip_ids(records: &[Value]) -> Vec<String> {
+    unclaimed_media_ids(records, "clip", "clips")
+}
+
+fn unclaimed_image_ids(records: &[Value]) -> Vec<String> {
+    unclaimed_media_ids(records, "image", "images")
+}
+
+fn unclaimed_media_ids(records: &[Value], kind: &str, claim_field: &str) -> Vec<String> {
     let claimed: HashSet<&str> = records
         .iter()
         .filter(|record| record["kind"] == "turn")
         .flat_map(|record| {
-            record["clips"]
+            record[claim_field]
                 .as_array()
                 .into_iter()
                 .flatten()
                 .filter_map(Value::as_str)
         })
         .collect();
-    let mut clips: Vec<(u64, u64, String)> = records
+    let mut media: Vec<(u64, u64, String)> = records
         .iter()
-        .filter(|record| record["kind"] == "clip")
+        .filter(|record| record["kind"] == kind)
         .filter_map(|record| {
             let id = record["id"].as_str()?;
             (!claimed.contains(id)).then(|| {
@@ -1220,8 +1526,18 @@ fn unclaimed_clip_ids(records: &[Value]) -> Vec<String> {
             })
         })
         .collect();
-    clips.sort_by_key(|(recorded_at, seq, _)| (*recorded_at, *seq));
-    clips.into_iter().map(|(_, _, id)| id).collect()
+    media.sort_by_key(|(recorded_at, seq, _)| (*recorded_at, *seq));
+    media.into_iter().map(|(_, _, id)| id).collect()
+}
+
+fn turn_images(record: &Value) -> Vec<String> {
+    record["images"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect()
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
@@ -1963,7 +2279,7 @@ mod tests {
         let existing = store.create_turn("kibo", "general", "turn-1").unwrap();
         assert!(matches!(created, CreateTurnOutcome::Created { .. }));
         assert!(matches!(existing, CreateTurnOutcome::Existing { .. }));
-        let CreateTurnOutcome::Created { record, clips } = created else {
+        let CreateTurnOutcome::Created { record, clips, .. } = created else {
             unreachable!()
         };
         assert_eq!(clips, ["clip-older", "clip-1"]);
@@ -2284,6 +2600,542 @@ mod tests {
         };
         assert_eq!(named.name.chars().count(), 60);
         assert!(named.name.chars().all(|character| character == 'é'));
+    }
+
+    fn test_jpeg(payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xE0];
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn test_png(payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn image_upload<'a>(image_id: &'a str, bytes: &'a [u8], sha: &'a str) -> ImageUpload<'a> {
+        ImageUpload {
+            project_id: "kibo",
+            conversation_id: "general",
+            image_id,
+            bytes,
+            expected_sha256: sha,
+            recorded_at: 1,
+            width: None,
+            height: None,
+            caption: None,
+        }
+    }
+
+    #[test]
+    fn image_format_sniffing_is_the_mime_authority() {
+        assert_eq!(
+            sniff_image_format(&test_jpeg(b"pixels")),
+            Some(ImageFormat::Jpeg)
+        );
+        assert_eq!(
+            sniff_image_format(&test_png(b"pixels")),
+            Some(ImageFormat::Png)
+        );
+        let mut webp = b"RIFF".to_vec();
+        webp.extend_from_slice(&[0, 0, 0, 0]);
+        webp.extend_from_slice(b"WEBPpixels");
+        assert_eq!(sniff_image_format(&webp), Some(ImageFormat::Webp));
+
+        // HEIC, WAV, and garbage are rejected at the door.
+        assert_eq!(sniff_image_format(b"\x00\x00\x00\x18ftypheic\x00\x00"), None);
+        assert_eq!(sniff_image_format(b"RIFF0000WAVEfmt "), None);
+        assert_eq!(sniff_image_format(b"plain text"), None);
+        assert_eq!(sniff_image_format(b""), None);
+    }
+
+    #[test]
+    fn image_upload_is_idempotent_by_id_and_hash() {
+        let (_temporary, store) = store_with_general();
+        let bytes = test_jpeg(b"pixels");
+        let sha = hex_sha256(&bytes);
+        let (outcome, events) = store.put_image(image_upload("img-1", &bytes, &sha)).unwrap();
+        assert_eq!(outcome, PutImage::Created);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["kind"], "image");
+        assert_eq!(events[0]["file"], "images/img-1.jpg");
+        assert_eq!(events[0]["mime"], "image/jpeg");
+
+        let (outcome, events) = store.put_image(image_upload("img-1", &bytes, &sha)).unwrap();
+        assert_eq!(outcome, PutImage::AlreadyExists);
+        assert!(events.is_empty());
+        assert_eq!(store.records("kibo", "general").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn image_upload_conflicts_on_different_bytes_and_cross_kind_ids() {
+        let (_temporary, store) = store_with_general();
+        let bytes = test_jpeg(b"pixels");
+        let sha = hex_sha256(&bytes);
+        store.put_image(image_upload("img-1", &bytes, &sha)).unwrap();
+
+        let different = test_jpeg(b"other pixels");
+        let different_sha = hex_sha256(&different);
+        let error = store
+            .put_image(image_upload("img-1", &different, &different_sha))
+            .unwrap_err();
+        assert!(error.downcast_ref::<ImageConflict>().is_some());
+        let path = store.image_path("kibo", "general", "img-1").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+
+        // One media-ID namespace: a clip cannot take an image's ID and an
+        // image cannot take a clip's, whatever the bytes.
+        let wav = b"RIFF tiny fake wav";
+        let wav_sha = hex_sha256(wav);
+        let clip_error = store
+            .put_clip(ClipUpload {
+                project_id: "kibo",
+                conversation_id: "general",
+                clip_id: "img-1",
+                bytes: wav,
+                expected_sha256: &wav_sha,
+                duration_ms: 1,
+                peak_pct: 1,
+                recorded_at: 1,
+            })
+            .unwrap_err();
+        assert!(clip_error.downcast_ref::<ClipConflict>().is_some());
+
+        store
+            .put_clip(ClipUpload {
+                project_id: "kibo",
+                conversation_id: "general",
+                clip_id: "clip-1",
+                bytes: wav,
+                expected_sha256: &wav_sha,
+                duration_ms: 1,
+                peak_pct: 1,
+                recorded_at: 1,
+            })
+            .unwrap();
+        let image_error = store
+            .put_image(image_upload("clip-1", &bytes, &sha))
+            .unwrap_err();
+        assert!(image_error.downcast_ref::<ImageConflict>().is_some());
+    }
+
+    #[test]
+    fn image_file_without_event_is_adopted_by_matching_retry() {
+        let (_temporary, store) = store_with_general();
+        let bytes = test_jpeg(b"pixels");
+        let sha = hex_sha256(&bytes);
+        let directory = store.conversation_dir("kibo", "general").join("images");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("img-1.jpg"), &bytes).unwrap();
+
+        let (outcome, events) = store.put_image(image_upload("img-1", &bytes, &sha)).unwrap();
+        assert_eq!(outcome, PutImage::Created);
+        assert_eq!(events.len(), 1);
+
+        // Different orphan bytes are never overwritten.
+        fs::write(directory.join("img-2.jpg"), b"unrelated").unwrap();
+        let error = store
+            .put_image(image_upload("img-2", &bytes, &sha))
+            .unwrap_err();
+        assert!(error.downcast_ref::<ImageConflict>().is_some());
+        assert_eq!(fs::read(directory.join("img-2.jpg")).unwrap(), b"unrelated");
+    }
+
+    #[test]
+    fn crash_left_alternate_extension_is_a_conflict_never_superseded() {
+        let (_temporary, store) = store_with_general();
+        let directory = store.conversation_dir("kibo", "general").join("images");
+        fs::create_dir_all(&directory).unwrap();
+        // A crash-left PNG under this ID: a JPEG retry must conflict, both
+        // before an event exists and after one is forged for the JPEG.
+        fs::write(directory.join("img-1.png"), test_png(b"crash leftover")).unwrap();
+        let bytes = test_jpeg(b"pixels");
+        let sha = hex_sha256(&bytes);
+        let error = store
+            .put_image(image_upload("img-1", &bytes, &sha))
+            .unwrap_err();
+        assert!(error.downcast_ref::<ImageConflict>().is_some());
+        assert!(store.records("kibo", "general").unwrap().is_empty());
+
+        let (outcome, _) = store.put_image(image_upload("img-2", &bytes, &sha)).unwrap();
+        assert_eq!(outcome, PutImage::Created);
+        fs::write(directory.join("img-2.webp"), b"other leftover").unwrap();
+        let error = store
+            .put_image(image_upload("img-2", &bytes, &sha))
+            .unwrap_err();
+        assert!(error.downcast_ref::<ImageConflict>().is_some());
+    }
+
+    #[test]
+    fn image_repair_appends_reopen_intents_before_restoring_bytes() {
+        let (_temporary, store) = store_with_general();
+        let bytes = test_jpeg(b"pixels");
+        let sha = hex_sha256(&bytes);
+        store.put_image(image_upload("img-1", &bytes, &sha)).unwrap();
+        // Two claiming turns in non-successful reply states plus a terminal
+        // description: repair must reopen all of them, in one batch.
+        store
+            .append_fixture(
+                "kibo",
+                "general",
+                json!({"kind":"turn", "id":"turn-1", "clips":[], "images":["img-1"]}),
+            )
+            .unwrap();
+        store
+            .append_fixture(
+                "kibo",
+                "general",
+                json!({"kind":"reply_error", "turn":"turn-1", "attempt":1, "terminal":true, "stage":"reply", "error":"corrupt input"}),
+            )
+            .unwrap();
+        store
+            .append_fixture(
+                "kibo",
+                "general",
+                json!({"kind":"turn", "id":"turn-2", "clips":[], "images":["img-1"]}),
+            )
+            .unwrap();
+        store
+            .append_fixture(
+                "kibo",
+                "general",
+                json!({"kind":"reply_started", "turn":"turn-2", "attempt":1}),
+            )
+            .unwrap();
+        store
+            .append_fixture(
+                "kibo",
+                "general",
+                json!({"kind":"description_error", "image":"img-1", "attempt":1, "terminal":true, "error":"corrupt input"}),
+            )
+            .unwrap();
+        let path = store.image_path("kibo", "general", "img-1").unwrap();
+        fs::write(&path, b"damaged").unwrap();
+
+        let (outcome, events) = store.put_image(image_upload("img-1", &bytes, &sha)).unwrap();
+        assert_eq!(outcome, PutImage::Repaired);
+        let kinds: Vec<(&str, &str)> = events
+            .iter()
+            .map(|event| {
+                (
+                    event["kind"].as_str().unwrap(),
+                    event["turn"].as_str().or(event["image"].as_str()).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("reply_retry_requested", "turn-1"),
+                ("reply_retry_requested", "turn-2"),
+                ("description_retry_requested", "img-1"),
+            ]
+        );
+        // Contiguous sequence numbers: the API can publish without a WS gap.
+        let seqs: Vec<u64> = events
+            .iter()
+            .map(|event| event["seq"].as_u64().unwrap())
+            .collect();
+        assert!(seqs.windows(2).all(|pair| pair[1] == pair[0] + 1));
+        assert!(
+            events
+                .iter()
+                .all(|event| event["reason"] == "payload_repaired")
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+
+        // Replay after repair is inert: the reopened stages are Due (open
+        // work), so nothing is appended twice.
+        let (outcome, events) = store.put_image(image_upload("img-1", &bytes, &sha)).unwrap();
+        assert_eq!(outcome, PutImage::AlreadyExists);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn failed_repair_batch_restores_nothing_and_reentry_converges() {
+        let (_temporary, store) = store_with_general();
+        let bytes = test_jpeg(b"pixels");
+        let sha = hex_sha256(&bytes);
+        store.put_image(image_upload("img-1", &bytes, &sha)).unwrap();
+        store
+            .append_fixture(
+                "kibo",
+                "general",
+                json!({"kind":"turn", "id":"turn-1", "clips":[], "images":["img-1"]}),
+            )
+            .unwrap();
+        store
+            .append_fixture(
+                "kibo",
+                "general",
+                json!({"kind":"reply_error", "turn":"turn-1", "attempt":1, "terminal":true, "stage":"reply", "error":"corrupt input"}),
+            )
+            .unwrap();
+        store
+            .append_fixture(
+                "kibo",
+                "general",
+                json!({"kind":"description_error", "image":"img-1", "attempt":1, "terminal":true, "error":"corrupt input"}),
+            )
+            .unwrap();
+        let path = store.image_path("kibo", "general", "img-1").unwrap();
+        fs::write(&path, b"damaged").unwrap();
+
+        // The batched intent write fails: no event is durable and the bytes
+        // are NOT restored, so the failure cannot masquerade as a repair.
+        store.fail_append_after(0);
+        assert!(store.put_image(image_upload("img-1", &bytes, &sha)).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"damaged");
+        assert_eq!(store.records("kibo", "general").unwrap().len(), 4);
+
+        // Idempotent re-entry appends the missing intents, then restores.
+        let (outcome, events) = store.put_image(image_upload("img-1", &bytes, &sha)).unwrap();
+        assert_eq!(outcome, PutImage::Repaired);
+        assert_eq!(events.len(), 2);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            store.put_image(image_upload("img-1", &bytes, &sha)).unwrap(),
+            (PutImage::AlreadyExists, Vec::new())
+        );
+    }
+
+    #[test]
+    fn repair_batch_durable_but_bytes_unrestored_converges_on_retry() {
+        // Crash window: the intent batch committed but the process died
+        // before the bytes were restored. Re-entry must append nothing new
+        // (the reopened stages are Due) and still restore the payload.
+        let (_temporary, store) = store_with_general();
+        let bytes = test_jpeg(b"pixels");
+        let sha = hex_sha256(&bytes);
+        store.put_image(image_upload("img-1", &bytes, &sha)).unwrap();
+        store
+            .append_fixture(
+                "kibo",
+                "general",
+                json!({"kind":"turn", "id":"turn-1", "clips":[], "images":["img-1"]}),
+            )
+            .unwrap();
+        store
+            .append_fixture(
+                "kibo",
+                "general",
+                json!({"kind":"reply_error", "turn":"turn-1", "attempt":1, "terminal":true, "stage":"reply", "error":"corrupt input"}),
+            )
+            .unwrap();
+        store
+            .append_fixture(
+                "kibo",
+                "general",
+                json!({"kind":"reply_retry_requested", "turn":"turn-1", "reason":"payload_repaired"}),
+            )
+            .unwrap();
+        let path = store.image_path("kibo", "general", "img-1").unwrap();
+        fs::write(&path, b"damaged").unwrap();
+        let records_before = store.records("kibo", "general").unwrap().len();
+
+        let (outcome, events) = store.put_image(image_upload("img-1", &bytes, &sha)).unwrap();
+        assert_eq!(outcome, PutImage::Repaired);
+        assert!(events.is_empty());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(store.records("kibo", "general").unwrap().len(), records_before);
+    }
+
+    #[test]
+    fn torn_repair_batch_tail_repairs_and_reentry_appends_missing_intents() {
+        // Crash window: the batch tore mid-write — a durable reply reopen
+        // plus a partial final line. Re-entry must repair the tail, skip the
+        // already-open reply, append only the missing description intent,
+        // then restore the bytes.
+        let (_temporary, store) = store_with_general();
+        let bytes = test_jpeg(b"pixels");
+        let sha = hex_sha256(&bytes);
+        store.put_image(image_upload("img-1", &bytes, &sha)).unwrap();
+        store
+            .append_fixture(
+                "kibo",
+                "general",
+                json!({"kind":"turn", "id":"turn-1", "clips":[], "images":["img-1"]}),
+            )
+            .unwrap();
+        store
+            .append_fixture(
+                "kibo",
+                "general",
+                json!({"kind":"reply_error", "turn":"turn-1", "attempt":1, "terminal":true, "stage":"reply", "error":"corrupt input"}),
+            )
+            .unwrap();
+        store
+            .append_fixture(
+                "kibo",
+                "general",
+                json!({"kind":"description_error", "image":"img-1", "attempt":1, "terminal":true, "error":"corrupt input"}),
+            )
+            .unwrap();
+        store
+            .append_fixture(
+                "kibo",
+                "general",
+                json!({"kind":"reply_retry_requested", "turn":"turn-1", "reason":"payload_repaired"}),
+            )
+            .unwrap();
+        let journal = store.conversation_dir("kibo", "general").join("turns.jsonl");
+        {
+            use std::io::Write as _;
+            let mut file = fs::OpenOptions::new().append(true).open(&journal).unwrap();
+            file.write_all(br#"{"kind":"description_retry_req"#).unwrap();
+        }
+        let path = store.image_path("kibo", "general", "img-1").unwrap();
+        fs::write(&path, b"damaged").unwrap();
+
+        let (outcome, events) = store.put_image(image_upload("img-1", &bytes, &sha)).unwrap();
+        assert_eq!(outcome, PutImage::Repaired);
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["description_retry_requested"]);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        // The torn tail is gone: every journal line parses.
+        for line in fs::read_to_string(&journal).unwrap().lines() {
+            serde_json::from_str::<Value>(line).unwrap();
+        }
+    }
+
+    #[test]
+    fn image_repair_skips_open_work_and_successful_values() {
+        let (_temporary, store) = store_with_general();
+        let bytes = test_jpeg(b"pixels");
+        let sha = hex_sha256(&bytes);
+        store.put_image(image_upload("img-1", &bytes, &sha)).unwrap();
+        // Successful reply and description: repair restores bytes silently.
+        store
+            .append_fixture(
+                "kibo",
+                "general",
+                json!({"kind":"turn", "id":"turn-1", "clips":[], "images":["img-1"]}),
+            )
+            .unwrap();
+        store
+            .append_fixture(
+                "kibo",
+                "general",
+                json!({"kind":"reply", "turn":"turn-1", "text":"answered"}),
+            )
+            .unwrap();
+        store
+            .append_fixture(
+                "kibo",
+                "general",
+                json!({"kind":"description", "image":"img-1", "text":"a photo", "attempt":1, "model":"mock", "prompt_version":1}),
+            )
+            .unwrap();
+        let path = store.image_path("kibo", "general", "img-1").unwrap();
+        fs::write(&path, b"damaged").unwrap();
+
+        let (outcome, events) = store.put_image(image_upload("img-1", &bytes, &sha)).unwrap();
+        assert_eq!(outcome, PutImage::Repaired);
+        assert!(events.is_empty(), "first success stays authoritative");
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn create_turn_claims_pending_images_sorted_by_recorded_at() {
+        let (_temporary, store) = store_with_general();
+        let wav = b"RIFF tiny fake wav";
+        let wav_sha = hex_sha256(wav);
+        store
+            .put_clip(ClipUpload {
+                project_id: "kibo",
+                conversation_id: "general",
+                clip_id: "clip-1",
+                bytes: wav,
+                expected_sha256: &wav_sha,
+                duration_ms: 1,
+                peak_pct: 1,
+                recorded_at: 2,
+            })
+            .unwrap();
+        let bytes = test_jpeg(b"pixels");
+        let sha = hex_sha256(&bytes);
+        store
+            .put_image(ImageUpload {
+                recorded_at: 3,
+                ..image_upload("img-late", &bytes, &sha)
+            })
+            .unwrap();
+        store
+            .put_image(ImageUpload {
+                recorded_at: 1,
+                ..image_upload("img-early", &bytes, &sha)
+            })
+            .unwrap();
+
+        let CreateTurnOutcome::Created {
+            record,
+            clips,
+            images,
+        } = store.create_turn("kibo", "general", "turn-1").unwrap()
+        else {
+            panic!("expected a new turn");
+        };
+        assert_eq!(clips, ["clip-1"]);
+        assert_eq!(images, ["img-early", "img-late"]);
+        assert_eq!(record["images"], json!(["img-early", "img-late"]));
+
+        // Idempotent replay returns the original claim.
+        let CreateTurnOutcome::Existing { images, .. } =
+            store.create_turn("kibo", "general", "turn-1").unwrap()
+        else {
+            panic!("expected the existing turn");
+        };
+        assert_eq!(images, ["img-early", "img-late"]);
+        // Everything claimed: a new turn has nothing to answer.
+        assert!(store.create_turn("kibo", "general", "turn-2").is_err());
+    }
+
+    #[test]
+    fn image_only_turn_is_legal_and_empty_turn_still_conflicts() {
+        let (_temporary, store) = store_with_general();
+        assert!(
+            store
+                .create_turn("kibo", "general", "turn-none")
+                .unwrap_err()
+                .downcast_ref::<NoPendingClips>()
+                .is_some()
+        );
+        let bytes = test_jpeg(b"pixels");
+        let sha = hex_sha256(&bytes);
+        store.put_image(image_upload("img-1", &bytes, &sha)).unwrap();
+        let CreateTurnOutcome::Created { clips, images, record } =
+            store.create_turn("kibo", "general", "turn-1").unwrap()
+        else {
+            panic!("expected a new turn");
+        };
+        assert!(clips.is_empty());
+        assert_eq!(images, ["img-1"]);
+        assert_eq!(record["clips"], json!([]));
+    }
+
+    #[test]
+    fn recording_ids_cannot_collide_with_images() {
+        let (_temporary, store) = store_with_general();
+        let bytes = test_jpeg(b"pixels");
+        let sha = hex_sha256(&bytes);
+        store
+            .put_image(image_upload("shared-id", &bytes, &sha))
+            .unwrap();
+        put_test_part(&store, "shared-id", 0, &[1, 2]).unwrap();
+        let error = store
+            .complete_recording(RecordingCompletion {
+                project_id: "kibo",
+                conversation_id: "general",
+                recording_id: "shared-id",
+                part_count: 1,
+                total_samples: 2,
+            })
+            .unwrap_err();
+        assert!(error.downcast_ref::<RecordingConflict>().is_some());
     }
 
     #[test]

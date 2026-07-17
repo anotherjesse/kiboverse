@@ -1085,6 +1085,34 @@
     if (reply) { event.preventDefault(); toggleReply(reply); }
   });
 
+  // Timeline forms are re-rendered on every refresh, so retries are handled
+  // by delegation: post in place and let the journal broadcast refresh the
+  // fragment with the reopened state.
+  document.addEventListener("submit", (event) => {
+    const form = event.target.closest?.("form[data-timeline-retry]");
+    if (!form) return;
+    event.preventDefault();
+    if (form.dataset.submitting === "true") return;
+    form.dataset.submitting = "true";
+    const button = form.querySelector("button");
+    if (button) button.disabled = true;
+    fetch(form.action, { method: "POST" })
+      .then((response) => {
+        if (!response.ok) throw new Error(`retry failed: ${response.status}`);
+        // Success: the journal broadcast refreshes the fragment, which
+        // replaces this form wholesale.
+      })
+      .catch((error) => {
+        console.warn("retry request failed", error);
+      })
+      .finally(() => {
+        if (form.isConnected) {
+          delete form.dataset.submitting;
+          if (button) button.disabled = false;
+        }
+      });
+  });
+
   for (const type of ["play", "playing", "pause", "ended"]) {
     document.addEventListener(type, (event) => {
       if (!(event.target instanceof HTMLAudioElement)) return;

@@ -338,6 +338,43 @@ h1 {
   line-height: 1.55;
 }
 
+/* Photo bubbles: the image is the content; the link opens the original. */
+.message.image {
+  max-width: min(26rem, 78vw);
+  padding: 0.35rem;
+}
+
+.message.image img {
+  /* Thumbnail scale in the timeline; the wrapping link opens the original. */
+  display: block;
+  max-width: 100%;
+  max-height: 19rem;
+  width: auto;
+  height: auto;
+  border-radius: 0.7rem;
+}
+
+.message.image figcaption {
+  padding: 0.4rem 0.45rem 0.15rem;
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.4;
+}
+
+.message.image .description-retry {
+  padding: 0.3rem 0.45rem 0.15rem;
+}
+
+.message.image .description-retry button {
+  border: 0;
+  padding: 0;
+  background: none;
+  color: var(--muted);
+  font-size: 0.74rem;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
 .composer {
   position: fixed;
   z-index: 10;
@@ -695,6 +732,7 @@ body[data-knowledge-busy="true"] form[data-knowledge-action] button { cursor: wa
 .markdown-body h3 { font-size: 1.25rem; }
 .markdown-body p,
 .markdown-body li { overflow-wrap: anywhere; }
+.markdown-body img { max-width: 100%; height: auto; border-radius: 0.5rem; }
 .markdown-body code { padding: 0.12rem 0.3rem; border-radius: 0.3rem; background: rgba(24, 32, 29, 0.07); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.88em; }
 .markdown-body pre { overflow-x: auto; padding: 1rem; border-radius: 0.7rem; background: #202622; color: #f4f1e8; }
 .markdown-body pre code { padding: 0; background: none; color: inherit; }
@@ -1151,3 +1189,27 @@ body[data-knowledge-busy="true"] form[data-knowledge-action] button { cursor: wa
   .knowledge-query-message.is-streaming .knowledge-query-message-body::after,
   .knowledge-query-activity li[data-status="running"] .query-activity-indicator { animation: none; }
 }
+
+.media-gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 1rem;
+}
+.media-card { margin: 0; }
+.media-card img {
+  width: 100%;
+  aspect-ratio: 1;
+  object-fit: cover;
+  border-radius: 0.75rem;
+  display: block;
+  background: rgba(0, 0, 0, 0.04);
+}
+.media-card figcaption {
+  font-size: 0.8rem;
+  margin-top: 0.35rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  overflow-wrap: anywhere;
+}
+.media-card .media-meta { opacity: 0.65; }

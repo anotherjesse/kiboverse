@@ -10,6 +10,34 @@ use serde_json::Value;
 #[derive(Debug)]
 pub(crate) struct JournalWrite(JournalWriteKind);
 
+/// The three accepted image encodings. The sniffed format is the durable
+/// `mime` authority and fixes the payload extension, exactly like clips fix
+/// `clips/<id>.wav`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImageFormat {
+    Jpeg,
+    Png,
+    Webp,
+}
+
+impl ImageFormat {
+    pub(crate) fn mime(self) -> &'static str {
+        match self {
+            Self::Jpeg => "image/jpeg",
+            Self::Png => "image/png",
+            Self::Webp => "image/webp",
+        }
+    }
+
+    pub(crate) fn extension(self) -> &'static str {
+        match self {
+            Self::Jpeg => "jpg",
+            Self::Png => "png",
+            Self::Webp => "webp",
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum JournalWriteKind {
@@ -42,9 +70,25 @@ enum JournalWriteKind {
         rate: u32,
         part_count: u32,
     },
+    Image {
+        id: String,
+        file: String,
+        mime: &'static str,
+        recorded_at: u64,
+        sha256: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        width: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        height: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
+    },
     Turn {
         id: String,
         clips: Vec<String>,
+        // Omitted when empty so audio-only turns keep their exact legacy shape.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        images: Vec<String>,
     },
     ConversationRenamed {
         name: String,
@@ -77,6 +121,33 @@ enum JournalWriteKind {
         error: String,
         terminal: bool,
         stage: FailureStage,
+    },
+    DescriptionStarted {
+        image: String,
+        attempt: u32,
+    },
+    DescriptionRetryRequested {
+        image: String,
+        reason: String,
+    },
+    DescriptionRetryScheduled {
+        image: String,
+        attempt: u32,
+        error: String,
+        retry_at_ms: u64,
+    },
+    Description {
+        image: String,
+        attempt: u32,
+        text: String,
+        model: String,
+        prompt_version: u32,
+    },
+    DescriptionError {
+        image: String,
+        attempt: u32,
+        error: String,
+        terminal: bool,
     },
     ReplyStarted {
         turn: String,
@@ -198,10 +269,94 @@ impl JournalWrite {
         })
     }
 
-    pub(crate) fn turn(id: impl Into<String>, clips: Vec<String>) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn image(
+        id: impl Into<String>,
+        format: ImageFormat,
+        sha256: impl Into<String>,
+        recorded_at: u64,
+        width: Option<u32>,
+        height: Option<u32>,
+        caption: Option<String>,
+    ) -> Self {
+        let id = id.into();
+        Self(JournalWriteKind::Image {
+            file: format!("images/{id}.{}", format.extension()),
+            id,
+            mime: format.mime(),
+            recorded_at,
+            sha256: sha256.into(),
+            width,
+            height,
+            caption: caption.filter(|caption| !caption.is_empty()),
+        })
+    }
+
+    pub(crate) fn turn(id: impl Into<String>, clips: Vec<String>, images: Vec<String>) -> Self {
         Self(JournalWriteKind::Turn {
             id: id.into(),
             clips,
+            images,
+        })
+    }
+
+    pub(crate) fn description_started(image: impl Into<String>, attempt: u32) -> Self {
+        Self(JournalWriteKind::DescriptionStarted {
+            image: image.into(),
+            attempt,
+        })
+    }
+
+    pub(crate) fn description_retry_requested(
+        image: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self(JournalWriteKind::DescriptionRetryRequested {
+            image: image.into(),
+            reason: reason.into(),
+        })
+    }
+
+    pub(crate) fn description_retry_scheduled(
+        image: impl Into<String>,
+        attempt: u32,
+        error: impl Into<String>,
+        retry_at_ms: u64,
+    ) -> Self {
+        Self(JournalWriteKind::DescriptionRetryScheduled {
+            image: image.into(),
+            attempt,
+            error: error.into(),
+            retry_at_ms,
+        })
+    }
+
+    pub(crate) fn description_succeeded(
+        image: impl Into<String>,
+        text: &str,
+        attempt: u32,
+        model: impl Into<String>,
+        prompt_version: u32,
+    ) -> Self {
+        Self(JournalWriteKind::Description {
+            image: image.into(),
+            attempt,
+            text: bound_description_text(text),
+            model: model.into(),
+            prompt_version,
+        })
+    }
+
+    pub(crate) fn description_failed(
+        image: impl Into<String>,
+        attempt: u32,
+        error: impl Into<String>,
+    ) -> Self {
+        Self(JournalWriteKind::DescriptionError {
+            image: image.into(),
+            attempt,
+            error: error.into(),
+            terminal: true,
         })
     }
 
@@ -442,6 +597,30 @@ impl JournalWrite {
     }
 }
 
+/// Descriptions are durable values reused by history fallback, knowledge, and
+/// UIs, so their bounds are enforced where the value is written: trimmed,
+/// control characters stripped, collapsed to a single paragraph, and capped at
+/// 4 KiB on a character boundary. Knowledge reapplies the same projection on
+/// read as a defense against handcrafted journal events.
+pub(crate) fn bound_description_text(text: &str) -> String {
+    const MAX_DESCRIPTION_BYTES: usize = 4 * 1024;
+    let mut paragraph = text
+        .chars()
+        .filter(|character| !character.is_control() || character.is_whitespace())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if paragraph.len() > MAX_DESCRIPTION_BYTES {
+        let mut end = MAX_DESCRIPTION_BYTES;
+        while !paragraph.is_char_boundary(end) {
+            end -= 1;
+        }
+        paragraph.truncate(end);
+    }
+    paragraph
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,12 +651,57 @@ mod tests {
                 "samples":19_200, "rate":16_000, "part_count":3
             })
         );
+        // Audio-only turns must keep their exact legacy byte shape: no
+        // `images` key may appear when the claim set is empty.
         assert_eq!(
             value(JournalWrite::turn(
                 "turn-1",
-                vec!["clip-1".into(), "clip-2".into()]
+                vec!["clip-1".into(), "clip-2".into()],
+                vec![]
             )),
             json!({"kind":"turn", "id":"turn-1", "clips":["clip-1", "clip-2"]})
+        );
+        assert_eq!(
+            value(JournalWrite::turn(
+                "turn-2",
+                vec!["clip-1".into()],
+                vec!["img-1".into(), "img-2".into()]
+            )),
+            json!({
+                "kind":"turn", "id":"turn-2", "clips":["clip-1"],
+                "images":["img-1", "img-2"]
+            })
+        );
+        assert_eq!(
+            value(JournalWrite::image(
+                "img-1",
+                ImageFormat::Jpeg,
+                "abc",
+                42,
+                Some(3024),
+                Some(4032),
+                Some("whiteboard".into()),
+            )),
+            json!({
+                "kind":"image", "id":"img-1", "file":"images/img-1.jpg",
+                "mime":"image/jpeg", "recorded_at":42, "sha256":"abc",
+                "width":3024, "height":4032, "caption":"whiteboard"
+            })
+        );
+        assert_eq!(
+            value(JournalWrite::image(
+                "img-2",
+                ImageFormat::Webp,
+                "def",
+                7,
+                None,
+                None,
+                None,
+            )),
+            json!({
+                "kind":"image", "id":"img-2", "file":"images/img-2.webp",
+                "mime":"image/webp", "recorded_at":7, "sha256":"def"
+            })
         );
         assert_eq!(
             value(JournalWrite::conversation_renamed("A useful name")),
@@ -572,6 +796,26 @@ mod tests {
     }
 
     #[test]
+    fn description_text_is_bounded_at_the_constructor() {
+        let hostile = "  a cat\u{7} on\n\na desk\t\tnext to\ra mug  ";
+        assert_eq!(
+            value(JournalWrite::description_succeeded(
+                "img-1", hostile, 1, "mock", 1
+            ))["text"],
+            "a cat on a desk next to a mug"
+        );
+
+        let oversized = "é".repeat(3 * 1024);
+        let bounded = value(JournalWrite::description_succeeded(
+            "img-1", &oversized, 1, "mock", 1,
+        ));
+        let text = bounded["text"].as_str().unwrap();
+        assert!(text.len() <= 4 * 1024);
+        assert_eq!(text.len(), 4 * 1024); // even byte count: no split character
+        assert!(text.chars().all(|character| character == 'é'));
+    }
+
+    #[test]
     fn every_retry_result_constructor_has_an_exact_wire_shape() {
         let cases = [
             (
@@ -602,6 +846,47 @@ mod tests {
                     "kind":"transcript_error", "clip":"clip-1", "attempt":3,
                     "error":"invalid audio", "terminal":true,
                     "stage":"transcription"
+                }),
+            ),
+            (
+                JournalWrite::description_started("img-1", 2),
+                json!({
+                    "kind":"description_started", "image":"img-1", "attempt":2
+                }),
+            ),
+            (
+                JournalWrite::description_retry_requested("img-1", "explicit_retry"),
+                json!({
+                    "kind":"description_retry_requested", "image":"img-1",
+                    "reason":"explicit_retry"
+                }),
+            ),
+            (
+                JournalWrite::description_retry_scheduled("img-1", 2, "busy", 41),
+                json!({
+                    "kind":"description_retry_scheduled", "image":"img-1",
+                    "attempt":2, "error":"busy", "retry_at_ms":41
+                }),
+            ),
+            (
+                JournalWrite::description_succeeded(
+                    "img-1",
+                    "a tabby cat",
+                    2,
+                    "gemini-3.5-flash",
+                    1,
+                ),
+                json!({
+                    "kind":"description", "image":"img-1", "attempt":2,
+                    "text":"a tabby cat", "model":"gemini-3.5-flash",
+                    "prompt_version":1
+                }),
+            ),
+            (
+                JournalWrite::description_failed("img-1", 3, "safety block"),
+                json!({
+                    "kind":"description_error", "image":"img-1", "attempt":3,
+                    "error":"safety block", "terminal":true
                 }),
             ),
             (

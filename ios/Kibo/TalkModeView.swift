@@ -53,7 +53,7 @@ struct TalkModeView: View {
                         endHold: { session.endHold() },
                         cancelHold: { session.cancelHold() },
                         askKibo: {
-                            if store.askableClipCount > 0 {
+                            if store.askableItemCount > 0 {
                                 session.startSubmit(afterCaptureEnded: true)
                             }
                         }
@@ -139,8 +139,8 @@ struct TalkModeView: View {
         if store.recoveryItemCount > 0 {
             return "Recording needs review · see Settings"
         }
-        if store.askableClipCount > 0 {
-            return "\(store.askableClipCount) pending"
+        if store.askableItemCount > 0 {
+            return "\(store.askableItemCount) pending"
         }
         return ""
     }

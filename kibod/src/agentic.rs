@@ -27,6 +27,7 @@ Workflow:
 1. Read index.md first.
 2. Search the wiki with local shell tools such as rg, then read every relevant Markdown page needed to synthesize the answer.
 3. Answer in concise Markdown. Cite material claims with relative links to the supporting wiki files, for example [Project notes](sources/conversation--project-notes.md).
+   For claims drawn from an image description, cite the note's image anchor, for example [Whiteboard photo](sources/conversation--project-notes.md#img-img-42).
 4. Call out missing, ambiguous, or conflicting evidence instead of guessing.
 
 Security and scope:
@@ -1012,6 +1013,11 @@ fn duration_env(name: &str) -> Option<Duration> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn developer_instructions_request_image_anchor_citations() {
+        assert!(DEVELOPER_INSTRUCTIONS.contains("#img-"));
+    }
 
     #[test]
     fn permission_profile_contains_only_the_wiki_and_minimal_runtime() {

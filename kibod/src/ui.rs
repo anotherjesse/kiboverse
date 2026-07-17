@@ -244,7 +244,7 @@ fn knowledge_redirect(project_id: &str, notice: &str) -> Response {
 
 fn knowledge_action_error(project_id: &str, error: anyhow::Error) -> Response {
     let body = format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><link rel=\"stylesheet\" href=\"/assets/app.css?v=4\"><title>Knowledge error · Kibo</title></head><body><main class=\"action-error\"><p class=\"eyebrow\">Knowledge ingestion</p><h1>That didn’t work.</h1><p>{}</p><a class=\"primary-link\" href=\"/app/{}/knowledge\">Back to knowledge</a></main></body></html>",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><link rel=\"stylesheet\" href=\"/assets/app.css?v=6\"><title>Knowledge error · Kibo</title></head><body><main class=\"action-error\"><p class=\"eyebrow\">Knowledge ingestion</p><h1>That didn’t work.</h1><p>{}</p><a class=\"primary-link\" href=\"/app/{}/knowledge\">Back to knowledge</a></main></body></html>",
         escape(&error.to_string()),
         url_component(project_id)
     );
@@ -311,7 +311,7 @@ fn render_page(
 <html lang=\"en\"><head>
 <meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\">
 <title>{conversation} · Kibo</title><meta name=\"description\" content=\"A durable voice conversation with Kibo\">
-	<link rel=\"stylesheet\" href=\"/assets/app.css?v=4\"><script src=\"/assets/htmx.min.js\" defer></script><script src=\"/assets/app.js?v=4\" defer></script>
+	<link rel=\"stylesheet\" href=\"/assets/app.css?v=6\"><script src=\"/assets/htmx.min.js\" defer></script><script src=\"/assets/app.js?v=6\" defer></script>
 	</head><body data-project-id=\"{project_id}\" data-conversation-id=\"{conversation_id}\" data-last-seq=\"{last_seq}\" data-conversation-url=\"{base}\" data-timeline-url=\"{page_url}/timeline\" data-events-url=\"{base}/events\">
 	<div class=\"app-shell\"><aside class=\"sidebar\"><div class=\"brand\"><span class=\"brand-mark\">k</span>Kibo</div>{navigation}
 	<details class=\"new-item\"><summary>New project</summary><form method=\"post\" action=\"/ui/projects\"><label>Name<input name=\"name\" maxlength=\"100\" required></label><button> create </button></form></details>
@@ -365,7 +365,7 @@ fn render_project_page(state: &AppState, project_id: &str) -> anyhow::Result<Str
 <html lang=\"en\"><head>
 <meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\">
 <title>{project} · Kibo</title><meta name=\"description\" content=\"Voice chats organized in Kibo projects\">
-<link rel=\"stylesheet\" href=\"/assets/app.css?v=4\"><script src=\"/assets/htmx.min.js\" defer></script><script src=\"/assets/app.js?v=4\" defer></script>
+<link rel=\"stylesheet\" href=\"/assets/app.css?v=6\"><script src=\"/assets/htmx.min.js\" defer></script><script src=\"/assets/app.js?v=6\" defer></script>
 </head><body data-project-id=\"{project_id}\">
 <div class=\"app-shell\"><aside class=\"sidebar\"><div class=\"brand\"><span class=\"brand-mark\">k</span>Kibo</div>{navigation}
 <details class=\"new-item\"><summary>New project</summary><form method=\"post\" action=\"/ui/projects\"><label>Name<input name=\"name\" maxlength=\"100\" required></label><button> create </button></form></details>
@@ -430,12 +430,13 @@ fn render_knowledge_page(
     } else {
         "<span class=\"mode-badge\">Jina anonymous mode</span>"
     };
+    let media_cards = render_project_media(state, project_id, &statuses)?;
     Ok(format!(
         "<!doctype html>
 <html lang=\"en\"><head>
 <meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
 <title>Knowledge · {project}</title><meta name=\"description\" content=\"Ingest conversations and web sources into project Markdown\">
-<link rel=\"stylesheet\" href=\"/assets/app.css?v=4\"><script src=\"/assets/app.js?v=4\" defer></script>
+<link rel=\"stylesheet\" href=\"/assets/app.css?v=6\"><script src=\"/assets/app.js?v=6\" defer></script>
 </head><body data-project-id=\"{project_id}\"><div class=\"app-shell\"><aside class=\"sidebar\"><div class=\"brand\"><span class=\"brand-mark\">k</span>Kibo</div>{navigation}
 <details class=\"new-item\"><summary>New project</summary><form method=\"post\" action=\"/ui/projects\"><label>Name<input name=\"name\" maxlength=\"100\" required></label><button> create </button></form></details>
 </aside><main class=\"main knowledge-main\"><div class=\"knowledge-wrap\">
@@ -446,6 +447,7 @@ fn render_knowledge_page(
 <div class=\"knowledge-grid\"><div class=\"knowledge-sources\">
 <section class=\"knowledge-section\"><div class=\"section-heading\"><div><p class=\"eyebrow\">Raw transcripts</p><h2>Conversations</h2></div></div><div class=\"source-list\">{conversation_cards}</div></section>
 <section class=\"knowledge-section\"><div class=\"section-heading\"><div><p class=\"eyebrow\">Jina Reader</p><h2>Import a URL</h2></div></div><form class=\"url-import\" method=\"post\" action=\"/ui/projects/{project_id}/knowledge/import\" data-knowledge-action data-progress-title=\"Importing with Jina Reader\" data-progress-detail=\"Jina is fetching the source; then Gemini will turn it into a knowledge note.\" data-progress-long=\"Still importing. Complex pages and PDFs can take a little longer.\"><label><span>Public webpage or PDF URL</span><input type=\"url\" name=\"url\" placeholder=\"https://example.com/article\" required></label><button class=\"primary-button\" type=\"submit\">Import &amp; ingest</button></form><div class=\"source-list web-source-list\">{web_cards}</div></section>
+<section class=\"knowledge-section\"><div class=\"section-heading\"><div><p class=\"eyebrow\">Across conversations</p><h2>Media</h2></div></div>{media_cards}</section>
 </div><aside class=\"markdown-library\"><div class=\"section-heading\"><div><p class=\"eyebrow\">Generated files</p><h2>Markdown</h2></div></div><ul>{file_links}</ul></aside></div>
 </div></main></div></body></html>",
         project = escape(&project.name),
@@ -465,7 +467,7 @@ fn render_knowledge_query_page(state: &AppState, project_id: &str) -> anyhow::Re
 <meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\">
 <base href=\"/app/{project_id}/knowledge/files/wiki/\">
 <title>Ask knowledge · {project}</title><meta name=\"description\" content=\"Ask an agent to investigate this project's knowledge base\">
-<link rel=\"stylesheet\" href=\"/assets/app.css?v=4\"><script src=\"/assets/knowledge-query.js?v=1\" defer></script>
+<link rel=\"stylesheet\" href=\"/assets/app.css?v=6\"><script src=\"/assets/knowledge-query.js?v=1\" defer></script>
 </head><body data-project-id=\"{project_id}\" data-query-url=\"/v1/projects/{project_id}/knowledge/query\"><div class=\"app-shell\"><aside class=\"sidebar\"><div class=\"brand\"><span class=\"brand-mark\">k</span>Kibo</div>{navigation}
 <details class=\"new-item\"><summary>New project</summary><form method=\"post\" action=\"/ui/projects\"><label>Name<input name=\"name\" maxlength=\"100\" required></label><button> create </button></form></details>
 </aside><main class=\"main knowledge-query-main\"><div class=\"knowledge-query-shell\">
@@ -594,7 +596,7 @@ fn render_knowledge_file_page(
         })
         .collect::<String>();
     Ok(format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><base href=\"/app/{project_id}/knowledge/files/wiki/\"><title>{path} · {project}</title><link rel=\"stylesheet\" href=\"/assets/app.css?v=4\"></head><body data-project-id=\"{project_id}\"><div class=\"app-shell\"><aside class=\"sidebar\"><div class=\"brand\"><span class=\"brand-mark\">k</span>Kibo</div>{navigation}</aside><main class=\"main markdown-main\"><div class=\"markdown-shell\"><aside class=\"file-rail\"><a class=\"back-link\" href=\"/app/{project_id}/knowledge\">← Knowledge</a><p class=\"eyebrow\">Markdown files</p><ul>{file_links}</ul></aside><article class=\"markdown-document\"><header><p class=\"eyebrow\">{path}</p></header><div class=\"markdown-body\">{rendered}</div><details class=\"raw-markdown\"><summary>View raw Markdown</summary><pre>{raw}</pre></details></article></div></main></div></body></html>",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><base href=\"/app/{project_id}/knowledge/files/wiki/\"><title>{path} · {project}</title><link rel=\"stylesheet\" href=\"/assets/app.css?v=6\"></head><body data-project-id=\"{project_id}\"><div class=\"app-shell\"><aside class=\"sidebar\"><div class=\"brand\"><span class=\"brand-mark\">k</span>Kibo</div>{navigation}</aside><main class=\"main markdown-main\"><div class=\"markdown-shell\"><aside class=\"file-rail\"><a class=\"back-link\" href=\"/app/{project_id}/knowledge\">← Knowledge</a><p class=\"eyebrow\">Markdown files</p><ul>{file_links}</ul></aside><article class=\"markdown-document\"><header><p class=\"eyebrow\">{path}</p></header><div class=\"markdown-body\">{rendered}</div><details class=\"raw-markdown\"><summary>View raw Markdown</summary><pre>{raw}</pre></details></article></div></main></div></body></html>",
         project = escape(&project.name),
         project_id = escape_attr(project_id),
         path = escape(path),
@@ -603,7 +605,36 @@ fn render_knowledge_file_page(
 }
 
 pub(crate) fn render_markdown(markdown: &str) -> String {
-    ammonia::clean(&markdown_html(markdown))
+    // Two trust domains per note: the body is LLM/imported text and renders
+    // under the default policy — it cannot mint or shadow citation anchors,
+    // and an unclosed fence in it cannot swallow the appendix. Only the
+    // machine-written appendix after the LAST separator keeps `img-*` ids
+    // (knowledge::commit_ingestion writes the separator last, so a
+    // body-injected copy only donates more body to the untrusted region).
+    let separator = format!("\n{}\n", crate::knowledge::IMAGES_APPENDIX_SEPARATOR);
+    let (body, appendix) = match markdown.rfind(&separator) {
+        Some(position) => (
+            &markdown[..position],
+            Some(&markdown[position + separator.len()..]),
+        ),
+        None => (markdown, None),
+    };
+    let mut rendered = ammonia::Builder::default()
+        .clean(&markdown_html(body))
+        .to_string();
+    if let Some(appendix) = appendix {
+        let mut sanitizer = ammonia::Builder::default();
+        // Defense in depth even for the trusted region: only `img-…`
+        // citation anchors keep an id.
+        sanitizer.add_generic_attributes(["id"]);
+        sanitizer.attribute_filter(|_, attribute, value| match attribute {
+            "id" if value.starts_with("img-") => Some(value.into()),
+            "id" => None,
+            _ => Some(value.into()),
+        });
+        rendered.push_str(&sanitizer.clean(&markdown_html(appendix)).to_string());
+    }
+    rendered
 }
 
 pub(crate) fn render_query_markdown(markdown: &str) -> String {
@@ -715,6 +746,85 @@ fn new_chat_form(project_id: &str, label: &str, class: &str) -> String {
     )
 }
 
+/// The Media gallery is a pure projection over the project's conversation
+/// journals — no knowledge/ writes, no checkpoint interaction, nothing the
+/// Codex sandbox can see. Newest first across conversations.
+fn render_project_media(
+    state: &AppState,
+    project_id: &str,
+    statuses: &[SourceStatus],
+) -> anyhow::Result<String> {
+    let ingested: HashSet<&str> = statuses
+        .iter()
+        .filter(|source| source.kind == DocumentKind::Conversation && source.generation > 0)
+        .map(|source| source.id.as_str())
+        .collect();
+    let mut entries: Vec<(u64, u64, String)> = Vec::new();
+    for conversation in state.store().list_conversations(project_id)? {
+        let records = state
+            .store()
+            .records(project_id, &conversation.id)?;
+        let workflow = ConversationWorkflow::from_records(&records);
+        for event in records.iter().filter(|event| event["kind"] == "image") {
+            let Some(image_id) = event["id"].as_str() else {
+                continue;
+            };
+            // Upload enforces `valid_id`; handcrafted journal ids never reach
+            // attributes or URLs.
+            if !crate::model::valid_id(image_id) {
+                continue;
+            }
+            let Some(image) = workflow.image(image_id) else {
+                continue;
+            };
+            let description = match &image.description {
+                AttemptState::Succeeded(record) => Some(record.text.as_str()),
+                _ => None,
+            };
+            let label = image.caption.as_deref().or(description).unwrap_or("photo");
+            let snippet: String = label.chars().take(140).collect();
+            let note_link = if ingested.contains(conversation.id.as_str()) {
+                format!(
+                    " · <a href=\"/app/{}/knowledge/files/wiki/sources/conversation--{}.md#img-{}\">note</a>",
+                    url_component(project_id),
+                    url_component(&conversation.id),
+                    url_component(image_id)
+                )
+            } else {
+                String::new()
+            };
+            let dimensions = match (image.width, image.height) {
+                (Some(width), Some(height)) => format!(" width=\"{width}\" height=\"{height}\""),
+                _ => String::new(),
+            };
+            let card = format!(
+                "<figure class=\"media-card\"><a href=\"/app/{project}/{conversation}\" title=\"Open conversation\"><img src=\"/v1/projects/{project}/conversations/{conversation}/images/{id}/content\" alt=\"{alt}\"{dimensions} loading=\"lazy\"></a><figcaption><span class=\"media-label\">{label}</span><span class=\"media-meta\">{name}{note_link}</span></figcaption></figure>",
+                project = url_component(project_id),
+                conversation = url_component(&conversation.id),
+                id = url_component(image_id),
+                alt = escape_attr(&snippet),
+                label = escape(&snippet),
+                name = escape(&conversation.name),
+            );
+            entries.push((image.recorded_at, image.seq, card));
+        }
+    }
+    if entries.is_empty() {
+        return Ok(
+            "<p class=\"knowledge-empty\">No images shared yet. Photos added to conversations appear here.</p>"
+                .to_string(),
+        );
+    }
+    entries.sort_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
+    Ok(format!(
+        "<div class=\"media-gallery\">{}</div>",
+        entries
+            .into_iter()
+            .map(|(_, _, card)| card)
+            .collect::<String>()
+    ))
+}
+
 fn render_timeline(project_id: &str, conversation_id: &str, records: &[Value]) -> String {
     if records.is_empty() {
         return "<div class=\"empty-state\"><p><strong>No conversation yet.</strong></p><p>Hold the coral button to record a thought, then ask Kibo.</p></div>".into();
@@ -725,22 +835,46 @@ fn render_timeline(project_id: &str, conversation_id: &str, records: &[Value]) -
         .iter()
         .flat_map(|turn| turn.clips.iter().map(String::as_str))
         .collect();
+    let claimed_images: HashSet<&str> = workflow
+        .turns()
+        .iter()
+        .flat_map(|turn| turn.images.iter().map(String::as_str))
+        .collect();
     let clips: HashMap<&str, &Value> = records
         .iter()
         .filter(|event| event["kind"] == "clip")
         .filter_map(|event| Some((event["id"].as_str()?, event)))
         .collect();
+    let images: HashMap<&str, &Value> = records
+        .iter()
+        .filter(|event| event["kind"] == "image")
+        .filter_map(|event| Some((event["id"].as_str()?, event)))
+        .collect();
 
     let mut html = String::new();
     for turn in workflow.turns() {
-        let clip_ids: Vec<&str> = turn.clips.iter().map(String::as_str).collect();
-        html.push_str(&render_user_message(
-            project_id,
-            conversation_id,
-            &clip_ids,
-            &clips,
-            &workflow,
-        ));
+        // TurnContent order: clips and images merged by (recorded_at, seq).
+        for item in ordered_turn_media(turn, &clips, &images) {
+            match item {
+                TimelineMedia::Clip(clip_id) => html.push_str(&render_user_message(
+                    project_id,
+                    conversation_id,
+                    &[clip_id],
+                    &clips,
+                    &workflow,
+                )),
+                TimelineMedia::Image(image_id) => {
+                    if let Some(event) = images.get(image_id) {
+                        html.push_str(&render_image_message(
+                            project_id,
+                            conversation_id,
+                            event,
+                            &workflow,
+                        ));
+                    }
+                }
+            }
+        }
         match &turn.reply {
             AttemptState::Succeeded(reply) => html.push_str(&render_reply(turn, reply)),
             AttemptState::TerminalFailure(failure) => html.push_str(&format!(
@@ -756,21 +890,132 @@ fn render_timeline(project_id: &str, conversation_id: &str, records: &[Value]) -
         }
     }
 
-    for clip_id in records
-        .iter()
-        .filter(|event| event["kind"] == "clip")
-        .filter_map(|event| event["id"].as_str())
-        .filter(|clip_id| !claimed.contains(*clip_id))
-    {
-        html.push_str(&render_user_message(
-            project_id,
-            conversation_id,
-            &[clip_id],
-            &clips,
-            &workflow,
-        ));
+    // Unclaimed media interleaves by (recorded_at, seq) — the same rule as
+    // claimed media inside a turn — so a photo added before a voice note
+    // renders before it, not in a clips-then-images block.
+    let mut pending: Vec<(i64, u64, TimelineMedia)> = Vec::new();
+    for event in records.iter() {
+        let Some(id) = event["id"].as_str() else {
+            continue;
+        };
+        let key = (
+            event["recorded_at"].as_i64().unwrap_or_default(),
+            event["seq"].as_u64().unwrap_or_default(),
+        );
+        if event["kind"] == "clip" && !claimed.contains(id) {
+            pending.push((key.0, key.1, TimelineMedia::Clip(id)));
+        } else if event["kind"] == "image" && !claimed_images.contains(id) {
+            pending.push((key.0, key.1, TimelineMedia::Image(id)));
+        }
+    }
+    pending.sort_by_key(|(recorded_at, seq, _)| (*recorded_at, *seq));
+    for (_, _, item) in pending {
+        match item {
+            TimelineMedia::Clip(clip_id) => html.push_str(&render_user_message(
+                project_id,
+                conversation_id,
+                &[clip_id],
+                &clips,
+                &workflow,
+            )),
+            TimelineMedia::Image(image_id) => {
+                if let Some(event) = images.get(image_id) {
+                    html.push_str(&render_image_message(
+                        project_id,
+                        conversation_id,
+                        event,
+                        &workflow,
+                    ));
+                }
+            }
+        }
     }
     html
+}
+
+enum TimelineMedia<'a> {
+    Clip(&'a str),
+    Image(&'a str),
+}
+
+/// Merge a turn's claimed media by `(recorded_at, seq)` so a photo taken
+/// between two voice notes renders between them.
+fn ordered_turn_media<'a>(
+    turn: &'a TurnWork,
+    clips: &HashMap<&str, &Value>,
+    images: &HashMap<&str, &Value>,
+) -> Vec<TimelineMedia<'a>> {
+    let sort_key = |event: Option<&&Value>| {
+        event.map_or((0, 0), |event| {
+            (
+                event["recorded_at"].as_u64().unwrap_or(0),
+                event["seq"].as_u64().unwrap_or(0),
+            )
+        })
+    };
+    let mut media: Vec<((u64, u64), TimelineMedia<'a>)> = Vec::new();
+    for clip_id in &turn.clips {
+        media.push((
+            sort_key(clips.get(clip_id.as_str())),
+            TimelineMedia::Clip(clip_id),
+        ));
+    }
+    for image_id in &turn.images {
+        media.push((
+            sort_key(images.get(image_id.as_str())),
+            TimelineMedia::Image(image_id),
+        ));
+    }
+    media.sort_by_key(|(key, _)| *key);
+    media.into_iter().map(|(_, item)| item).collect()
+}
+
+fn render_image_message(
+    project_id: &str,
+    conversation_id: &str,
+    event: &Value,
+    workflow: &ConversationWorkflow,
+) -> String {
+    let image_id = event["id"].as_str().unwrap_or_default();
+    // Upload enforces `valid_id`; a handcrafted journal id must never reach
+    // an attribute or URL (same posture as the knowledge appendix).
+    if !crate::model::valid_id(image_id) {
+        return String::new();
+    }
+    let content_url = format!(
+        "/v1/projects/{}/conversations/{}/images/{}/content",
+        url_component(project_id),
+        url_component(conversation_id),
+        url_component(image_id)
+    );
+    let caption = event["caption"]
+        .as_str()
+        .map(str::trim)
+        .filter(|caption| !caption.is_empty());
+    let alt = escape_attr(caption.unwrap_or("photo"));
+    let dimensions = match (event["width"].as_u64(), event["height"].as_u64()) {
+        (Some(width), Some(height)) => format!(" width=\"{width}\" height=\"{height}\""),
+        _ => String::new(),
+    };
+    let figcaption = caption.map_or_else(String::new, |caption| {
+        format!("<figcaption>{}</figcaption>", escape(caption))
+    });
+    let retry = if matches!(
+        workflow.image(image_id).map(|image| &image.description),
+        Some(AttemptState::TerminalFailure(_))
+    ) {
+        format!(
+            "<form class=\"description-retry\" data-timeline-retry method=\"post\" action=\"/v1/projects/{}/conversations/{}/images/{}/retry\"><button type=\"submit\">description failed — retry</button></form>",
+            url_component(project_id),
+            url_component(conversation_id),
+            url_component(image_id)
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "<article class=\"message user image\"><a href=\"{content_url}\" target=\"_blank\" rel=\"noopener\"><img src=\"{content_url}\"{dimensions} loading=\"lazy\" alt=\"{alt}\"></a>{figcaption}{retry}</article>"
+    )
 }
 
 fn render_user_message(
@@ -922,6 +1167,66 @@ mod tests {
     }
 
     #[test]
+    fn knowledge_page_media_gallery_projects_images_newest_first() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(temporary.path()).unwrap();
+        let first = store.create_conversation("kibo", Some("First")).unwrap();
+        let second = store.create_conversation("kibo", Some("Second")).unwrap();
+        store
+            .append_fixture(
+                "kibo",
+                &first.id,
+                serde_json::json!({
+                    "kind":"image", "id":"img-old", "file":"images/img-old.jpg",
+                    "mime":"image/jpeg", "sha256":"abc", "recorded_at":100,
+                    "caption":"<b>whiteboard</b>"
+                }),
+            )
+            .unwrap();
+        store
+            .append_fixture(
+                "kibo",
+                &second.id,
+                serde_json::json!({
+                    "kind":"image", "id":"img-new", "file":"images/img-new.png",
+                    "mime":"image/png", "sha256":"def", "recorded_at":200
+                }),
+            )
+            .unwrap();
+        store
+            .append_fixture(
+                "kibo",
+                &second.id,
+                serde_json::json!({
+                    "kind":"description", "image":"img-new",
+                    "text":"a red square on a desk", "attempt":1
+                }),
+            )
+            .unwrap();
+        let state = AppState::new(store, Ai::mock());
+
+        let html = render_knowledge_page(&state, "kibo", None).unwrap();
+
+        // Newest first, across conversations.
+        let newer = html.find("img-new/content").unwrap();
+        let older = html.find("img-old/content").unwrap();
+        assert!(newer < older, "gallery is newest first");
+        // Caption escaped; description used when no caption exists.
+        assert!(html.contains("&lt;b&gt;whiteboard&lt;/b&gt;"));
+        assert!(!html.contains("<b>whiteboard</b>"));
+        assert!(html.contains("a red square on a desk"));
+        // Nothing ingested yet: no note anchors offered.
+        assert!(!html.contains("#img-img-old"));
+
+        // A project without images renders the empty state, not a gallery.
+        let empty_temporary = tempfile::tempdir().unwrap();
+        let empty_state = AppState::new(Store::open(empty_temporary.path()).unwrap(), Ai::mock());
+        let empty_html = render_knowledge_page(&empty_state, "kibo", None).unwrap();
+        assert!(empty_html.contains("No images shared yet"));
+        assert!(!empty_html.contains("media-gallery"));
+    }
+
+    #[test]
     fn knowledge_query_page_exposes_an_accessible_streaming_conversation() {
         let temporary = tempfile::tempdir().unwrap();
         let state = AppState::new(Store::open(temporary.path()).unwrap(), Ai::mock());
@@ -970,6 +1275,40 @@ mod tests {
         assert!(!rendered.contains("attacker.invalid"));
         assert!(!rendered.contains("../../secret"));
         assert!(!rendered.contains("<img"));
+    }
+
+    #[test]
+    fn knowledge_note_markdown_keeps_images_and_anchor_ids() {
+        // Body and appendix are separate trust domains split on the LAST
+        // separator: a body-spoofed anchor loses its id, a body-injected
+        // separator donates itself to the body, an unclosed fence cannot
+        // swallow the appendix, and only the machine appendix's img-* anchor
+        // survives.
+        let note = format!(
+            "Body text <a id=\"img-img-1\"></a> spoof\n\nfake below\n\n{sep}\n\n<a id=\"body-after-fake-separator\"></a>\n\n```\nunclosed fence\n\n{sep}\n## Images\n\n### Image img-1 <a id=\"img-img-1\"></a>\n\n![Image img-1](/v1/projects/kibo/conversations/c-1/images/img-1/content)\n\n> A whiteboard covered in sticky notes\n\n<a id=\"not-an-image-anchor\"></a>\n\n<script>alert('no')</script>",
+            sep = format!("\n{}\n", crate::knowledge::IMAGES_APPENDIX_SEPARATOR),
+        );
+        let rendered = render_markdown(&note);
+
+        assert!(rendered.contains("<img"));
+        assert!(rendered.contains("src=\"/v1/projects/kibo/conversations/c-1/images/img-1/content\""));
+        assert!(rendered.contains("alt=\"Image img-1\""));
+        assert_eq!(rendered.matches("id=\"img-img-1\"").count(), 1);
+        assert!(!rendered.contains("id=\"body-after-fake-separator\""));
+        assert!(!rendered.contains("id=\"not-an-image-anchor\""));
+        assert!(!rendered.contains("<script>"));
+    }
+
+    #[test]
+    fn query_markdown_keeps_image_anchor_citations_but_strips_images() {
+        let rendered = render_query_markdown(
+            "[Whiteboard photo](sources/conversation--c-1.md#img-img-1)\n\n![leak](/v1/projects/kibo/conversations/c-1/images/img-1/content)\n\n<a id=\"img-img-1\"></a>",
+        );
+
+        assert!(rendered.contains("href=\"sources/conversation--c-1.md#img-img-1\""));
+        assert!(!rendered.contains("<img"));
+        // Query answers may cite anchors but never define them.
+        assert!(!rendered.contains("id=\"img-img-1\""));
     }
 
     #[test]
@@ -1061,6 +1400,103 @@ mod tests {
         assert!(html.contains("recovered"));
         assert!(html.contains(">Thinking…<"));
         assert!(!html.contains("broken"));
+    }
+
+    #[test]
+    fn timeline_renders_images_in_turn_content_order_with_escaping() {
+        let records = vec![
+            serde_json::json!({"kind":"clip", "id":"clip-1", "recorded_at":30, "seq":1}),
+            serde_json::json!({"kind":"transcript", "clip":"clip-1", "text":"after the photo", "seq":2}),
+            serde_json::json!({
+                "kind":"image", "id":"img-1", "file":"images/img-1.jpg",
+                "mime":"image/jpeg", "sha256":"abc", "recorded_at":20,
+                "width":3024, "height":4032,
+                "caption":"<script>alert('caption')</script>", "seq":3
+            }),
+            serde_json::json!({"kind":"turn", "id":"turn-1", "clips":["clip-1"], "images":["img-1"], "seq":4}),
+            serde_json::json!({"kind":"reply", "turn":"turn-1", "text":"noted", "seq":5}),
+        ];
+
+        let html = render_timeline("kibo", "conversation", &records);
+
+        // The photo (recorded_at 20) renders before the clip (recorded_at 30).
+        let image_at = html.find("message user image").unwrap();
+        let clip_at = html.find("after the photo").unwrap();
+        assert!(image_at < clip_at);
+        assert!(html.contains(
+            "src=\"/v1/projects/kibo/conversations/conversation/images/img-1/content\""
+        ));
+        assert!(html.contains(
+            "href=\"/v1/projects/kibo/conversations/conversation/images/img-1/content\""
+        ));
+        assert!(html.contains("width=\"3024\" height=\"4032\""));
+        assert!(html.contains("loading=\"lazy\""));
+        // Hostile captions are escaped in both the alt attribute and caption.
+        assert!(!html.contains("<script>alert"));
+        assert!(html.contains("alt=\"&lt;script&gt;alert(&#39;caption&#39;)&lt;/script&gt;\""));
+        assert!(html.contains(
+            "<figcaption>&lt;script&gt;alert(&#39;caption&#39;)&lt;/script&gt;</figcaption>"
+        ));
+        // No terminal description: no retry affordance.
+        assert!(!html.contains("description-retry"));
+    }
+
+    #[test]
+    fn timeline_renders_unclaimed_images_after_turns_with_retry_affordance() {
+        let records = vec![
+            serde_json::json!({"kind":"turn", "id":"turn-1", "clips":[], "seq":1}),
+            serde_json::json!({"kind":"reply", "turn":"turn-1", "text":"the reply", "seq":2}),
+            serde_json::json!({
+                "kind":"image", "id":"img-1", "file":"images/img-1.png",
+                "mime":"image/png", "sha256":"abc", "recorded_at":5, "seq":3
+            }),
+            serde_json::json!({
+                "kind":"description_error", "image":"img-1", "attempt":3,
+                "terminal":true, "error":"blocked", "seq":4
+            }),
+        ];
+
+        let html = render_timeline("kibo", "conversation", &records);
+
+        let reply_at = html.find("the reply").unwrap();
+        let image_at = html.find("message user image").unwrap();
+        assert!(reply_at < image_at, "unclaimed images render after turns");
+        // Captionless images still get accessible alt text.
+        assert!(html.contains("alt=\"photo\""));
+        assert!(!html.contains("<figcaption>"));
+        // A terminally failed description offers a retry posting to the API.
+        assert!(html.contains(
+            "action=\"/v1/projects/kibo/conversations/conversation/images/img-1/retry\""
+        ));
+        assert!(html.contains("description failed — retry"));
+    }
+
+    #[test]
+    fn unclaimed_media_interleaves_by_recorded_at_not_kind() {
+        // A photo added before voice notes renders before them; a later photo
+        // renders after — no clips-then-images grouping in the pending tail.
+        let records = vec![
+            serde_json::json!({
+                "kind":"image", "id":"img-early", "file":"images/img-early.png",
+                "mime":"image/png", "sha256":"abc", "recorded_at":100, "seq":1
+            }),
+            serde_json::json!({
+                "kind":"clip", "id":"clip-mid", "file":"clips/clip-mid.wav",
+                "mime":"audio/wav", "recorded_at":200, "seq":2
+            }),
+            serde_json::json!({
+                "kind":"image", "id":"img-late", "file":"images/img-late.png",
+                "mime":"image/png", "sha256":"def", "recorded_at":300, "seq":3
+            }),
+        ];
+
+        let html = render_timeline("kibo", "conversation", &records);
+
+        let early = html.find("img-early").unwrap();
+        let mid = html.find("clip-mid").unwrap();
+        let late = html.find("img-late").unwrap();
+        assert!(early < mid, "earlier photo renders before later voice");
+        assert!(mid < late, "later photo renders after voice");
     }
 
     #[test]

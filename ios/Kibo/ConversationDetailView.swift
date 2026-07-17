@@ -1,10 +1,13 @@
 import SwiftUI
+import UIKit
 
 struct ConversationDetailView: View {
     @EnvironmentObject private var store: AppStore
     @EnvironmentObject private var audio: AudioCoordinator
     @EnvironmentObject private var router: KiboRouter
     @StateObject private var session = ReplySession()
+    @State private var isPhotoLibraryPresented = false
+    @State private var isCameraPresented = false
 
     var body: some View {
         Group {
@@ -70,6 +73,22 @@ struct ConversationDetailView: View {
             set: { if !$0 { audio.playbackErrorMessage = nil } }
         )) { Button("OK") { audio.playbackErrorMessage = nil } }
         message: { Text(audio.playbackErrorMessage ?? "Unknown playback error") }
+        .sheet(isPresented: $isPhotoLibraryPresented) {
+            PhotoLibraryPicker {
+                // One batch-level gate, registered before the picker
+                // dismisses: destination and intake timestamp are captured
+                // once for the whole selection, so a mid-batch Ask or
+                // navigation cannot split or redirect it.
+                store.beginImageIntake(source: "library")
+            }
+            .ignoresSafeArea()
+        }
+        .fullScreenCover(isPresented: $isCameraPresented) {
+            CameraCapture { payload in
+                store.queueImage(data: payload, source: "camera")
+            }
+            .ignoresSafeArea()
+        }
     }
 
     // MARK: - Composer
@@ -86,13 +105,14 @@ struct ConversationDetailView: View {
                 endHold: { session.endHold() },
                 cancelHold: { session.cancelHold() },
                 askKibo: {
-                    if store.askableClipCount > 0 {
+                    if store.askableItemCount > 0 {
                         session.startSubmit(afterCaptureEnded: true)
                     }
                 }
             )
             Spacer()
             composerStatus
+            attachButton
         }
         .padding(.horizontal)
         .padding(.vertical, 10)
@@ -121,11 +141,36 @@ struct ConversationDetailView: View {
             }
             .font(.subheadline.weight(.medium))
             .foregroundStyle(.secondary)
-        } else if store.askableClipCount > 0 {
-            Text("\(store.askableClipCount) pending")
+        } else if store.askableItemCount > 0 {
+            Text("\(store.askableItemCount) pending")
                 .font(.subheadline.weight(.medium))
                 .foregroundStyle(.secondary)
         }
+    }
+
+    /// One attach entry point; intake goes straight to the pending sweep (no
+    /// staging UI) — an added image normalizes, spools, uploads, and shows up
+    /// as a "not asked yet" card for the next swipe-up ask to claim.
+    private var attachButton: some View {
+        Menu {
+            Button("Photo Library", systemImage: "photo.on.rectangle") {
+                isPhotoLibraryPresented = true
+            }
+            if CameraCapture.isAvailable {
+                Button("Take Photo", systemImage: "camera") {
+                    isCameraPresented = true
+                }
+            }
+        } label: {
+            Image(systemName: "plus")
+                .font(.system(size: 20, weight: .semibold))
+                .foregroundStyle(Color.kiboCoral)
+                .frame(width: 44, height: 44)
+                .background(Color.kiboCoral.opacity(0.12), in: Circle())
+        }
+        .disabled(store.selectedConversationID == nil)
+        .accessibilityLabel("Add photo")
+        .accessibilityIdentifier("attach-button")
     }
 
     // MARK: - Timeline cards
@@ -145,7 +190,16 @@ struct ConversationDetailView: View {
                         .padding(.horizontal, 6)
                 }
                 VStack(alignment: .leading, spacing: 6) {
-                    Text(item.body).textSelection(.enabled)
+                    if let imageID = item.imageID, let sha256 = item.imageSHA256 {
+                        TimelineImageView(
+                            imageID: imageID,
+                            sha256: sha256,
+                            aspectRatio: item.imageAspectRatio
+                        )
+                    }
+                    if item.imageID == nil || !item.body.isEmpty {
+                        Text(item.body).textSelection(.enabled)
+                    }
                     if playbackID != nil {
                         HStack(spacing: 5) {
                             if isLoading {
@@ -209,5 +263,60 @@ struct ConversationDetailView: View {
             return Color.kiboCoral.opacity(active ? 0.30 : 0.15)
         }
         return active ? Color.kiboCoral.opacity(0.12) : Color(.secondarySystemGroupedBackground)
+    }
+}
+
+/// Photo inside a timeline card, loaded through the sha256-verified cache.
+/// Un-uploaded images never reach the timeline (pending count only), so this
+/// view always has a durable server event behind it.
+private struct TimelineImageView: View {
+    @EnvironmentObject private var store: AppStore
+    let imageID: String
+    let sha256: String
+    let aspectRatio: Double?
+
+    @State private var image: UIImage?
+    @State private var failed = false
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFit()
+            } else {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Color.kiboCoral.opacity(0.08))
+                    .aspectRatio(aspectRatio ?? 4 / 3, contentMode: .fit)
+                    .overlay {
+                        if failed {
+                            Label("Tap to retry", systemImage: "arrow.clockwise")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ProgressView()
+                        }
+                    }
+            }
+        }
+        .frame(maxWidth: 240, maxHeight: 280)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .onTapGesture {
+            guard failed else { return }
+            failed = false
+            Task { await load() }
+        }
+        .task(id: sha256) { await load() }
+        .accessibilityLabel("Photo")
+        .accessibilityIdentifier("timeline-image")
+    }
+
+    private func load() async {
+        guard image == nil else { return }
+        if let loaded = await store.image(imageID: imageID, sha256: sha256) {
+            image = loaded
+        } else {
+            failed = true
+        }
     }
 }

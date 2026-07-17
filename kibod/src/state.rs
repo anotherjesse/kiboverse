@@ -1,12 +1,12 @@
 use crate::agentic::{CodexKnowledgeAgent, QueryEvent, RunningQuery};
-use crate::ai::{Ai, HistoryTurn, TTS_RATE};
+use crate::ai::{Ai, DESCRIPTION_PROMPT_VERSION, HistoryImage, HistoryTurn, ImagePart, TTS_RATE};
 use crate::journal::JournalWrite;
 use crate::knowledge::{self, Document, IngestReceipt, JinaReader, ReaderDocument, WebSource};
 use crate::model::{epoch, epoch_millis, make_id};
 use crate::store::{AutoNameOutcome, Store, hex_sha256};
 use crate::workflow::{
-    ConversationWorkflow, FailureStage, HistoryContext, ReplyRecord, ReplyState, SpeechState,
-    TranscriptState, TurnAction,
+    AttemptState, ConversationWorkflow, FailureStage, HistoryContext, ImageWork, ReplyRecord,
+    ReplyState, SpeechState, TranscriptState, TurnAction, TurnImage, TurnMedia,
 };
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
@@ -98,6 +98,7 @@ impl RetryPolicy {
 #[derive(Clone)]
 struct WorkflowPolicy {
     transcription: RetryPolicy,
+    description: RetryPolicy,
     reply: RetryPolicy,
     speech: RetryPolicy,
     infrastructure_delay: Duration,
@@ -113,8 +114,17 @@ struct AttemptFailure<'a> {
 #[derive(Clone, Copy)]
 enum AttemptSubject<'a> {
     Transcript(&'a str),
+    Description(&'a str),
     Reply(&'a str),
     Speech(&'a str),
+}
+
+/// The two per-media supervised text-projection stages. They share one
+/// attempt loop; only the event kinds, provider call, and retry policy vary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaStage {
+    Transcription,
+    Description,
 }
 
 impl Default for WorkflowPolicy {
@@ -123,6 +133,9 @@ impl Default for WorkflowPolicy {
             Arc::from([Duration::from_secs(1), Duration::from_secs(5)]);
         Self {
             transcription: RetryPolicy {
+                retry_delays: retry_delays.clone(),
+            },
+            description: RetryPolicy {
                 retry_delays: retry_delays.clone(),
             },
             reply: RetryPolicy {
@@ -720,15 +733,15 @@ impl AppState {
         self.inner.speech.lock().unwrap().remove(key);
     }
 
-    /// Schedule currently due work for a newly available or replayed clip.
+    /// Schedule currently due work for newly available or replayed media.
     /// This never reopens terminal work: an idempotent data submission is not
     /// a workflow control command.
-    pub fn reconcile_transcriptions(&self, project_id: &str, conversation_id: &str) -> Result<()> {
-        self.ensure_transcriptions(project_id, conversation_id)
+    pub fn reconcile_media(&self, project_id: &str, conversation_id: &str) -> Result<()> {
+        self.ensure_media_work(project_id, conversation_id)
     }
 
-    /// Explicitly reopen a terminal transcription, then schedule all due clip
-    /// work. Repeating this command while work is already open is inert.
+    /// Explicitly reopen a terminal transcription, then schedule all due
+    /// media work. Repeating this command while work is already open is inert.
     pub fn retry_transcription(
         &self,
         project_id: &str,
@@ -763,8 +776,48 @@ impl AppState {
         Ok(true)
     }
 
-    fn schedule_transcription(&self, project_id: String, conversation_id: String, clip_id: String) {
-        let key = key3(&project_id, &conversation_id, &clip_id);
+    /// Explicitly reopen terminal or interrupted description work. Replies
+    /// never wait on descriptions, so this only reschedules the value.
+    pub fn retry_description(
+        &self,
+        project_id: &str,
+        conversation_id: &str,
+        image_id: &str,
+        reason: &str,
+    ) -> Result<bool> {
+        let records = self.inner.store.records(project_id, conversation_id)?;
+        let workflow = ConversationWorkflow::from_records(&records);
+        if workflow.image(image_id).is_none() {
+            return Ok(false);
+        }
+        let expected_image = image_id.to_string();
+        self.append_if(
+            project_id,
+            conversation_id,
+            JournalWrite::description_retry_requested(image_id, reason),
+            move |records| {
+                matches!(
+                    ConversationWorkflow::from_records(records)
+                        .image(&expected_image)
+                        .map(|image| &image.description),
+                    Some(
+                        AttemptState::TerminalFailure(_) | AttemptState::Attempting { .. }
+                    )
+                )
+            },
+        )?;
+        self.wake_conversation(project_id.to_string(), conversation_id.to_string());
+        Ok(true)
+    }
+
+    fn schedule_media_stage(
+        &self,
+        project_id: String,
+        conversation_id: String,
+        media_id: String,
+        stage: MediaStage,
+    ) {
+        let key = key3(&project_id, &conversation_id, &media_id);
         if !self.inner.transcribing.lock().unwrap().insert(key.clone()) {
             return;
         }
@@ -774,135 +827,153 @@ impl AppState {
             loop {
                 if recover_infrastructure {
                     tokio::time::sleep(state.inner.workflow_policy.infrastructure_delay).await;
-                    match state.recover_interrupted_transcription(
+                    match state.recover_interrupted_media(
                         &project_id,
                         &conversation_id,
-                        &clip_id,
+                        &media_id,
+                        stage,
                         "supervisor_recovery",
                     ) {
                         Ok(()) => {}
                         Err(error) => {
-                            tracing::error!(%project_id, %conversation_id, %clip_id, "recover transcription supervisor: {error:#}");
+                            tracing::error!(%project_id, %conversation_id, %media_id, "recover media supervisor: {error:#}");
                             continue;
                         }
                     }
                 }
                 match state
-                    .drive_transcription(&project_id, &conversation_id, &clip_id)
+                    .drive_media_stage(&project_id, &conversation_id, &media_id, stage)
                     .await
                 {
                     Ok(()) => break,
                     Err(error) => {
-                        tracing::error!(%project_id, %conversation_id, %clip_id, "transcription infrastructure: {error:#}");
+                        tracing::error!(%project_id, %conversation_id, %media_id, "media stage infrastructure: {error:#}");
                         recover_infrastructure = true;
                     }
                 }
             }
             state.inner.transcribing.lock().unwrap().remove(&key);
-            if let Err(error) = state.ensure_transcriptions(&project_id, &conversation_id) {
-                tracing::error!(%project_id, %conversation_id, %clip_id, "reschedule durable transcription work: {error:#}");
+            if let Err(error) = state.ensure_media_work(&project_id, &conversation_id) {
+                tracing::error!(%project_id, %conversation_id, %media_id, "reschedule durable media work: {error:#}");
             }
             state.wake_conversation(project_id, conversation_id);
         });
     }
 
-    async fn drive_transcription(
+    /// One supervised attempt loop for both per-media text projections. The
+    /// stage selects event kinds, the provider call, and the retry policy;
+    /// the claim/compare-and-append protocol is identical.
+    async fn drive_media_stage(
         &self,
         project_id: &str,
         conversation_id: &str,
-        clip_id: &str,
+        media_id: &str,
+        stage: MediaStage,
     ) -> Result<()> {
         loop {
             let records = self.inner.store.records(project_id, conversation_id)?;
             let workflow = ConversationWorkflow::from_records(&records);
-            let clip = workflow
-                .clip(clip_id)
-                .cloned()
-                .ok_or_else(|| anyhow!("clip event is missing"))?;
-            let (attempt, retry_at_ms) = match &clip.transcript {
-                TranscriptState::Due { next_attempt } => (*next_attempt, 0),
-                TranscriptState::RetryScheduled {
-                    next_attempt,
-                    retry_at_ms,
-                    ..
-                } => (*next_attempt, *retry_at_ms),
-                TranscriptState::Attempting { .. }
-                | TranscriptState::Succeeded(_)
-                | TranscriptState::TerminalFailure(_) => return Ok(()),
+            let scheduled = match stage {
+                MediaStage::Transcription => workflow
+                    .clip(media_id)
+                    .map(|clip| clip.transcript.scheduled_work()),
+                MediaStage::Description => workflow
+                    .image(media_id)
+                    .map(|image| image.description.scheduled_work()),
+            }
+            .ok_or_else(|| anyhow!("media event is missing"))?;
+            let Some((attempt, retry_at_ms)) = scheduled else {
+                return Ok(());
             };
             sleep_until_epoch_ms(retry_at_ms).await;
 
-            let expected_clip = clip_id.to_string();
+            let started_event = match stage {
+                MediaStage::Transcription => JournalWrite::transcript_started(media_id, attempt),
+                MediaStage::Description => JournalWrite::description_started(media_id, attempt),
+            };
+            let expected = media_id.to_string();
             let started = self.append_if(
                 project_id,
                 conversation_id,
-                JournalWrite::transcript_started(clip_id, attempt),
-                move |records| {
-                    let workflow = ConversationWorkflow::from_records(records);
-                    match workflow.clip(&expected_clip).map(|clip| &clip.transcript) {
-                        Some(TranscriptState::Due { next_attempt }) => {
-                            retry_at_ms == 0 && *next_attempt == attempt
-                        }
-                        Some(TranscriptState::RetryScheduled {
-                            next_attempt,
-                            retry_at_ms: current_retry_at_ms,
-                            ..
-                        }) => *next_attempt == attempt && *current_retry_at_ms == retry_at_ms,
-                        _ => false,
-                    }
-                },
+                started_event,
+                move |records| stage_runnable_in(records, stage, &expected, attempt, retry_at_ms),
             )?;
             if started.is_none() {
                 continue;
             }
 
-            match self
-                .transcribe_once(project_id, conversation_id, &clip)
-                .await
-            {
+            let result = match stage {
+                MediaStage::Transcription => {
+                    let clip = workflow
+                        .clip(media_id)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("clip event is missing"))?;
+                    self.transcribe_once(project_id, conversation_id, &clip).await
+                }
+                MediaStage::Description => {
+                    let image = workflow
+                        .image(media_id)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("image event is missing"))?;
+                    self.describe_once(project_id, conversation_id, &image).await
+                }
+            };
+            match result {
                 Ok(text) => {
-                    let expected_clip = clip_id.to_string();
-                    let transcript = self.append_if(
+                    let success_event = match stage {
+                        MediaStage::Transcription => {
+                            JournalWrite::transcript_succeeded(media_id, text, attempt)
+                        }
+                        MediaStage::Description => JournalWrite::description_succeeded(
+                            media_id,
+                            &text,
+                            attempt,
+                            self.inner.ai.description_model(),
+                            DESCRIPTION_PROMPT_VERSION,
+                        ),
+                    };
+                    let expected = media_id.to_string();
+                    let success = self.append_if(
                         project_id,
                         conversation_id,
-                        JournalWrite::transcript_succeeded(clip_id, text, attempt),
-                        move |records| {
-                            matches!(
-                                ConversationWorkflow::from_records(records)
-                                    .clip(&expected_clip)
-                                    .map(|clip| &clip.transcript),
-                                Some(TranscriptState::Attempting { attempt: current })
-                                    if *current == attempt
-                            )
-                        },
+                        success_event,
+                        move |records| stage_attempting_in(records, stage, &expected, attempt),
                     )?;
-                    if transcript.is_none() {
+                    if success.is_none() {
                         continue;
                     }
-                    self.auto_name_conversation(project_id, conversation_id);
+                    if stage == MediaStage::Transcription {
+                        // R13: auto-naming fires only on transcript success,
+                        // never on descriptions.
+                        self.auto_name_conversation(project_id, conversation_id);
+                    }
                     return Ok(());
                 }
                 Err(error) => {
+                    let subject = match stage {
+                        MediaStage::Transcription => AttemptSubject::Transcript(media_id),
+                        MediaStage::Description => AttemptSubject::Description(media_id),
+                    };
+                    let policy = match stage {
+                        MediaStage::Transcription => &self.inner.workflow_policy.transcription,
+                        MediaStage::Description => &self.inner.workflow_policy.description,
+                    };
                     let event = self.attempt_error_event(
                         AttemptFailure {
-                            subject: AttemptSubject::Transcript(clip_id),
+                            subject,
                             attempt,
                             error: format!("{error:#}"),
                             retryable: self.inner.ai.failure_is_retryable(&error),
                         },
-                        &self.inner.workflow_policy.transcription,
+                        policy,
                     );
-                    let expected_clip = clip_id.to_string();
-                    let failure =
-                        self.append_if(project_id, conversation_id, event, move |records| {
-                            matches!(
-                                ConversationWorkflow::from_records(records)
-                                    .clip(&expected_clip)
-                                    .map(|clip| &clip.transcript),
-                                Some(TranscriptState::Attempting { attempt: current })
-                                    if *current == attempt
-                            )
-                        })?;
+                    let expected = media_id.to_string();
+                    let failure = self.append_if(
+                        project_id,
+                        conversation_id,
+                        event,
+                        move |records| stage_attempting_in(records, stage, &expected, attempt),
+                    )?;
                     if failure.is_none() {
                         continue;
                     }
@@ -947,6 +1018,42 @@ impl AppState {
         self.inner.ai.transcribe(&wav).await
     }
 
+    /// The transcribe_once doctrine for pixels: bytes are re-verified against
+    /// the durable SHA before the provider sees them, so a corrupt payload can
+    /// never produce an authoritative description.
+    async fn describe_once(
+        &self,
+        project_id: &str,
+        conversation_id: &str,
+        image: &ImageWork,
+    ) -> Result<String> {
+        let bytes = tokio::fs::read(self.inner.store.image_path(
+            project_id,
+            conversation_id,
+            &image.id,
+        )?)
+        .await?;
+        if let Some(expected_sha256) = &image.sha256
+            && !hex_sha256(&bytes).eq_ignore_ascii_case(expected_sha256)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "image {} payload does not match its durable SHA-256",
+                    image.id
+                ),
+            )
+            .into());
+        }
+        let _permit = self
+            .inner
+            .provider_permits
+            .acquire()
+            .await
+            .map_err(|_| anyhow!("provider concurrency gate closed"))?;
+        self.inner.ai.describe_image(&bytes, &image.mime).await
+    }
+
     fn append_attempt_error(
         &self,
         project_id: &str,
@@ -966,6 +1073,7 @@ impl AppState {
     ) -> JournalWrite {
         let owner_id = match failure.subject {
             AttemptSubject::Transcript(clip_id) => clip_id,
+            AttemptSubject::Description(image_id) => image_id,
             AttemptSubject::Reply(turn_id) | AttemptSubject::Speech(turn_id) => turn_id,
         };
         let retry_delay = if failure.retryable {
@@ -978,6 +1086,12 @@ impl AppState {
             match failure.subject {
                 AttemptSubject::Transcript(clip_id) => JournalWrite::transcript_retry_scheduled(
                     clip_id,
+                    failure.attempt,
+                    failure.error,
+                    retry_at_ms,
+                ),
+                AttemptSubject::Description(image_id) => JournalWrite::description_retry_scheduled(
+                    image_id,
                     failure.attempt,
                     failure.error,
                     retry_at_ms,
@@ -1000,6 +1114,9 @@ impl AppState {
                 AttemptSubject::Transcript(clip_id) => {
                     JournalWrite::transcript_failed(clip_id, failure.attempt, failure.error)
                 }
+                AttemptSubject::Description(image_id) => {
+                    JournalWrite::description_failed(image_id, failure.attempt, failure.error)
+                }
                 AttemptSubject::Reply(turn_id) => {
                     JournalWrite::reply_failed(turn_id, failure.attempt, failure.error)
                 }
@@ -1010,39 +1127,54 @@ impl AppState {
         }
     }
 
-    fn ensure_transcriptions(&self, project_id: &str, conversation_id: &str) -> Result<()> {
+    fn ensure_media_work(&self, project_id: &str, conversation_id: &str) -> Result<()> {
         let records = self.inner.store.records(project_id, conversation_id)?;
-        for work in ConversationWorkflow::from_records(&records).transcription_work() {
-            self.schedule_transcription(
+        let workflow = ConversationWorkflow::from_records(&records);
+        for work in workflow.transcription_work() {
+            self.schedule_media_stage(
                 project_id.to_string(),
                 conversation_id.to_string(),
                 work.clip_id,
+                MediaStage::Transcription,
+            );
+        }
+        for work in workflow.description_work() {
+            self.schedule_media_stage(
+                project_id.to_string(),
+                conversation_id.to_string(),
+                work.image_id,
+                MediaStage::Description,
             );
         }
         Ok(())
     }
 
-    fn recover_interrupted_transcription(
+    fn recover_interrupted_media(
         &self,
         project_id: &str,
         conversation_id: &str,
-        clip_id: &str,
+        media_id: &str,
+        stage: MediaStage,
         reason: &str,
     ) -> Result<()> {
-        let expected_clip = clip_id.to_string();
-        self.append_if(
-            project_id,
-            conversation_id,
-            JournalWrite::transcript_retry_requested(clip_id, reason),
-            move |records| {
-                matches!(
-                    ConversationWorkflow::from_records(records)
-                        .clip(&expected_clip)
-                        .map(|clip| &clip.transcript),
+        let event = match stage {
+            MediaStage::Transcription => JournalWrite::transcript_retry_requested(media_id, reason),
+            MediaStage::Description => JournalWrite::description_retry_requested(media_id, reason),
+        };
+        let expected = media_id.to_string();
+        self.append_if(project_id, conversation_id, event, move |records| {
+            let workflow = ConversationWorkflow::from_records(records);
+            match stage {
+                MediaStage::Transcription => matches!(
+                    workflow.clip(&expected).map(|clip| &clip.transcript),
                     Some(TranscriptState::Attempting { .. })
-                )
-            },
-        )?;
+                ),
+                MediaStage::Description => matches!(
+                    workflow.image(&expected).map(|image| &image.description),
+                    Some(AttemptState::Attempting { .. })
+                ),
+            }
+        })?;
         Ok(())
     }
 
@@ -1191,7 +1323,7 @@ impl AppState {
         // Scheduling is part of the supervised operation. A transient journal
         // read failure therefore backs off and retries instead of allowing a
         // transcription-blocked turn to become dormant.
-        self.ensure_transcriptions(project_id, conversation_id)?;
+        self.ensure_media_work(project_id, conversation_id)?;
         self.drain_turns(project_id, conversation_id).await
     }
 
@@ -1227,16 +1359,9 @@ impl AppState {
                         },
                     )?;
                 }
-                TurnAction::GenerateReply { attempt, user_text } => {
-                    self.run_reply_attempt(
-                        project_id,
-                        conversation_id,
-                        &workflow,
-                        &turn_id,
-                        attempt,
-                        &user_text,
-                    )
-                    .await?;
+                TurnAction::GenerateReply { attempt } => {
+                    self.run_reply_attempt(project_id, conversation_id, &workflow, &turn_id, attempt)
+                        .await?;
                 }
                 TurnAction::GenerateSpeech { attempt, reply } => {
                     let generation_index = workflow
@@ -1258,6 +1383,11 @@ impl AppState {
         }
     }
 
+    /// Every reply transition here is conditional on this attempt still being
+    /// current (the transcription compare-and-append protocol, applied to the
+    /// reply stage). A payload repair that reopens the turn while a provider
+    /// call is in flight therefore supersedes this attempt instead of racing
+    /// its stale result into the journal.
     async fn run_reply_attempt(
         &self,
         project_id: &str,
@@ -1265,40 +1395,75 @@ impl AppState {
         workflow: &ConversationWorkflow,
         turn_id: &str,
         attempt: u32,
-        user_text: &str,
     ) -> Result<()> {
-        self.append(
+        let expected_turn = turn_id.to_string();
+        let started = self.append_if(
             project_id,
             conversation_id,
             JournalWrite::reply_started(turn_id, attempt),
+            move |records| reply_runnable_in(records, &expected_turn, attempt),
         )?;
+        if started.is_none() {
+            return Ok(());
+        }
         let turn = workflow
             .turn(turn_id)
             .ok_or_else(|| anyhow!("turn event is missing"))?;
-        if turn.clips.is_empty() {
-            self.append_attempt_error(
+        if turn.clips.is_empty() && turn.images.is_empty() {
+            self.append_reply_result_error(
                 project_id,
                 conversation_id,
-                AttemptFailure {
-                    subject: AttemptSubject::Reply(turn_id),
-                    attempt,
-                    error: "turn has no clips".into(),
-                    retryable: false,
-                },
+                turn_id,
+                attempt,
+                "turn has no clips or images".into(),
+                false,
                 &RetryPolicy {
                     retry_delays: Arc::from([]),
                 },
             )?;
             return Ok(());
         }
-        if user_text.is_empty() {
-            self.append(
+        let content = workflow
+            .turn_content(turn_id)
+            .ok_or_else(|| anyhow!("turn event is missing"))?;
+        let user_text = content.user_text();
+        let turn_images = content.images();
+        // A turn is answerable when it has text OR images; the sentinel fires
+        // only when both are absent.
+        if user_text.is_empty() && turn_images.is_empty() {
+            let expected_turn = turn_id.to_string();
+            self.append_if(
                 project_id,
                 conversation_id,
                 JournalWrite::reply_text(turn_id, "[nothing to answer]", turn.clips.clone()),
+                move |records| reply_attempting_in(records, &expected_turn, attempt),
             )?;
             return Ok(());
         }
+        // Verify every claimed image against its durable SHA before any byte
+        // can reach the provider; corrupt payloads close the attempt locally
+        // and heal through re-PUT repair.
+        let mut image_bytes = HashMap::new();
+        for image in &turn_images {
+            match self.load_verified_image(project_id, conversation_id, image).await {
+                Ok(bytes) => {
+                    image_bytes.insert(image.id.clone(), bytes);
+                }
+                Err(error) => {
+                    self.append_reply_result_error(
+                        project_id,
+                        conversation_id,
+                        turn_id,
+                        attempt,
+                        format!("{error:#}"),
+                        self.inner.ai.failure_is_retryable(&error),
+                        &self.inner.workflow_policy.reply,
+                    )?;
+                    return Ok(());
+                }
+            }
+        }
+        let request = bound_current_turn(turn_request_items(&content, &image_bytes));
         let HistoryContext {
             turns: projected_history,
             previous_interaction_id,
@@ -1309,6 +1474,14 @@ impl AppState {
             .map(|turn| HistoryTurn {
                 user: turn.user,
                 assistant: turn.assistant,
+                images: turn
+                    .images
+                    .into_iter()
+                    .map(|image| HistoryImage {
+                        id: image.id,
+                        description: image.description,
+                    })
+                    .collect(),
             })
             .collect();
         let reply_result = {
@@ -1320,7 +1493,12 @@ impl AppState {
                 .map_err(|_| anyhow!("provider concurrency gate closed"))?;
             self.inner
                 .ai
-                .chat(user_text, previous_interaction_id.as_deref(), &history)
+                .chat(
+                    &request.text,
+                    &request.parts,
+                    previous_interaction_id.as_deref(),
+                    &history,
+                )
                 .await
         };
         match reply_result {
@@ -1333,7 +1511,8 @@ impl AppState {
                     &generation,
                     1,
                 )?;
-                if let Err(error) = self.append(
+                let expected_turn = turn_id.to_string();
+                let committed = self.append_if(
                     project_id,
                     conversation_id,
                     JournalWrite::reply_spoken(
@@ -1344,28 +1523,98 @@ impl AppState {
                         generation,
                         history_through_seq,
                     ),
-                ) {
-                    if let Some((key, stream)) = prepared {
-                        self.discard_speech_endpoint(&key, &stream, &error);
+                    move |records| reply_attempting_in(records, &expected_turn, attempt),
+                );
+                match committed {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        // Superseded mid-flight (payload repair or explicit
+                        // reopen): drop the pre-registered stream and let the
+                        // drain loop run the now-current attempt.
+                        if let Some((key, stream)) = prepared {
+                            self.discard_speech_endpoint(
+                                &key,
+                                &stream,
+                                &anyhow!("reply attempt superseded before its result was durable"),
+                            );
+                        }
                     }
-                    return Err(error);
+                    Err(error) => {
+                        if let Some((key, stream)) = prepared {
+                            self.discard_speech_endpoint(&key, &stream, &error);
+                        }
+                        return Err(error);
+                    }
                 }
             }
             Err(error) => {
-                self.append_attempt_error(
+                self.append_reply_result_error(
                     project_id,
                     conversation_id,
-                    AttemptFailure {
-                        subject: AttemptSubject::Reply(turn_id),
-                        attempt,
-                        error: format!("{error:#}"),
-                        retryable: self.inner.ai.failure_is_retryable(&error),
-                    },
+                    turn_id,
+                    attempt,
+                    format!("{error:#}"),
+                    self.inner.ai.failure_is_retryable(&error),
                     &self.inner.workflow_policy.reply,
                 )?;
             }
         }
         Ok(())
+    }
+
+    /// Append a reply-stage failure only while this attempt is still current.
+    #[allow(clippy::too_many_arguments)]
+    fn append_reply_result_error(
+        &self,
+        project_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        attempt: u32,
+        error: String,
+        retryable: bool,
+        policy: &RetryPolicy,
+    ) -> Result<()> {
+        let event = self.attempt_error_event(
+            AttemptFailure {
+                subject: AttemptSubject::Reply(turn_id),
+                attempt,
+                error,
+                retryable,
+            },
+            policy,
+        );
+        let expected_turn = turn_id.to_string();
+        self.append_if(project_id, conversation_id, event, move |records| {
+            reply_attempting_in(records, &expected_turn, attempt)
+        })?;
+        Ok(())
+    }
+
+    async fn load_verified_image(
+        &self,
+        project_id: &str,
+        conversation_id: &str,
+        image: &TurnImage,
+    ) -> Result<Vec<u8>> {
+        let bytes = tokio::fs::read(self.inner.store.image_path(
+            project_id,
+            conversation_id,
+            &image.id,
+        )?)
+        .await?;
+        if let Some(expected_sha256) = &image.sha256
+            && !hex_sha256(&bytes).eq_ignore_ascii_case(expected_sha256)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "image {} payload does not match its durable SHA-256",
+                    image.id
+                ),
+            )
+            .into());
+        }
+        Ok(bytes)
     }
 
     async fn run_speech_attempt(
@@ -1545,19 +1794,23 @@ impl AppState {
         let records = self.inner.store.records(project_id, conversation_id)?;
         let workflow = ConversationWorkflow::from_records(&records);
         for clip_id in workflow.interrupted_transcriptions() {
-            let expected_clip = clip_id.clone();
-            self.append_if(
+            self.recover_interrupted_media(
                 project_id,
                 conversation_id,
-                JournalWrite::transcript_retry_requested(&clip_id, "startup_recovery"),
-                move |records| {
-                    matches!(
-                        ConversationWorkflow::from_records(records)
-                            .clip(&expected_clip)
-                            .map(|clip| &clip.transcript),
-                        Some(TranscriptState::Attempting { .. })
-                    )
-                },
+                &clip_id,
+                MediaStage::Transcription,
+                "startup_recovery",
+            )?;
+        }
+        // Fail-fast doctrine: an interrupted description is durable work that
+        // startup must explicitly reopen, exactly like transcripts.
+        for image_id in workflow.interrupted_descriptions() {
+            self.recover_interrupted_media(
+                project_id,
+                conversation_id,
+                &image_id,
+                MediaStage::Description,
+                "startup_recovery",
             )?;
         }
         for (turn_id, stage) in workflow.interrupted_turn_stages() {
@@ -1603,7 +1856,7 @@ impl AppState {
                 }
             }
         }
-        self.ensure_transcriptions(project_id, conversation_id)?;
+        self.ensure_media_work(project_id, conversation_id)?;
         if !workflow.turns().is_empty() {
             self.wake_conversation(project_id.into(), conversation_id.into());
         }
@@ -1676,11 +1929,258 @@ fn key3(project_id: &str, conversation_id: &str, item_id: &str) -> String {
     format!("{project_id}/{conversation_id}/{item_id}")
 }
 
+fn stage_matches_runnable<T, F>(
+    state: Option<&AttemptState<T, F>>,
+    attempt: u32,
+    retry_at_ms: u64,
+) -> bool {
+    match state {
+        Some(AttemptState::Due { next_attempt }) => retry_at_ms == 0 && *next_attempt == attempt,
+        Some(AttemptState::RetryScheduled {
+            next_attempt,
+            retry_at_ms: current_retry_at_ms,
+            ..
+        }) => *next_attempt == attempt && *current_retry_at_ms == retry_at_ms,
+        _ => false,
+    }
+}
+
+fn stage_matches_attempting<T, F>(state: Option<&AttemptState<T, F>>, attempt: u32) -> bool {
+    matches!(
+        state,
+        Some(AttemptState::Attempting { attempt: current }) if *current == attempt
+    )
+}
+
+fn stage_runnable_in(
+    records: &[Value],
+    stage: MediaStage,
+    media_id: &str,
+    attempt: u32,
+    retry_at_ms: u64,
+) -> bool {
+    let workflow = ConversationWorkflow::from_records(records);
+    match stage {
+        MediaStage::Transcription => stage_matches_runnable(
+            workflow.clip(media_id).map(|clip| &clip.transcript),
+            attempt,
+            retry_at_ms,
+        ),
+        MediaStage::Description => stage_matches_runnable(
+            workflow.image(media_id).map(|image| &image.description),
+            attempt,
+            retry_at_ms,
+        ),
+    }
+}
+
+fn stage_attempting_in(records: &[Value], stage: MediaStage, media_id: &str, attempt: u32) -> bool {
+    let workflow = ConversationWorkflow::from_records(records);
+    match stage {
+        MediaStage::Transcription => {
+            stage_matches_attempting(workflow.clip(media_id).map(|clip| &clip.transcript), attempt)
+        }
+        MediaStage::Description => stage_matches_attempting(
+            workflow.image(media_id).map(|image| &image.description),
+            attempt,
+        ),
+    }
+}
+
+fn reply_runnable_in(records: &[Value], turn_id: &str, attempt: u32) -> bool {
+    match ConversationWorkflow::from_records(records)
+        .turn(turn_id)
+        .map(|turn| &turn.reply)
+    {
+        Some(ReplyState::Due { next_attempt })
+        | Some(ReplyState::RetryScheduled { next_attempt, .. }) => *next_attempt == attempt,
+        _ => false,
+    }
+}
+
+fn reply_attempting_in(records: &[Value], turn_id: &str, attempt: u32) -> bool {
+    stage_matches_attempting(
+        ConversationWorkflow::from_records(records)
+            .turn(turn_id)
+            .map(|turn| &turn.reply),
+        attempt,
+    )
+}
+
+// Request bounds (§3.4): every dimension of the provider call is bounded and
+// deterministic — image parts, encoded payload, degraded reference lines, and
+// total current-turn text. Nothing derived here is journaled.
+const MAX_INLINE_IMAGE_PARTS: usize = 16;
+const MAX_INLINE_IMAGE_ENCODED_BYTES: usize = 15 * 1024 * 1024;
+const MAX_DEGRADED_IMAGE_LINES: usize = 24;
+const MAX_CURRENT_TURN_TEXT_BYTES: usize = 32 * 1024;
+
+/// One current-turn media element in TurnContent order.
+enum TurnRequestItem {
+    Text(String),
+    Image {
+        id: String,
+        mime: String,
+        data: Vec<u8>,
+        description: Option<String>,
+    },
+}
+
+struct BoundedTurnRequest {
+    text: String,
+    parts: Vec<ImagePart>,
+}
+
+fn turn_request_items(
+    content: &crate::workflow::TurnContent,
+    image_bytes: &HashMap<String, Vec<u8>>,
+) -> Vec<TurnRequestItem> {
+    let mut items = Vec::new();
+    for item in &content.items {
+        match item {
+            TurnMedia::Transcript { text, .. } => {
+                if crate::workflow::meaningful_user_text(text) {
+                    items.push(TurnRequestItem::Text(text.clone()));
+                }
+            }
+            TurnMedia::Image(image) => {
+                // The caption is user text exactly once, at its media
+                // position; image reference lines never repeat it.
+                if let Some(caption) = image
+                    .caption
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|caption| !caption.is_empty())
+                {
+                    items.push(TurnRequestItem::Text(caption.to_string()));
+                }
+                items.push(TurnRequestItem::Image {
+                    id: image.id.clone(),
+                    mime: image.mime.clone(),
+                    data: image_bytes.get(&image.id).cloned().unwrap_or_default(),
+                    description: image.description.clone(),
+                });
+            }
+        }
+    }
+    items
+}
+
+fn base64_encoded_len(bytes: usize) -> usize {
+    bytes.div_ceil(3) * 4
+}
+
+/// Deterministically shape the current turn under the request bounds: inline
+/// images newest-first within the part and encoded-byte caps; overflow images
+/// degrade to reference lines (description or bare id, never the caption),
+/// capped with a summary; total text collapses oldest-first into markers.
+fn bound_current_turn(items: Vec<TurnRequestItem>) -> BoundedTurnRequest {
+    let mut inline = HashSet::new();
+    let mut encoded_total = 0usize;
+    for (index, item) in items.iter().enumerate().rev() {
+        let TurnRequestItem::Image { data, .. } = item else {
+            continue;
+        };
+        if inline.len() >= MAX_INLINE_IMAGE_PARTS {
+            break;
+        }
+        let encoded = base64_encoded_len(data.len());
+        if encoded_total + encoded >= MAX_INLINE_IMAGE_ENCODED_BYTES {
+            continue;
+        }
+        encoded_total += encoded;
+        inline.insert(index);
+    }
+
+    enum Segment {
+        UserText(String),
+        ImageLine(String),
+    }
+    let mut segments = Vec::new();
+    let mut parts = Vec::new();
+    let mut summarized = 0usize;
+    let mut degraded_lines = 0usize;
+    for (index, item) in items.into_iter().enumerate() {
+        match item {
+            TurnRequestItem::Text(text) => segments.push(Segment::UserText(text)),
+            TurnRequestItem::Image {
+                id,
+                mime,
+                data,
+                description,
+            } => {
+                if inline.contains(&index) {
+                    parts.push(ImagePart { id, mime, data });
+                } else if degraded_lines < MAX_DEGRADED_IMAGE_LINES {
+                    degraded_lines += 1;
+                    segments.push(Segment::ImageLine(match description {
+                        Some(description) => format!("[Image {id}: {description}]"),
+                        None => format!("[Image {id}]"),
+                    }));
+                } else {
+                    summarized += 1;
+                }
+            }
+        }
+    }
+
+    let render = |segments: &[Segment], truncated: bool, summarized: usize| {
+        let mut lines = Vec::new();
+        if truncated {
+            lines.push("[+truncated]".to_string());
+        }
+        for segment in segments {
+            match segment {
+                Segment::UserText(text) | Segment::ImageLine(text) => lines.push(text.clone()),
+            }
+        }
+        if summarized > 0 {
+            lines.push(format!("[+{summarized} more images]"));
+        }
+        lines.join("\n")
+    };
+
+    let mut truncated = false;
+    let mut start = 0usize;
+    loop {
+        let text = render(&segments[start..], truncated, summarized);
+        if text.len() <= MAX_CURRENT_TURN_TEXT_BYTES {
+            return BoundedTurnRequest { text, parts };
+        }
+        if start + 1 >= segments.len() {
+            // A single oversized segment: hard-truncate on a character
+            // boundary rather than losing the entire turn text.
+            truncated = true;
+            let markers = render(&[], truncated, summarized).len() + 1;
+            let budget = MAX_CURRENT_TURN_TEXT_BYTES.saturating_sub(markers);
+            if let Some(segment) = segments.get_mut(start) {
+                let (Segment::UserText(text) | Segment::ImageLine(text)) = segment;
+                let mut end = budget.min(text.len());
+                while end > 0 && !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+            }
+            return BoundedTurnRequest {
+                text: render(&segments[start..], truncated, summarized),
+                parts,
+            };
+        }
+        // Collapse oldest-first: dropped image lines fold into the summary
+        // count, dropped user text is marked once.
+        match &segments[start] {
+            Segment::UserText(_) => truncated = true,
+            Segment::ImageLine(_) => summarized += 1,
+        }
+        start += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agentic::{CodexKnowledgeAgent, QueryEvent};
-    use crate::store::{ClipUpload, CreateTurnOutcome, hex_sha256};
+    use crate::store::{ClipUpload, CreateTurnOutcome, ImageUpload, PutImage, hex_sha256};
 
     #[test]
     fn conversation_supervision_preserves_a_wake_during_an_active_pass() {
@@ -1901,7 +2401,7 @@ while read ignored; do :; done
             .unwrap();
         let state = AppState::new(store.clone(), Ai::mock());
         state
-            .reconcile_transcriptions("kibo", &conversation.id)
+            .reconcile_media("kibo", &conversation.id)
             .unwrap();
         let outcome = store
             .create_turn("kibo", conversation_id, "turn-1")
@@ -1930,7 +2430,7 @@ while read ignored; do :; done
 
         put_test_clip(&store, conversation_id, "clip-2", wav, 2);
         state
-            .reconcile_transcriptions("kibo", conversation_id)
+            .reconcile_media("kibo", conversation_id)
             .unwrap();
         assert!(matches!(
             store
@@ -2363,7 +2863,7 @@ while read ignored; do :; done
             test_workflow_policy(&[Duration::from_millis(1)], &[], &[]),
         );
         state
-            .reconcile_transcriptions("kibo", &conversation.id)
+            .reconcile_media("kibo", &conversation.id)
             .unwrap();
 
         wait_for_matching_event(&store, conversation_id, |event| {
@@ -2415,7 +2915,7 @@ while read ignored; do :; done
         // explicit runnable work instead of relying on its in-memory set.
         store.fail_append_after(1);
         state
-            .reconcile_transcriptions("kibo", &conversation.id)
+            .reconcile_media("kibo", &conversation.id)
             .unwrap();
 
         wait_for_matching_event(&store, conversation_id, |event| {
@@ -2469,7 +2969,7 @@ while read ignored; do :; done
             test_workflow_policy(&[], &[], &[]),
         );
         state
-            .reconcile_transcriptions("kibo", &conversation.id)
+            .reconcile_media("kibo", &conversation.id)
             .unwrap();
         state.wake_conversation("kibo".into(), conversation.id.clone());
 
@@ -2551,7 +3051,7 @@ while read ignored; do :; done
             test_workflow_policy(&[], &[], &[]),
         );
         state
-            .reconcile_transcriptions("kibo", conversation_id)
+            .reconcile_media("kibo", conversation_id)
             .unwrap();
         state.wake_conversation("kibo".into(), conversation.id.clone());
         wait_for_event_count(&store, conversation_id, "reply_error", 1).await;
@@ -2590,7 +3090,7 @@ while read ignored; do :; done
         let state =
             AppState::with_workflow_policy(store.clone(), ai, test_workflow_policy(&[], &[], &[]));
         state
-            .reconcile_transcriptions("kibo", &conversation.id)
+            .reconcile_media("kibo", &conversation.id)
             .unwrap();
         tokio::time::timeout(Duration::from_secs(2), provider_started.notified())
             .await
@@ -2617,7 +3117,7 @@ while read ignored; do :; done
         assert_eq!(outcome, crate::store::PutClip::Repaired);
         state.publish_persisted("kibo", &conversation.id, event.unwrap());
         state
-            .reconcile_transcriptions("kibo", &conversation.id)
+            .reconcile_media("kibo", &conversation.id)
             .unwrap();
         release_provider.notify_one();
 
@@ -2665,7 +3165,7 @@ while read ignored; do :; done
             test_workflow_policy(&[], &[], &[]),
         );
         state
-            .reconcile_transcriptions("kibo", &conversation.id)
+            .reconcile_media("kibo", &conversation.id)
             .unwrap();
 
         wait_for_event(&store, &conversation.id, "transcript_error").await;
@@ -2697,7 +3197,7 @@ while read ignored; do :; done
             test_workflow_policy(&[], &[], &[]),
         );
         state
-            .reconcile_transcriptions("kibo", &conversation.id)
+            .reconcile_media("kibo", &conversation.id)
             .unwrap();
         wait_for_matching_event(&store, &conversation.id, |event| {
             event["kind"] == "transcript_error" && event["terminal"] == true
@@ -2719,7 +3219,7 @@ while read ignored; do :; done
             .unwrap();
         assert_eq!(outcome, crate::store::PutClip::AlreadyExists);
         state
-            .reconcile_transcriptions("kibo", &conversation.id)
+            .reconcile_media("kibo", &conversation.id)
             .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         let before_retry = store.records("kibo", &conversation.id).unwrap();
@@ -2988,6 +3488,85 @@ while read ignored; do :; done
     }
 
     #[tokio::test]
+    async fn image_descriptions_dirty_the_note_again_after_the_turn_lands() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(temporary.path()).unwrap();
+        let conversation = store.create_conversation("kibo", Some("Camera roll")).unwrap();
+        for event in [
+            json!({"kind":"image", "id":"img-1", "recorded_at":1000, "caption":"whiteboard after standup"}),
+            json!({"kind":"turn", "id":"turn-1", "images":["img-1"]}),
+            json!({"kind":"reply", "turn":"turn-1", "text":"Looks busy."}),
+        ] {
+            store
+                .append_fixture("kibo", &conversation.id, event)
+                .unwrap();
+        }
+        let state = AppState::new(store.clone(), Ai::mock());
+        let wiki_path = format!("wiki/sources/conversation--{}.md", conversation.id);
+        let dirty = |store: &Store| {
+            knowledge::source_statuses(store, "kibo")
+                .unwrap()
+                .iter()
+                .any(|status| status.id == conversation.id && status.dirty)
+        };
+
+        // Transition one: the turn and reply land while the description is
+        // still pending — the note compiles without any image reference.
+        assert!(dirty(&store));
+        let first = state
+            .ingest_conversation("kibo", &conversation.id, false)
+            .await
+            .unwrap();
+        assert!(matches!(first, IngestOutcome::Ingested(ref receipt) if receipt.generation == 1));
+        let note = knowledge::read_markdown(&store, "kibo", &wiki_path).unwrap();
+        assert!(note.contains("whiteboard after standup"));
+        assert!(!note.contains("[Image"));
+        assert!(!note.contains("## Images"));
+        assert!(matches!(
+            state
+                .ingest_conversation("kibo", &conversation.id, false)
+                .await
+                .unwrap(),
+            IngestOutcome::Skipped
+        ));
+
+        // Transition two: the description value lands and dirties the note a
+        // second time; the recompiled note carries the reference line and the
+        // mechanical appendix.
+        store
+            .append_fixture(
+                "kibo",
+                &conversation.id,
+                json!({"kind":"description", "image":"img-1", "text":"Sticky notes grouped into three lanes"}),
+            )
+            .unwrap();
+        assert!(dirty(&store));
+        let once = knowledge::conversation_document(&store, "kibo", &conversation.id).unwrap();
+        let twice = knowledge::conversation_document(&store, "kibo", &conversation.id).unwrap();
+        assert_eq!(once.body, twice.body);
+        assert_eq!(once.content_sha256, twice.content_sha256);
+        let second = state
+            .ingest_conversation("kibo", &conversation.id, false)
+            .await
+            .unwrap();
+        assert!(matches!(second, IngestOutcome::Ingested(ref receipt) if receipt.generation == 2));
+        let note = knowledge::read_markdown(&store, "kibo", &wiki_path).unwrap();
+        assert!(note.contains("[Image img-1: Sticky notes grouped into three lanes]"));
+        assert!(note.contains("### Image img-1 <a id=\"img-img-1\"></a>"));
+        assert!(note.contains("> Sticky notes grouped into three lanes"));
+        // Caption uniformity: the caption appears once (as user text in the
+        // compiled source material), never in the image line or appendix.
+        assert_eq!(note.matches("whiteboard after standup").count(), 1);
+        assert!(matches!(
+            state
+                .ingest_conversation("kibo", &conversation.id, false)
+                .await
+                .unwrap(),
+            IngestOutcome::Skipped
+        ));
+    }
+
+    #[tokio::test]
     async fn imported_reader_content_uses_the_same_checkpoint_path() {
         let temporary = tempfile::tempdir().unwrap();
         let store = Store::open(temporary.path()).unwrap();
@@ -3019,6 +3598,461 @@ while read ignored; do :; done
         );
     }
 
+    fn test_jpeg(payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xE0];
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn put_test_image(
+        store: &Store,
+        conversation_id: &str,
+        image_id: &str,
+        bytes: &[u8],
+        recorded_at: u64,
+        caption: Option<&str>,
+    ) -> String {
+        let sha = hex_sha256(bytes);
+        store
+            .put_image(ImageUpload {
+                project_id: "kibo",
+                conversation_id,
+                image_id,
+                bytes,
+                expected_sha256: &sha,
+                recorded_at,
+                width: None,
+                height: None,
+                caption: caption.map(str::to_string),
+            })
+            .unwrap();
+        sha
+    }
+
+    #[tokio::test]
+    async fn mock_pipeline_answers_an_image_only_turn() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(temporary.path()).unwrap();
+        let conversation = store.create_conversation("kibo", None).unwrap();
+        let conversation_id = conversation.id.as_str();
+        let jpeg = test_jpeg(b"desk photo");
+        let sha = put_test_image(&store, conversation_id, "img-1", &jpeg, 1, None);
+        let state = AppState::new(store.clone(), Ai::mock());
+        state.reconcile_media("kibo", conversation_id).unwrap();
+        let outcome = store.create_turn("kibo", conversation_id, "turn-1").unwrap();
+        let CreateTurnOutcome::Created { images, clips, .. } = outcome else {
+            panic!("expected a new turn");
+        };
+        assert_eq!(images, ["img-1"]);
+        assert!(clips.is_empty());
+        state.wake_conversation("kibo".into(), conversation.id.clone());
+
+        wait_for_event(&store, conversation_id, "speech_ready").await;
+        wait_for_event(&store, conversation_id, "description").await;
+        let records = store.records("kibo", conversation_id).unwrap();
+        let reply = records
+            .iter()
+            .find(|event| event["kind"] == "reply")
+            .unwrap();
+        // The mock proves the model received the actual pixels, and the turn
+        // was answerable with no text at all.
+        assert_eq!(
+            reply["text"],
+            format!("I see 1 image(s): {}", &sha[..8])
+        );
+        assert!(reply["audio"].is_string());
+        let description = records
+            .iter()
+            .find(|event| event["kind"] == "description")
+            .unwrap();
+        assert_eq!(
+            description["text"],
+            format!("MOCK IMAGE: {}", &sha[..8])
+        );
+        assert_eq!(description["model"], "mock");
+        assert_eq!(description["prompt_version"], 1);
+        assert!(
+            !records
+                .iter()
+                .any(|event| event["text"] == "[nothing to answer]")
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_pipeline_combines_text_captions_and_images() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(temporary.path()).unwrap();
+        let conversation = store.create_conversation("kibo", None).unwrap();
+        let conversation_id = conversation.id.as_str();
+        put_test_clip(&store, conversation_id, "clip-1", b"RIFF0000WAVE mock", 1);
+        let jpeg = test_jpeg(b"desk photo");
+        let sha = put_test_image(
+            &store,
+            conversation_id,
+            "img-1",
+            &jpeg,
+            2,
+            Some("on my desk"),
+        );
+        let state = AppState::new(store.clone(), Ai::mock());
+        state.reconcile_media("kibo", conversation_id).unwrap();
+        store.create_turn("kibo", conversation_id, "turn-1").unwrap();
+        state.wake_conversation("kibo".into(), conversation.id.clone());
+
+        wait_for_event(&store, conversation_id, "speech_ready").await;
+        let records = store.records("kibo", conversation_id).unwrap();
+        let reply = records
+            .iter()
+            .find(|event| event["kind"] == "reply")
+            .unwrap();
+        // Transcript then caption in media order, then the pixel receipt.
+        assert_eq!(
+            reply["text"],
+            format!(
+                "I heard you say: Mock voice transcript\non my desk [saw 1 image(s): {}]",
+                &sha[..8]
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn silent_clip_with_image_is_still_answerable() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(temporary.path()).unwrap();
+        let conversation = store.create_conversation("kibo", None).unwrap();
+        let conversation_id = conversation.id.as_str();
+        let wav = b"RIFF0000WAVE silent";
+        let sha = hex_sha256(wav);
+        store
+            .put_clip(ClipUpload {
+                project_id: "kibo",
+                conversation_id,
+                clip_id: "clip-1",
+                bytes: wav,
+                expected_sha256: &sha,
+                duration_ms: 800,
+                peak_pct: 0, // transcribes to the [silent] sentinel
+                recorded_at: 1,
+            })
+            .unwrap();
+        let jpeg = test_jpeg(b"just pixels");
+        let image_sha = put_test_image(&store, conversation_id, "img-1", &jpeg, 2, None);
+        let state = AppState::new(store.clone(), Ai::mock());
+        state.reconcile_media("kibo", conversation_id).unwrap();
+        store.create_turn("kibo", conversation_id, "turn-1").unwrap();
+        state.wake_conversation("kibo".into(), conversation.id.clone());
+
+        wait_for_event(&store, conversation_id, "speech_ready").await;
+        let records = store.records("kibo", conversation_id).unwrap();
+        let reply = records
+            .iter()
+            .find(|event| event["kind"] == "reply")
+            .unwrap();
+        assert_eq!(
+            reply["text"],
+            format!("I see 1 image(s): {}", &image_sha[..8])
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_image_bytes_cannot_reach_the_model() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(temporary.path()).unwrap();
+        let conversation = store.create_conversation("kibo", None).unwrap();
+        let conversation_id = conversation.id.as_str();
+        let jpeg = test_jpeg(b"original pixels");
+        let sha = put_test_image(&store, conversation_id, "img-1", &jpeg, 1, None);
+        store.create_turn("kibo", conversation_id, "turn-1").unwrap();
+        std::fs::write(
+            store.image_path("kibo", conversation_id, "img-1").unwrap(),
+            b"not the journaled payload",
+        )
+        .unwrap();
+        let state = AppState::with_workflow_policy(
+            store.clone(),
+            Ai::mock(),
+            test_workflow_policy(&[], &[], &[]),
+        );
+        state.wake_conversation("kibo".into(), conversation.id.clone());
+
+        wait_for_matching_event(&store, conversation_id, |event| {
+            event["kind"] == "reply_error" && event["terminal"] == true
+        })
+        .await;
+        let records = store.records("kibo", conversation_id).unwrap();
+        let failure = records
+            .iter()
+            .find(|event| event["kind"] == "reply_error")
+            .unwrap();
+        assert!(
+            failure["error"]
+                .as_str()
+                .unwrap()
+                .contains("does not match its durable SHA-256")
+        );
+        assert!(!records.iter().any(|event| event["kind"] == "reply"));
+
+        // Repair restores the bytes and reopens the closed reply; the turn
+        // then completes against verified pixels.
+        let upload_sha = sha.clone();
+        let (outcome, events) = store
+            .put_image(ImageUpload {
+                project_id: "kibo",
+                conversation_id,
+                image_id: "img-1",
+                bytes: &jpeg,
+                expected_sha256: &upload_sha,
+                recorded_at: 1,
+                width: None,
+                height: None,
+                caption: None,
+            })
+            .unwrap();
+        assert_eq!(outcome, PutImage::Repaired);
+        assert!(
+            events
+                .iter()
+                .any(|event| event["kind"] == "reply_retry_requested")
+        );
+        state.reconcile_media("kibo", conversation_id).unwrap();
+        state.wake_conversation("kibo".into(), conversation.id.clone());
+        wait_for_event(&store, conversation_id, "reply").await;
+        let reply_text = store
+            .records("kibo", conversation_id)
+            .unwrap()
+            .iter()
+            .find(|event| event["kind"] == "reply")
+            .unwrap()["text"]
+            .clone();
+        assert_eq!(reply_text, format!("I see 1 image(s): {}", &sha[..8]));
+    }
+
+    #[tokio::test]
+    async fn payload_repair_supersedes_an_in_flight_reply_attempt() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(temporary.path()).unwrap();
+        let conversation = store.create_conversation("kibo", None).unwrap();
+        let conversation_id = conversation.id.as_str();
+        let jpeg = test_jpeg(b"raced pixels");
+        let sha = put_test_image(&store, conversation_id, "img-1", &jpeg, 1, None);
+        store.create_turn("kibo", conversation_id, "turn-1").unwrap();
+        let (ai, chat_started, release_chat) = Ai::mock_blocking_chat();
+        let state =
+            AppState::with_workflow_policy(store.clone(), ai, test_workflow_policy(&[], &[], &[]));
+        state.wake_conversation("kibo".into(), conversation.id.clone());
+        tokio::time::timeout(Duration::from_secs(2), chat_started.notified())
+            .await
+            .unwrap();
+
+        // The provider call is in flight; repair lands and reopens the turn.
+        std::fs::write(
+            store.image_path("kibo", conversation_id, "img-1").unwrap(),
+            b"damaged while the provider is running",
+        )
+        .unwrap();
+        let (outcome, events) = store
+            .put_image(ImageUpload {
+                project_id: "kibo",
+                conversation_id,
+                image_id: "img-1",
+                bytes: &jpeg,
+                expected_sha256: &sha,
+                recorded_at: 1,
+                width: None,
+                height: None,
+                caption: None,
+            })
+            .unwrap();
+        assert_eq!(outcome, PutImage::Repaired);
+        assert!(
+            events
+                .iter()
+                .any(|event| event["kind"] == "reply_retry_requested")
+        );
+        release_chat.notify_one();
+
+        wait_for_event(&store, conversation_id, "reply").await;
+        let records = store.records("kibo", conversation_id).unwrap();
+        let started: Vec<_> = records
+            .iter()
+            .filter(|event| event["kind"] == "reply_started")
+            .collect();
+        assert_eq!(started.len(), 2);
+        assert_eq!(started[0]["attempt"], 1);
+        assert_eq!(started[1]["attempt"], 1);
+        let repair_seq = records
+            .iter()
+            .find(|event| {
+                event["kind"] == "reply_retry_requested" && event["reason"] == "payload_repaired"
+            })
+            .unwrap()["seq"]
+            .as_u64()
+            .unwrap();
+        // The superseded attempt's result was discarded: exactly one reply,
+        // produced by the attempt started after the repair.
+        assert!(started[0]["seq"].as_u64().unwrap() < repair_seq);
+        assert!(repair_seq < started[1]["seq"].as_u64().unwrap());
+        assert_eq!(
+            records
+                .iter()
+                .filter(|event| event["kind"] == "reply")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_reopens_an_interrupted_description() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(temporary.path()).unwrap();
+        let conversation = store.create_conversation("kibo", None).unwrap();
+        let conversation_id = conversation.id.as_str();
+        let jpeg = test_jpeg(b"interrupted");
+        let sha = put_test_image(&store, conversation_id, "img-1", &jpeg, 1, None);
+        store
+            .append_fixture(
+                "kibo",
+                conversation_id,
+                json!({"kind":"description_started", "image":"img-1", "attempt":1}),
+            )
+            .unwrap();
+        let state = AppState::with_workflow_policy(
+            store.clone(),
+            Ai::mock(),
+            test_workflow_policy(&[], &[], &[]),
+        );
+        state.resume().unwrap();
+
+        wait_for_event(&store, conversation_id, "description").await;
+        let records = store.records("kibo", conversation_id).unwrap();
+        assert!(records.iter().any(|event| {
+            event["kind"] == "description_retry_requested"
+                && event["image"] == "img-1"
+                && event["reason"] == "startup_recovery"
+        }));
+        assert_eq!(
+            records
+                .iter()
+                .find(|event| event["kind"] == "description")
+                .unwrap()["text"],
+            format!("MOCK IMAGE: {}", &sha[..8])
+        );
+    }
+
+    #[test]
+    fn bounded_request_encoded_boundary_is_exclusive() {
+        // "stays under 15 MiB encoded": exactly-at-cap is rejected, one
+        // base64 quantum under is inlined.
+        let at_cap_raw = MAX_INLINE_IMAGE_ENCODED_BYTES / 4 * 3;
+        assert_eq!(base64_encoded_len(at_cap_raw), MAX_INLINE_IMAGE_ENCODED_BYTES);
+        let request = bound_current_turn(vec![TurnRequestItem::Image {
+            id: "img-at".into(),
+            mime: "image/jpeg".into(),
+            data: vec![0u8; at_cap_raw],
+            description: None,
+        }]);
+        assert!(request.parts.is_empty());
+        assert_eq!(request.text, "[Image img-at]");
+
+        let request = bound_current_turn(vec![TurnRequestItem::Image {
+            id: "img-under".into(),
+            mime: "image/jpeg".into(),
+            data: vec![0u8; at_cap_raw - 3],
+            description: None,
+        }]);
+        assert_eq!(request.parts.len(), 1);
+        assert_eq!(request.text, "");
+    }
+
+    #[test]
+    fn bounded_request_degrades_single_image_over_budget() {
+        // One image whose encoding alone exceeds the cap still yields an
+        // answerable request: it degrades to its reference line.
+        let request = bound_current_turn(vec![TurnRequestItem::Image {
+            id: "img-big".into(),
+            mime: "image/jpeg".into(),
+            data: vec![0u8; 12 * 1024 * 1024],
+            description: Some("a mural".into()),
+        }]);
+        assert!(request.parts.is_empty());
+        assert_eq!(request.text, "[Image img-big: a mural]");
+    }
+
+    #[test]
+    fn bounded_request_caps_inline_parts_at_sixteen_newest() {
+        let items: Vec<TurnRequestItem> = (0..17)
+            .map(|index| TurnRequestItem::Image {
+                id: format!("img-{index:02}"),
+                mime: "image/jpeg".into(),
+                data: vec![index as u8; 8],
+                description: Some(format!("photo {index}")),
+            })
+            .collect();
+        let request = bound_current_turn(items);
+        assert_eq!(request.parts.len(), 16);
+        // Newest sixteen inline, in media order; the oldest degrades.
+        assert_eq!(request.parts[0].id, "img-01");
+        assert_eq!(request.parts[15].id, "img-16");
+        assert_eq!(request.text, "[Image img-00: photo 0]");
+    }
+
+    #[test]
+    fn bounded_request_caps_encoded_bytes_and_degrades_oldest() {
+        // Three 6 MiB images encode to 8 MiB each; only the newest fits the
+        // 15 MiB encoded cap, so the older two degrade deterministically.
+        let items: Vec<TurnRequestItem> = (0..3)
+            .map(|index| TurnRequestItem::Image {
+                id: format!("img-{index}"),
+                mime: "image/jpeg".into(),
+                data: vec![0u8; 6 * 1024 * 1024],
+                description: (index == 0).then(|| "oldest".to_string()),
+            })
+            .collect();
+        let request = bound_current_turn(items);
+        assert_eq!(request.parts.len(), 1);
+        assert_eq!(request.parts[0].id, "img-2");
+        assert_eq!(request.text, "[Image img-0: oldest]\n[Image img-1]");
+    }
+
+    #[test]
+    fn bounded_request_caps_degraded_lines_with_a_summary() {
+        // 16 inline + 30 degraded: 24 reference lines plus a summary of 6.
+        let items: Vec<TurnRequestItem> = (0..46)
+            .map(|index| TurnRequestItem::Image {
+                id: format!("img-{index:02}"),
+                mime: "image/jpeg".into(),
+                data: vec![1; 4],
+                description: None,
+            })
+            .collect();
+        let request = bound_current_turn(items);
+        assert_eq!(request.parts.len(), 16);
+        let lines: Vec<&str> = request.text.lines().collect();
+        assert_eq!(lines.len(), 25);
+        assert_eq!(lines[0], "[Image img-00]");
+        assert_eq!(lines[23], "[Image img-23]");
+        assert_eq!(lines[24], "[+6 more images]");
+    }
+
+    #[test]
+    fn bounded_request_collapses_oversized_text_oldest_first() {
+        let big = "x".repeat(20 * 1024);
+        let items = vec![
+            TurnRequestItem::Text(big.clone()),
+            TurnRequestItem::Text(big.clone()),
+            TurnRequestItem::Text("the newest words".to_string()),
+        ];
+        let request = bound_current_turn(items);
+        assert!(request.text.len() <= MAX_CURRENT_TURN_TEXT_BYTES);
+        assert!(request.text.starts_with("[+truncated]"));
+        assert!(request.text.ends_with("the newest words"));
+
+        // A single segment larger than the whole budget is truncated, not lost.
+        let oversized = bound_current_turn(vec![TurnRequestItem::Text("y".repeat(40 * 1024))]);
+        assert!(oversized.text.len() <= MAX_CURRENT_TURN_TEXT_BYTES);
+        assert!(oversized.text.contains("yyy"));
+    }
+
     async fn wait_for_event(store: &Store, conversation_id: &str, kind: &str) {
         wait_for_event_count(store, conversation_id, kind, 1).await;
     }
@@ -3033,6 +4067,7 @@ while read ignored; do :; done
         };
         WorkflowPolicy {
             transcription: retry(transcription),
+            description: retry(transcription),
             reply: retry(reply),
             speech: retry(speech),
             infrastructure_delay: Duration::from_millis(25),

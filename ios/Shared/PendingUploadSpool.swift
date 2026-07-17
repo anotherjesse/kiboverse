@@ -188,10 +188,7 @@ struct PendingClip: Codable, Identifiable, Sendable {
         }
         if version >= 2 {
             let digest = try container.decode(String.self, forKey: .sha256)
-            guard digest.count == 64,
-                  digest.utf8.allSatisfy({
-                      (48...57).contains($0) || (97...102).contains($0)
-                  }) else {
+            guard SpoolPrimitives.isLowercaseHexSHA256(digest) else {
                 throw DecodingError.dataCorruptedError(
                     forKey: .sha256,
                     in: container,
@@ -507,12 +504,7 @@ struct PendingUploadSpool {
     }
 
     private static func isSafeFilename(_ filename: String) -> Bool {
-        !filename.isEmpty
-            && filename != "."
-            && filename != ".."
-            && filename == URL(fileURLWithPath: filename).lastPathComponent
-            && !filename.contains("/")
-            && !filename.contains(":")
+        SpoolPrimitives.isSafeFilename(filename)
     }
 
     private static func isVersionedScratchFilename(_ filename: String) -> Bool {
@@ -524,6 +516,6 @@ struct PendingUploadSpool {
     }
 
     private static func sha256(_ data: Data) -> String {
-        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        SpoolPrimitives.sha256Hex(data)
     }
 }

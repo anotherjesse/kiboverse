@@ -17,6 +17,37 @@ struct TimelineItem: Identifiable, Hashable {
     let durationMs: UInt64?
     let canPlay: Bool
     let retryTarget: RetryTarget?
+    let imageID: String?
+    let imageSHA256: String?
+    let imageAspectRatio: Double?
+
+    init(
+        id: String,
+        role: Role,
+        title: String,
+        body: String,
+        turnID: String?,
+        clipID: String?,
+        durationMs: UInt64?,
+        canPlay: Bool,
+        retryTarget: RetryTarget?,
+        imageID: String? = nil,
+        imageSHA256: String? = nil,
+        imageAspectRatio: Double? = nil
+    ) {
+        self.id = id
+        self.role = role
+        self.title = title
+        self.body = body
+        self.turnID = turnID
+        self.clipID = clipID
+        self.durationMs = durationMs
+        self.canPlay = canPlay
+        self.retryTarget = retryTarget
+        self.imageID = imageID
+        self.imageSHA256 = imageSHA256
+        self.imageAspectRatio = imageAspectRatio
+    }
 }
 
 enum RetryTarget: Hashable {
@@ -55,9 +86,30 @@ extension Array where Element == KiboEvent {
 
     var unclaimedClipCount: Int { unclaimedClipIDs.count }
 
+    /// Server-side images not yet claimed by any turn. Together with
+    /// `unclaimedClipIDs` this is everything the next "Ask Kibo" would submit.
+    var unclaimedImageIDs: Set<String> {
+        var imageIDs = Set<String>()
+        var claimed = Set<String>()
+        for event in self {
+            switch event.kind {
+            case "image":
+                if let imageID = event.id { imageIDs.insert(imageID) }
+            case "turn":
+                claimed.formUnion(event.images ?? [])
+            default:
+                continue
+            }
+        }
+        return imageIDs.subtracting(claimed)
+    }
+
+    var unclaimedMediaCount: Int { unclaimedClipIDs.count + unclaimedImageIDs.count }
+
     func timeline() -> [TimelineItem] {
         let projection = ConversationPresentation(events: self)
         var claimed = Set<String>()
+        var claimedImages = Set<String>()
         var result: [TimelineItem] = []
 
         func personCard(clipID: String, title: String) -> TimelineItem {
@@ -75,13 +127,44 @@ extension Array where Element == KiboEvent {
             )
         }
 
+        func imageCard(imageID: String, title: String) -> TimelineItem {
+            let event = projection.imageEvents[imageID]
+            let aspectRatio: Double? = {
+                guard let width = event?.width, let height = event?.height,
+                      width > 0, height > 0 else { return nil }
+                return Double(width) / Double(height)
+            }()
+            return TimelineItem(
+                id: "image-\(imageID)", role: .person, title: title,
+                body: event?.caption ?? "", turnID: nil, clipID: nil,
+                durationMs: nil, canPlay: false, retryTarget: nil,
+                imageID: imageID, imageSHA256: event?.sha256,
+                imageAspectRatio: aspectRatio
+            )
+        }
+
         for event in sorted(by: { $0.seq < $1.seq }) where event.kind == "turn" {
             guard let turnID = event.id else { continue }
             let clipIDs = event.clips ?? []
+            let imageIDs = event.images ?? []
             claimed.formUnion(clipIDs)
-            // One card per recording, not one clump per turn.
-            for clipID in clipIDs {
-                result.append(personCard(clipID: clipID, title: "You"))
+            claimedImages.formUnion(imageIDs)
+            // One card per media item; clips and images merge-sorted by
+            // (recorded_at, seq) — the order every other surface renders.
+            let media = clipIDs.map { (id: $0, isImage: false) }
+                + imageIDs.map { (id: $0, isImage: true) }
+            // Tie-break on the claim array's own ordinal, not lexical ID:
+            // media whose referenced events are missing/malformed all share
+            // the (0, 0) key and must keep the server's order.
+            let ordered = media.enumerated().sorted { lhs, rhs in
+                let left = projection.mediaOrder[lhs.element.id] ?? (0, 0)
+                let right = projection.mediaOrder[rhs.element.id] ?? (0, 0)
+                return left == right ? lhs.offset < rhs.offset : left < right
+            }.map(\.element)
+            for item in ordered {
+                result.append(item.isImage
+                    ? imageCard(imageID: item.id, title: "You")
+                    : personCard(clipID: item.id, title: "You"))
             }
             switch projection.replies[turnID] {
             case let .ready(reply):
@@ -121,9 +204,31 @@ extension Array where Element == KiboEvent {
             }
         }
 
-        for event in sorted(by: { $0.seq < $1.seq }) where event.kind == "clip" {
-            guard let clipID = event.id, !claimed.contains(clipID) else { continue }
-            result.append(personCard(clipID: clipID, title: "You · not asked yet"))
+        // The pending tail interleaves unclaimed clips and images by
+        // (recorded_at, seq) — the SAME merge rule as claimed media inside a
+        // turn, and the order the server will claim them in. Upload latency
+        // must not reorder the conversation: a photo added before a voice
+        // note renders above it even when its upload landed later.
+        let unclaimedMedia = sorted(by: { $0.seq < $1.seq })
+            .filter { $0.kind == "clip" || $0.kind == "image" }
+            .compactMap { event -> (id: String, isImage: Bool)? in
+                guard let mediaID = event.id else { return nil }
+                if event.kind == "clip" {
+                    guard !claimed.contains(mediaID) else { return nil }
+                    return (mediaID, false)
+                }
+                guard !claimedImages.contains(mediaID) else { return nil }
+                return (mediaID, true)
+            }
+        let orderedTail = unclaimedMedia.enumerated().sorted { lhs, rhs in
+            let left = projection.mediaOrder[lhs.element.id] ?? (0, 0)
+            let right = projection.mediaOrder[rhs.element.id] ?? (0, 0)
+            return left == right ? lhs.offset < rhs.offset : left < right
+        }.map(\.element)
+        for item in orderedTail {
+            result.append(item.isImage
+                ? imageCard(imageID: item.id, title: "You · not asked yet")
+                : personCard(clipID: item.id, title: "You · not asked yet"))
         }
         return result
     }
@@ -270,6 +375,10 @@ private struct ConversationPresentation {
     var replies: [String: ReplyStatus] = [:]
     var speech: [String: SpeechStatus] = [:]
     var speechEventSeq: [String: UInt64] = [:]
+    /// First `image` commitment event per image ID (sha256/dimensions/caption).
+    var imageEvents: [String: KiboEvent] = [:]
+    /// Claim-time ordering key shared by clips and images.
+    var mediaOrder: [String: (recordedAt: UInt64, seq: UInt64)] = [:]
 
     init(events: [KiboEvent]) {
         for event in events.sorted(by: { $0.seq < $1.seq }) {
@@ -277,7 +386,16 @@ private struct ConversationPresentation {
             case "clip":
                 guard let clipID = event.id else { continue }
                 durations[clipID] = event.ms
+                if mediaOrder[clipID] == nil {
+                    mediaOrder[clipID] = (event.recorded_at ?? 0, event.seq)
+                }
                 if transcripts[clipID] == nil { transcripts[clipID] = .transcribing }
+            case "image":
+                guard let imageID = event.id else { continue }
+                if imageEvents[imageID] == nil { imageEvents[imageID] = event }
+                if mediaOrder[imageID] == nil {
+                    mediaOrder[imageID] = (event.recorded_at ?? 0, event.seq)
+                }
             case "transcript_started":
                 guard let clipID = event.clip,
                       transcripts[clipID]?.isReady != true,

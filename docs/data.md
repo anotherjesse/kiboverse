@@ -67,6 +67,8 @@ kibo-data/
           turns.jsonl
           clips/
             <clip-id>.wav
+          images/
+            <image-id>.jpg|png|webp
           recordings/
             <recording-id>/
               manifest.json
@@ -244,7 +246,13 @@ The table omits the common `kind`, `seq`, and `at` fields.
 | `transcript_retry_scheduled` | `clip`, `attempt`, `error`, `retry_at_ms` | A retryable transcription attempt failed and its next attempt has a durable deadline. This distinct kind keeps older clients from mistaking a retry for a terminal error. |
 | `transcript` | `clip`, `text` | Successful transcription of a clip. Peak-zero clips get the sentinel text `[silent]` without calling the provider. |
 | `transcript_error` | `clip`, `attempt`, `error`, `terminal: true` | Transcription exhausted its bounded policy or failed permanently. It stays closed until an explicit retry request. |
-| `turn` | `id`, `clips` | An explicit request for Kibo to answer. It atomically claims all clips that are unclaimed at creation time. |
+| `image` | `id`, `file`, `mime`, `recorded_at`, `sha256`; optional `width`, `height`, `caption` | A committed user photo. `file` is `images/<id>.jpg\|png\|webp`; `mime` is the server-sniffed authority (JPEG, PNG, or WebP — HEIC is rejected, clients transcode). `width`/`height` are trusted layout hints; `caption` is user text fixed at first upload (≤ 4 KiB). Clips and images share one media-ID namespace per conversation. |
+| `description_started` | `image`, `attempt` | An AI description attempt began. Like transcripts, an unmatched started event is durable interrupted work. |
+| `description_retry_requested` | `image`, `reason` | Explicitly reopens non-successful description work at attempt 1. Reasons include `payload_repaired`, `explicit_retry`, `startup_recovery`, and `supervisor_recovery`. |
+| `description_retry_scheduled` | `image`, `attempt`, `error`, `retry_at_ms` | A retryable description attempt failed and its next attempt has a durable deadline. |
+| `description` | `image`, `text`, `attempt`, `model`, `prompt_version` | The durable text projection of an image, produced once. First success is authoritative. The value is bounded at write time: trimmed, control characters stripped, one paragraph, ≤ 4 KiB. |
+| `description_error` | `image`, `attempt`, `error`, `terminal: true` | Description exhausted its bounded policy or failed permanently. It stays closed until an explicit retry request. |
+| `turn` | `id`, `clips`; optional `images` | An explicit request for Kibo to answer. It atomically claims all clips **and images** that are unclaimed at creation time; `images` is omitted when empty so audio-only turns keep their legacy byte shape. |
 | `reply_started` | `turn`, `attempt` | A model reply attempt began. |
 | `reply_retry_requested` | `turn`, `reason` | Explicitly reopens terminal or interrupted reply work at attempt 1. |
 | `reply_retry_scheduled` | `turn`, `attempt`, `stage`, `error`, `retry_at_ms` | A retryable model attempt failed and its next attempt has a durable deadline. `stage` is `reply`. |
@@ -299,17 +307,37 @@ Relationships are stored as string IDs rather than enforced foreign keys:
 The code assumes these references are valid. It does not validate the full log
 on load or reject every possible duplicate logical record.
 
-### Pending clips
+### Pending media
 
-A clip is pending when its ID does not occur in any `turn.clips` array. Asking
-Kibo creates one turn that claims every pending clip in the conversation. The
-claim is serialized with event appends and is therefore atomic relative to
-uploads and other turn submissions.
+A clip is pending when its ID does not occur in any `turn.clips` array; an
+image is pending when its ID does not occur in any `turn.images` array. Asking
+Kibo creates one turn that claims every pending clip and image in the
+conversation; the request is rejected only when both sets are empty, so
+image-only turns are legal. The claim is serialized with event appends and is
+therefore atomic relative to uploads and other turn submissions.
 
-Claimed clips are sorted by `(recorded_at, seq)`, not merely upload order. This
-allows offline recordings uploaded later to retain client capture order. It
-also means an inaccurate client clock affects the order of text sent to the
-model.
+Each claimed set is sorted by `(recorded_at, seq)`, not merely upload order.
+This allows offline recordings uploaded later to retain client capture order.
+It also means an inaccurate client clock affects the order of content sent to
+the model.
+
+### Image descriptions
+
+Every image gets a durable AI text projection through the `description_*`
+family, supervised by the same parameterized attempt mechanism as
+transcription (scheduled at upload, bounded retries, startup recovery for
+interrupted attempts, first success authoritative). Descriptions are advisory
+values consumed by durable-history fallback, knowledge notes, and UIs —
+**no turn or reply state ever waits on one**. A turn is answerable when its
+projected user text is non-empty or it claims at least one image; the reply
+attempt sends the current turn's sha-verified pixels inline to the model, so
+the description is never part of the live evidence.
+
+The workflow projects a claimed turn's media as one ordered list (`TurnContent`
+— clips and images merge-sorted by `(recorded_at, seq)`), and every consumer
+renders that order. A caption is user text and appears exactly once, at its
+media position; image reference lines rendered anywhere else carry the
+description (`[Image <id>: …]`) or a bare id, never the caption.
 
 ### Turn completion
 
@@ -529,10 +557,13 @@ The data-oriented API is:
 | `GET /v1/projects/{project}/conversations` | List conversation metadata. |
 | `POST /v1/projects/{project}/conversations` | Create a named or placeholder conversation. |
 | `PUT /v1/projects/{project}/conversations/{conversation}/clips/{clip}` | Commit a WAV and `clip` event. |
+| `PUT .../images/{image}` | Commit a JPEG/PNG/WebP and `image` event (magic-byte sniffed; `X-Content-Sha256` required; optional `X-Recorded-At`, `X-Width`, `X-Height`, `?caption=`; ≤ 10 MiB). Idempotent by `(id, sha256)`; repair appends all reopen intents as one batched single-fsync write before restoring bytes and publishes every appended event. |
+| `GET .../images/{image}/content` | Return the stored image after hash-on-read verification: verified bytes get the durable mime, `ETag "<sha256>"`, and immutable private caching; a mismatch is 503 with nothing cacheable (heal via re-PUT repair). |
+| `POST .../images/{image}/retry` | Explicitly reopen terminal or interrupted description work. |
 | `PUT .../recordings/{recording}/parts/{sequence}` | Durably stage one canonical WAV part, idempotently by ID, sequence, and hash. |
 | `POST .../recordings/{recording}/complete` | Assemble staged parts and atomically expose one ordinary clip. |
 | `GET .../clips/{clip}/audio` | Return the stored user WAV. |
-| `POST .../turns` | Idempotently create a turn and claim pending clips. |
+| `POST .../turns` | Idempotently create a turn and claim pending clips ∪ pending images (409 only when both are empty). |
 | `GET .../turns/{turn}/speech?from_sample=N` | Stream live or stored signed-16 little-endian mono PCM from a sample offset within one `X-Speech-Generation`. |
 | `GET .../events?after=N` | Return `{events, latest_seq}` for events with `seq > N`. |
 | `WS .../events?after=N` | Send catch-up events, then transient live events. |
@@ -678,6 +709,15 @@ cursor so reconnect can recover the missing sequence from the log.
 spools have their own fields and recovery behavior and do not appear in the
 server log until upload commits. A complete end-to-end model therefore has
 to account for both “captured locally” and “committed to the server.”
+10. **Journals are forward-only once images land (R14).** `.kibod.lock` means
+one process owns the tree, so old-binary exposure is only rollback-after-
+upgrade or restoring a newer backup onto an older binary. The rule is
+categorical: **after the first `image` event, no old binary may open that data
+directory; rollback requires a pre-image backup.** An old binary sees `image`
+events as unknown and `turn.images` as noise: an image-only turn fails visibly
+(“turn has no clips”) and heals via turn-retry after upgrading, while a mixed
+turn it answered keeps its pixel-less reply — first success stays
+authoritative and ordinary retry does not reopen it.
 
 ## Code map
 

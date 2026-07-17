@@ -19,15 +19,39 @@ const TTS_MODEL: &str = "gemini-3.1-flash-tts-preview";
 const TTS_VOICE: &str = "Kore";
 const PERSONA: &str = "You are kibo, a small robot voice companion. You hear \
 transcribed voice notes and reply out loud through a speaker. Keep replies \
-short and conversational - one to three sentences, easy to listen to.";
+short and conversational - one to three sentences, easy to listen to. When \
+you are shown a photo, talk about what you see naturally, the way a friend \
+would - never narrate that you are analyzing an image.";
+const DESCRIBE_IMAGE_PROMPT: &str = "Describe this image in one or two dense \
+sentences: subjects, visible text, colors, and anything a person would ask \
+about later.";
 
 pub const TTS_RATE: u32 = 24_000;
+pub const DESCRIPTION_PROMPT_VERSION: u32 = 1;
 
 /// One completed exchange reconstructed from the durable conversation log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryTurn {
     pub user: String,
     pub assistant: String,
+    pub images: Vec<HistoryImage>,
+}
+
+/// A past image rendered into the durable fallback prompt. Reference lines
+/// carry the stored description or a bare id — never the caption, which
+/// already sits in the turn's user text (caption uniformity rule).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryImage {
+    pub id: String,
+    pub description: Option<String>,
+}
+
+/// Verified current-turn image bytes sent inline to the provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImagePart {
+    pub id: String,
+    pub mime: String,
+    pub data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +164,12 @@ pub struct Ai {
     transcription_started: Option<Arc<Notify>>,
     #[cfg(test)]
     transcription_release: Option<Arc<Notify>>,
+    #[cfg(test)]
+    chat_blocks: Arc<AtomicUsize>,
+    #[cfg(test)]
+    chat_started: Option<Arc<Notify>>,
+    #[cfg(test)]
+    chat_release: Option<Arc<Notify>>,
 }
 
 impl Ai {
@@ -164,6 +194,12 @@ impl Ai {
             transcription_started: None,
             #[cfg(test)]
             transcription_release: None,
+            #[cfg(test)]
+            chat_blocks: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            chat_started: None,
+            #[cfg(test)]
+            chat_release: None,
         }
     }
 
@@ -180,6 +216,12 @@ impl Ai {
             transcription_started: None,
             #[cfg(test)]
             transcription_release: None,
+            #[cfg(test)]
+            chat_blocks: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            chat_started: None,
+            #[cfg(test)]
+            chat_release: None,
         }
     }
 
@@ -201,8 +243,24 @@ impl Ai {
         (ai, started, release)
     }
 
+    #[cfg(test)]
+    pub(crate) fn mock_blocking_chat() -> (Self, Arc<Notify>, Arc<Notify>) {
+        let mut ai = Self::mock();
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        ai.chat_blocks.store(1, Ordering::SeqCst);
+        ai.chat_started = Some(started.clone());
+        ai.chat_release = Some(release.clone());
+        (ai, started, release)
+    }
+
     pub fn is_mock(&self) -> bool {
         self.mock
+    }
+
+    /// Provenance recorded with each durable description value.
+    pub fn description_model(&self) -> &'static str {
+        if self.mock { "mock" } else { GEMINI_MODEL }
     }
 
     /// Transcribe an entire WAV file using the interactions API.
@@ -253,18 +311,60 @@ impl Ai {
         output_text(&response, "transcript")
     }
 
+    /// Describe an image into a durable text value used by history fallback,
+    /// knowledge notes, and UIs. The caller supplies sha-verified bytes.
+    pub async fn describe_image(&self, bytes: &[u8], mime: &str) -> Result<String> {
+        if self.mock {
+            return Ok(format!(
+                "MOCK IMAGE: {}",
+                &crate::store::hex_sha256(bytes)[..8]
+            ));
+        }
+        let body = json!({
+            "model": GEMINI_MODEL,
+            "input": [
+                { "type": "text", "text": DESCRIBE_IMAGE_PROMPT },
+                {
+                    "type": "image",
+                    "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+                    "mime_type": mime
+                }
+            ]
+        });
+        let response = self.interaction(&body).await?;
+        output_text(&response, "image description")
+    }
+
     /// Continue with Gemini's cached interaction when possible. If that ID
     /// has expired (or otherwise fails), reconstruct the conversation from
-    /// durable turns and retry without provider-side state.
+    /// durable turns and retry without provider-side state. Current-turn
+    /// images travel as inline base64 parts; chained calls keep the bare
+    /// string input unless images are present.
     pub async fn chat(
         &self,
         user_text: &str,
+        image_parts: &[ImagePart],
         previous_interaction_id: Option<&str>,
         durable_history: &[HistoryTurn],
     ) -> Result<ChatReply> {
+        #[cfg(test)]
+        if self
+            .chat_blocks
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            if let Some(started) = &self.chat_started {
+                started.notify_one();
+            }
+            if let Some(release) = &self.chat_release {
+                release.notified().await;
+            }
+        }
         if self.mock {
             return Ok(ChatReply {
-                text: format!("I heard you say: {}", user_text.trim()),
+                text: mock_chat_text(user_text, image_parts),
                 interaction_id: None,
             });
         }
@@ -272,7 +372,7 @@ impl Ai {
         if let Some(previous) = previous_interaction_id.filter(|id| !id.is_empty()) {
             let body = json!({
                 "model": GEMINI_MODEL,
-                "input": user_text,
+                "input": chat_input(user_text, image_parts),
                 "previous_interaction_id": previous,
             });
             match self.interaction(&body).await {
@@ -282,9 +382,12 @@ impl Ai {
             }
         }
 
-        let input = durable_prompt(user_text, durable_history);
+        let prompt = durable_prompt(user_text, durable_history);
         let response = self
-            .interaction(&json!({"model": GEMINI_MODEL, "input": input}))
+            .interaction(&json!({
+                "model": GEMINI_MODEL,
+                "input": chat_input(&prompt, image_parts),
+            }))
             .await
             .context("Gemini chat failed, including durable-history fallback")?;
         chat_reply(&response)
@@ -651,6 +754,47 @@ fn chat_reply(response: &Value) -> Result<ChatReply> {
     })
 }
 
+/// The exact deterministic mock replies the keyless end-to-end tests assert.
+fn mock_chat_text(user_text: &str, image_parts: &[ImagePart]) -> String {
+    let text = user_text.trim();
+    if image_parts.is_empty() {
+        return format!("I heard you say: {text}");
+    }
+    let hashes = image_parts
+        .iter()
+        .map(|part| crate::store::hex_sha256(&part.data)[..8].to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if text.is_empty() {
+        format!("I see {} image(s): {hashes}", image_parts.len())
+    } else {
+        format!(
+            "I heard you say: {text} [saw {} image(s): {hashes}]",
+            image_parts.len()
+        )
+    }
+}
+
+/// Bare-string input is the proven text-only shape; a parts array mirroring
+/// the production audio part is used only when images are present.
+fn chat_input(text: &str, image_parts: &[ImagePart]) -> Value {
+    if image_parts.is_empty() {
+        return json!(text);
+    }
+    let mut parts = Vec::with_capacity(image_parts.len() + 1);
+    if !text.is_empty() {
+        parts.push(json!({ "type": "text", "text": text }));
+    }
+    for part in image_parts {
+        parts.push(json!({
+            "type": "image",
+            "data": base64::engine::general_purpose::STANDARD.encode(&part.data),
+            "mime_type": part.mime,
+        }));
+    }
+    json!(parts)
+}
+
 fn durable_prompt(user_text: &str, history: &[HistoryTurn]) -> String {
     let mut prompt = String::from(PERSONA);
     if !history.is_empty() {
@@ -658,6 +802,18 @@ fn durable_prompt(user_text: &str, history: &[HistoryTurn]) -> String {
         for turn in history {
             prompt.push_str("User: ");
             prompt.push_str(turn.user.trim());
+            // Past pixels are never re-sent; the stored description (or a
+            // bare reference) stands in. Captions already sit in the user
+            // text above, so the reference line never repeats them.
+            for image in &turn.images {
+                prompt.push('\n');
+                match &image.description {
+                    Some(description) => {
+                        prompt.push_str(&format!("[Image {}: {description}]", image.id));
+                    }
+                    None => prompt.push_str(&format!("[Image {}]", image.id)),
+                }
+            }
             prompt.push_str("\nKibo: ");
             prompt.push_str(turn.assistant.trim());
             prompt.push('\n');
@@ -704,11 +860,89 @@ mod tests {
             &[HistoryTurn {
                 user: "old question".into(),
                 assistant: "old answer".into(),
+                images: vec![],
             }],
         );
         assert!(prompt.starts_with(PERSONA));
         assert!(prompt.contains("User: old question\nKibo: old answer"));
         assert!(prompt.ends_with("User: new question\nKibo:"));
+    }
+
+    #[test]
+    fn fallback_prompt_frames_past_images_without_repeating_captions() {
+        let prompt = durable_prompt(
+            "next",
+            &[HistoryTurn {
+                user: "my cat on the desk".into(),
+                assistant: "Cute!".into(),
+                images: vec![
+                    HistoryImage {
+                        id: "img-1".into(),
+                        description: Some("a tabby cat".into()),
+                    },
+                    HistoryImage {
+                        id: "img-2".into(),
+                        description: None,
+                    },
+                ],
+            }],
+        );
+        assert!(prompt.contains(
+            "User: my cat on the desk\n[Image img-1: a tabby cat]\n[Image img-2]\nKibo: Cute!"
+        ));
+    }
+
+    #[test]
+    fn mock_chat_acknowledges_images_deterministically() {
+        let part = |data: &[u8]| ImagePart {
+            id: "img-1".into(),
+            mime: "image/jpeg".into(),
+            data: data.to_vec(),
+        };
+        let sha8 = &crate::store::hex_sha256(b"pixels")[..8];
+        assert_eq!(
+            mock_chat_text("hello", &[]),
+            "I heard you say: hello".to_string()
+        );
+        assert_eq!(
+            mock_chat_text("", &[part(b"pixels")]),
+            format!("I see 1 image(s): {sha8}")
+        );
+        assert_eq!(
+            mock_chat_text("hello", &[part(b"pixels")]),
+            format!("I heard you say: hello [saw 1 image(s): {sha8}]")
+        );
+    }
+
+    #[test]
+    fn chat_input_switches_to_parts_only_when_images_are_present() {
+        assert_eq!(chat_input("hello", &[]), json!("hello"));
+        let parts = chat_input(
+            "hello",
+            &[ImagePart {
+                id: "img-1".into(),
+                mime: "image/webp".into(),
+                data: vec![1, 2, 3],
+            }],
+        );
+        assert_eq!(
+            parts,
+            json!([
+                { "type": "text", "text": "hello" },
+                { "type": "image", "data": "AQID", "mime_type": "image/webp" }
+            ])
+        );
+        // Image-only turns omit the empty text part entirely.
+        let image_only = chat_input(
+            "",
+            &[ImagePart {
+                id: "img-1".into(),
+                mime: "image/png".into(),
+                data: vec![9],
+            }],
+        );
+        assert_eq!(image_only.as_array().unwrap().len(), 1);
+        assert_eq!(image_only[0]["type"], "image");
     }
 
     #[test]

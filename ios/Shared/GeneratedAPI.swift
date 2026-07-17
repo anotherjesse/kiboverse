@@ -189,6 +189,38 @@ public struct PutClipResponse: Codable, Hashable, Sendable {
 	}
 }
 
+public struct PutRecordingPartResponse: Codable, Hashable, Sendable {
+	public let recording_id: String
+	public let sequence: UInt32
+	public let created: Bool
+
+	public init(recording_id: String, sequence: UInt32, created: Bool) {
+		self.recording_id = recording_id
+		self.sequence = sequence
+		self.created = created
+	}
+}
+
+public struct CompleteRecording: Codable, Hashable, Sendable {
+	public let part_count: UInt32
+	public let total_samples: UInt64
+
+	public init(part_count: UInt32, total_samples: UInt64) {
+		self.part_count = part_count
+		self.total_samples = total_samples
+	}
+}
+
+public struct CompleteRecordingResponse: Codable, Hashable, Sendable {
+	public let clip_id: String
+	public let created: Bool
+
+	public init(clip_id: String, created: Bool) {
+		self.clip_id = clip_id
+		self.created = created
+	}
+}
+
 public struct TurnResponse: Codable, Hashable, Sendable {
 	public let turn_id: String
 	public let clips: [String]

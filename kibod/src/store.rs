@@ -4,13 +4,14 @@ use crate::model::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use fs2::FileExt;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[cfg(test)]
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -33,6 +34,18 @@ pub struct Store {
 pub enum PutClip {
     Created,
     Repaired,
+    AlreadyExists,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PutRecordingPart {
+    Created,
+    AlreadyExists,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompleteRecordingOutcome {
+    Created,
     AlreadyExists,
 }
 
@@ -60,6 +73,17 @@ impl std::fmt::Display for ClipConflict {
 impl std::error::Error for ClipConflict {}
 
 #[derive(Debug)]
+pub struct RecordingConflict(pub String);
+
+impl std::fmt::Display for RecordingConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RecordingConflict {}
+
+#[derive(Debug)]
 pub struct NoPendingClips;
 
 impl std::fmt::Display for NoPendingClips {
@@ -80,6 +104,32 @@ pub struct ClipUpload<'a> {
     pub duration_ms: u64,
     pub peak_pct: u32,
     pub recorded_at: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordingPartUpload<'a> {
+    pub project_id: &'a str,
+    pub conversation_id: &'a str,
+    pub recording_id: &'a str,
+    pub sequence: u32,
+    pub bytes: &'a [u8],
+    pub expected_sha256: &'a str,
+    pub sample_count: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordingCompletion<'a> {
+    pub project_id: &'a str,
+    pub conversation_id: &'a str,
+    pub recording_id: &'a str,
+    pub part_count: u32,
+    pub total_samples: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RecordingManifest {
+    version: u32,
+    recorded_at: u64,
 }
 
 impl Store {
@@ -529,6 +579,177 @@ impl Store {
         Ok((PutClip::Created, Some(record)))
     }
 
+    /// Durably stage one independently retryable piece of a recording. Staged
+    /// parts are deliberately kept outside the event log, so readers and turn
+    /// creation cannot observe a recording until `complete_recording` commits
+    /// its single assembled clip.
+    pub fn put_recording_part(&self, upload: RecordingPartUpload<'_>) -> Result<PutRecordingPart> {
+        self.conversation(upload.project_id, upload.conversation_id)?;
+        self.check_id(upload.recording_id)?;
+        let wav = canonical_wav(upload.bytes)?;
+        if wav.sample_count != upload.sample_count {
+            bail!(
+                "sample count does not match X-Sample-Count: WAV has {}, header says {}",
+                wav.sample_count,
+                upload.sample_count
+            );
+        }
+        let actual_sha = hex_sha256(upload.bytes);
+        if !actual_sha.eq_ignore_ascii_case(upload.expected_sha256) {
+            bail!("content SHA-256 does not match X-Content-Sha256");
+        }
+
+        let lock = self.conversation_lock(upload.project_id, upload.conversation_id);
+        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let conversation_directory =
+            self.conversation_dir(upload.project_id, upload.conversation_id);
+        let directory = self.recording_parts_dir(
+            upload.project_id,
+            upload.conversation_id,
+            upload.recording_id,
+        );
+        let final_path = directory.join(recording_part_filename(upload.sequence));
+        if final_path.exists() {
+            sync_directory_chain(&directory, &conversation_directory)?;
+            ensure_recording_manifest(&directory)?;
+            return if file_sha256(&final_path).as_deref() == Some(actual_sha.as_str()) {
+                Ok(PutRecordingPart::AlreadyExists)
+            } else {
+                Err(RecordingConflict(
+                    "recording part already exists with different content".into(),
+                )
+                .into())
+            };
+        }
+
+        let completed = self
+            .records_unlocked(upload.project_id, upload.conversation_id)?
+            .into_iter()
+            .any(|record| record["kind"] == "clip" && record["id"] == upload.recording_id);
+        if completed {
+            return Err(RecordingConflict("recording is already complete".into()).into());
+        }
+
+        fs::create_dir_all(&directory)?;
+        sync_directory_chain(&directory, &conversation_directory)?;
+        ensure_recording_manifest(&directory)?;
+        write_file_atomic(&final_path, upload.bytes, "part")?;
+        Ok(PutRecordingPart::Created)
+    }
+
+    /// Assemble all staged parts into one canonical WAV and expose it with one
+    /// ordinary clip event. The final WAV rename precedes the event append, so
+    /// the only crash orphan is a complete payload that a retry can verify.
+    pub fn complete_recording(
+        &self,
+        completion: RecordingCompletion<'_>,
+    ) -> Result<(CompleteRecordingOutcome, Option<Value>)> {
+        self.conversation(completion.project_id, completion.conversation_id)?;
+        self.check_id(completion.recording_id)?;
+        if completion.part_count == 0 {
+            bail!("part_count must be greater than zero");
+        }
+        if completion.part_count > MAX_RECORDING_PARTS {
+            bail!("part_count exceeds the supported maximum");
+        }
+        canonical_wav_data_len(completion.total_samples)?;
+
+        let lock = self.conversation_lock(completion.project_id, completion.conversation_id);
+        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let directory = self.conversation_dir(completion.project_id, completion.conversation_id);
+        let final_path = directory
+            .join("clips")
+            .join(format!("{}.wav", completion.recording_id));
+        let existing = self
+            .records_unlocked(completion.project_id, completion.conversation_id)?
+            .into_iter()
+            .find(|record| record["kind"] == "clip" && record["id"] == completion.recording_id);
+
+        if let Some(existing) = existing.as_ref() {
+            if existing["part_count"].as_u64() != Some(u64::from(completion.part_count))
+                || existing["samples"].as_u64() != Some(completion.total_samples)
+            {
+                return Err(RecordingConflict(
+                    "recording was already completed with different parameters".into(),
+                )
+                .into());
+            }
+            let expected_sha = existing["sha256"]
+                .as_str()
+                .ok_or_else(|| anyhow!("completed recording event has no SHA-256"))?;
+            if file_sha256(&final_path).as_deref() == Some(expected_sha) {
+                return Ok((CompleteRecordingOutcome::AlreadyExists, None));
+            }
+        }
+
+        let parts_directory = self.recording_parts_dir(
+            completion.project_id,
+            completion.conversation_id,
+            completion.recording_id,
+        );
+        validate_part_set(&parts_directory, completion.part_count)?;
+        let manifest = read_recording_manifest(&parts_directory)?;
+        let assembled = assemble_recording(
+            &directory,
+            &parts_directory,
+            completion.recording_id,
+            completion.part_count,
+            completion.total_samples,
+        )?;
+
+        if let Some(existing) = existing {
+            let expected_sha = existing["sha256"].as_str().unwrap();
+            if assembled.sha256 != expected_sha {
+                let _ = fs::remove_file(&assembled.path);
+                return Err(RecordingConflict(
+                    "staged parts do not match the completed recording".into(),
+                )
+                .into());
+            }
+            fs::rename(&assembled.path, &final_path).inspect_err(|_| {
+                let _ = fs::remove_file(&assembled.path);
+            })?;
+            sync_parent(&final_path)?;
+            return Ok((CompleteRecordingOutcome::AlreadyExists, None));
+        }
+
+        if final_path.exists() {
+            if file_sha256(&final_path).as_deref() != Some(assembled.sha256.as_str()) {
+                let _ = fs::remove_file(&assembled.path);
+                return Err(RecordingConflict(
+                    "recording ID already has a different assembled payload".into(),
+                )
+                .into());
+            }
+            fs::remove_file(&assembled.path)?;
+        } else {
+            fs::rename(&assembled.path, &final_path).inspect_err(|_| {
+                let _ = fs::remove_file(&assembled.path);
+            })?;
+            sync_parent(&final_path)?;
+        }
+
+        let duration_ms = completion
+            .total_samples
+            .saturating_mul(1000)
+            .div_ceil(u64::from(RECORDING_SAMPLE_RATE));
+        let record = self.append_unlocked(
+            completion.project_id,
+            completion.conversation_id,
+            JournalWrite::recording_clip(
+                completion.recording_id,
+                duration_ms,
+                assembled.peak_pct,
+                manifest.recorded_at,
+                assembled.sha256,
+                completion.total_samples,
+                RECORDING_SAMPLE_RATE,
+                completion.part_count,
+            ),
+        )?;
+        Ok((CompleteRecordingOutcome::Created, Some(record)))
+    }
+
     pub fn clip_path(
         &self,
         project_id: &str,
@@ -541,6 +762,18 @@ impl Store {
             .conversation_dir(project_id, conversation_id)
             .join("clips")
             .join(format!("{clip_id}.wav")))
+    }
+
+    fn recording_parts_dir(
+        &self,
+        project_id: &str,
+        conversation_id: &str,
+        recording_id: &str,
+    ) -> PathBuf {
+        self.conversation_dir(project_id, conversation_id)
+            .join("recordings")
+            .join(recording_id)
+            .join("parts")
     }
 
     pub fn speech_path(
@@ -681,6 +914,216 @@ impl Store {
         self.check_id(project_id)?;
         self.check_id(conversation_id)
     }
+}
+
+const RECORDING_SAMPLE_RATE: u32 = 16_000;
+const CANONICAL_WAV_HEADER_LEN: usize = 44;
+const MAX_RECORDING_PARTS: u32 = 10_000;
+
+#[derive(Debug, Clone, Copy)]
+struct CanonicalWav {
+    sample_count: u64,
+    peak_pct: u32,
+}
+
+#[derive(Debug)]
+struct AssembledRecording {
+    path: PathBuf,
+    sha256: String,
+    peak_pct: u32,
+}
+
+fn canonical_wav(bytes: &[u8]) -> Result<CanonicalWav> {
+    if bytes.len() < CANONICAL_WAV_HEADER_LEN {
+        bail!("body must be a canonical WAV file");
+    }
+    let u16_at = |offset: usize| u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap());
+    let u32_at = |offset: usize| u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+    let data_len = bytes.len() - CANONICAL_WAV_HEADER_LEN;
+    if &bytes[0..4] != b"RIFF"
+        || &bytes[8..12] != b"WAVE"
+        || &bytes[12..16] != b"fmt "
+        || u32_at(16) != 16
+        || u16_at(20) != 1
+        || u16_at(22) != 1
+        || u32_at(24) != RECORDING_SAMPLE_RATE
+        || u32_at(28) != RECORDING_SAMPLE_RATE * 2
+        || u16_at(32) != 2
+        || u16_at(34) != 16
+        || &bytes[36..40] != b"data"
+        || usize::try_from(u32_at(40)).ok() != Some(data_len)
+        || u32::try_from(bytes.len() - 8).ok() != Some(u32_at(4))
+        || !data_len.is_multiple_of(2)
+    {
+        bail!("WAV must be canonical mono 16 kHz signed 16-bit PCM");
+    }
+    let sample_count = u64::try_from(data_len / 2)?;
+    let max_amplitude = bytes[CANONICAL_WAV_HEADER_LEN..]
+        .chunks_exact(2)
+        .map(|sample| i32::from(i16::from_le_bytes([sample[0], sample[1]])).unsigned_abs())
+        .max()
+        .unwrap_or(0);
+    let peak_pct = ((max_amplitude * 100).div_ceil(i16::MAX as u32)).min(100);
+    Ok(CanonicalWav {
+        sample_count,
+        peak_pct,
+    })
+}
+
+fn canonical_wav_data_len(sample_count: u64) -> Result<u32> {
+    let bytes = sample_count
+        .checked_mul(2)
+        .ok_or_else(|| anyhow!("total_samples is too large"))?;
+    let data_len = u32::try_from(bytes).map_err(|_| anyhow!("recording is too large for WAV"))?;
+    if data_len > u32::MAX - 36 {
+        bail!("recording is too large for WAV");
+    }
+    Ok(data_len)
+}
+
+fn canonical_wav_header(sample_count: u64) -> Result<[u8; CANONICAL_WAV_HEADER_LEN]> {
+    let data_len = canonical_wav_data_len(sample_count)?;
+    let mut header = [0_u8; CANONICAL_WAV_HEADER_LEN];
+    header[0..4].copy_from_slice(b"RIFF");
+    header[4..8].copy_from_slice(&(36 + data_len).to_le_bytes());
+    header[8..12].copy_from_slice(b"WAVE");
+    header[12..16].copy_from_slice(b"fmt ");
+    header[16..20].copy_from_slice(&16_u32.to_le_bytes());
+    header[20..22].copy_from_slice(&1_u16.to_le_bytes());
+    header[22..24].copy_from_slice(&1_u16.to_le_bytes());
+    header[24..28].copy_from_slice(&RECORDING_SAMPLE_RATE.to_le_bytes());
+    header[28..32].copy_from_slice(&(RECORDING_SAMPLE_RATE * 2).to_le_bytes());
+    header[32..34].copy_from_slice(&2_u16.to_le_bytes());
+    header[34..36].copy_from_slice(&16_u16.to_le_bytes());
+    header[36..40].copy_from_slice(b"data");
+    header[40..44].copy_from_slice(&data_len.to_le_bytes());
+    Ok(header)
+}
+
+fn recording_part_filename(sequence: u32) -> String {
+    format!("{sequence:08}.wav")
+}
+
+fn recording_manifest_path(parts_directory: &Path) -> Result<PathBuf> {
+    Ok(parts_directory
+        .parent()
+        .ok_or_else(|| anyhow!("invalid recording parts directory"))?
+        .join("manifest.json"))
+}
+
+fn ensure_recording_manifest(parts_directory: &Path) -> Result<RecordingManifest> {
+    let path = recording_manifest_path(parts_directory)?;
+    if path.exists() {
+        return read_json(&path).with_context(|| "read recording manifest");
+    }
+    let manifest = RecordingManifest {
+        version: 1,
+        recorded_at: epoch(),
+    };
+    write_json_atomic(&path, &manifest)?;
+    Ok(manifest)
+}
+
+fn read_recording_manifest(parts_directory: &Path) -> Result<RecordingManifest> {
+    let manifest: RecordingManifest = read_json(&recording_manifest_path(parts_directory)?)
+        .with_context(|| "recording manifest is missing or invalid")?;
+    if manifest.version != 1 {
+        bail!("unsupported recording manifest version");
+    }
+    Ok(manifest)
+}
+
+fn validate_part_set(directory: &Path, part_count: u32) -> Result<()> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(RecordingConflict("recording part 0 is missing".into()).into());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut sequences = HashSet::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file()
+            || entry.path().extension().and_then(|value| value.to_str()) != Some("wav")
+        {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let sequence = name
+            .strip_suffix(".wav")
+            .and_then(|stem| stem.parse::<u32>().ok())
+            .ok_or_else(|| anyhow!("recording contains an invalid part filename"))?;
+        sequences.insert(sequence);
+    }
+    for sequence in 0..part_count {
+        if !sequences.contains(&sequence) {
+            return Err(RecordingConflict(format!("recording part {sequence} is missing")).into());
+        }
+    }
+    if sequences.len() != part_count as usize {
+        let unexpected = sequences
+            .iter()
+            .copied()
+            .filter(|sequence| *sequence >= part_count)
+            .min()
+            .unwrap_or(part_count);
+        return Err(RecordingConflict(format!(
+            "recording part {unexpected} is outside part_count"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+fn assemble_recording(
+    conversation_directory: &Path,
+    parts_directory: &Path,
+    recording_id: &str,
+    part_count: u32,
+    total_samples: u64,
+) -> Result<AssembledRecording> {
+    let path = conversation_directory.join("clips").join(format!(
+        ".{recording_id}.{}.recording",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let result = (|| {
+        let mut output = File::create(&path)?;
+        output.write_all(&canonical_wav_header(total_samples)?)?;
+        let mut actual_samples = 0_u64;
+        let mut peak_pct = 0_u32;
+        for sequence in 0..part_count {
+            let bytes = fs::read(parts_directory.join(recording_part_filename(sequence)))?;
+            let wav = canonical_wav(&bytes).map_err(|error| {
+                RecordingConflict(format!(
+                    "recording part {sequence} is not canonical WAV: {error}"
+                ))
+            })?;
+            actual_samples = actual_samples
+                .checked_add(wav.sample_count)
+                .ok_or_else(|| anyhow!("recording sample count overflow"))?;
+            peak_pct = peak_pct.max(wav.peak_pct);
+            output.write_all(&bytes[CANONICAL_WAV_HEADER_LEN..])?;
+        }
+        if actual_samples != total_samples {
+            return Err(RecordingConflict(format!(
+                "total_samples does not match staged parts: parts have {actual_samples}, request says {total_samples}"
+            ))
+            .into());
+        }
+        output.sync_all()?;
+        drop(output);
+        Ok(AssembledRecording {
+            sha256: file_sha256_result(&path)?,
+            path: path.clone(),
+            peak_pct,
+        })
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&path);
+    }
+    result
 }
 
 fn clean_name(name: &str) -> Result<&str> {
@@ -854,21 +1297,70 @@ fn append_jsonl(path: &Path, value: &Value) -> Result<()> {
 
 fn write_clip_atomic(directory: &Path, clip_id: &str, bytes: &[u8]) -> Result<()> {
     let final_path = directory.join("clips").join(format!("{clip_id}.wav"));
-    let temporary_path = directory.join("clips").join(format!(
-        ".{clip_id}.{}.upload",
+    write_file_atomic(&final_path, bytes, "upload")
+}
+
+fn write_file_atomic(final_path: &Path, bytes: &[u8], suffix: &str) -> Result<()> {
+    let parent = final_path
+        .parent()
+        .ok_or_else(|| anyhow!("destination has no parent directory"))?;
+    let name = final_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("destination has no valid filename"))?;
+    let temporary_path = parent.join(format!(
+        ".{name}.{}.{suffix}",
         uuid::Uuid::new_v4().simple()
     ));
     let mut file = File::create(&temporary_path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
-    fs::rename(&temporary_path, &final_path).inspect_err(|_| {
+    fs::rename(&temporary_path, final_path).inspect_err(|_| {
         let _ = fs::remove_file(&temporary_path);
     })?;
-    sync_parent(&final_path)
+    sync_parent(final_path)
 }
 
 fn file_sha256(path: &Path) -> Option<String> {
-    fs::read(path).ok().map(|bytes| hex_sha256(&bytes))
+    file_sha256_result(path).ok()
+}
+
+fn file_sha256_result(path: &Path) -> Result<String> {
+    let mut file = File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+/// Make every directory entry created below an already-durable ancestor
+/// survive a successful response. `create_dir_all` can add several ancestors,
+/// and syncing only the leaf or its immediate parent does not durably link the
+/// upper entries on Unix filesystems.
+fn sync_directory_chain(leaf: &Path, ancestor: &Path) -> Result<()> {
+    if !leaf.starts_with(ancestor) {
+        bail!("directory is outside its durable ancestor");
+    }
+    let mut directory = leaf;
+    loop {
+        File::open(directory)?.sync_all()?;
+        if directory == ancestor {
+            return Ok(());
+        }
+        directory = directory
+            .parent()
+            .ok_or_else(|| anyhow!("durable ancestor is not in directory chain"))?;
+    }
 }
 
 fn sync_parent(path: &Path) -> Result<()> {
@@ -903,6 +1395,31 @@ mod tests {
             })
             .unwrap();
         (temporary, store)
+    }
+
+    fn test_wav(samples: &[i16]) -> Vec<u8> {
+        let mut bytes = canonical_wav_header(samples.len() as u64).unwrap().to_vec();
+        bytes.extend(samples.iter().flat_map(|sample| sample.to_le_bytes()));
+        bytes
+    }
+
+    fn put_test_part(
+        store: &Store,
+        recording_id: &str,
+        sequence: u32,
+        samples: &[i16],
+    ) -> Result<PutRecordingPart> {
+        let bytes = test_wav(samples);
+        let sha = hex_sha256(&bytes);
+        store.put_recording_part(RecordingPartUpload {
+            project_id: "kibo",
+            conversation_id: "general",
+            recording_id,
+            sequence,
+            bytes: &bytes,
+            expected_sha256: &sha,
+            sample_count: samples.len() as u64,
+        })
     }
 
     #[test]
@@ -1017,6 +1534,202 @@ mod tests {
         assert_eq!(outcome, PutClip::Repaired);
         assert_eq!(event.unwrap()["reason"], "payload_repaired");
         assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn recording_parts_are_invisible_and_assemble_without_boundary_loss() {
+        let (_temporary, store) = store_with_general();
+        let first = [-32_768, -12, -1, 0];
+        let second = [1, 12, 32_767];
+
+        assert_eq!(
+            put_test_part(&store, "long-note", 1, &second).unwrap(),
+            PutRecordingPart::Created
+        );
+        assert_eq!(
+            put_test_part(&store, "long-note", 0, &first).unwrap(),
+            PutRecordingPart::Created
+        );
+        assert!(store.records("kibo", "general").unwrap().is_empty());
+        assert!(
+            store
+                .pending_clip_ids("kibo", "general")
+                .unwrap()
+                .is_empty()
+        );
+
+        let (outcome, event) = store
+            .complete_recording(RecordingCompletion {
+                project_id: "kibo",
+                conversation_id: "general",
+                recording_id: "long-note",
+                part_count: 2,
+                total_samples: 7,
+            })
+            .unwrap();
+        assert_eq!(outcome, CompleteRecordingOutcome::Created);
+        let event = event.unwrap();
+        assert_eq!(event["kind"], "clip");
+        assert_eq!(event["part_count"], 2);
+        assert_eq!(event["samples"], 7);
+        assert_eq!(event["peak"], 100);
+        assert!(event["recorded_at"].as_u64().unwrap() <= event["at"].as_u64().unwrap());
+
+        let mut reader =
+            hound::WavReader::open(store.clip_path("kibo", "general", "long-note").unwrap())
+                .unwrap();
+        let samples: Vec<i16> = reader.samples().collect::<Result<_, _>>().unwrap();
+        assert_eq!(samples, first.into_iter().chain(second).collect::<Vec<_>>());
+        assert_eq!(store.records("kibo", "general").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn recording_part_put_is_idempotent_and_conflicting_content_is_rejected() {
+        let (_temporary, store) = store_with_general();
+        assert_eq!(
+            put_test_part(&store, "retryable", 0, &[1, 2, 3]).unwrap(),
+            PutRecordingPart::Created
+        );
+        assert_eq!(
+            put_test_part(&store, "retryable", 0, &[1, 2, 3]).unwrap(),
+            PutRecordingPart::AlreadyExists
+        );
+        let error = put_test_part(&store, "retryable", 0, &[3, 2, 1]).unwrap_err();
+        assert!(error.downcast_ref::<RecordingConflict>().is_some());
+        assert!(store.records("kibo", "general").unwrap().is_empty());
+    }
+
+    #[test]
+    fn recording_completion_reports_missing_and_bad_totals_then_is_idempotent() {
+        let (_temporary, store) = store_with_general();
+        put_test_part(&store, "checked", 1, &[30, 40]).unwrap();
+        let completion = || RecordingCompletion {
+            project_id: "kibo",
+            conversation_id: "general",
+            recording_id: "checked",
+            part_count: 2,
+            total_samples: 4,
+        };
+        let error = store.complete_recording(completion()).unwrap_err();
+        assert!(error.downcast_ref::<RecordingConflict>().is_some());
+        assert!(error.to_string().contains("part 0 is missing"));
+
+        put_test_part(&store, "checked", 0, &[10, 20]).unwrap();
+        let error = store
+            .complete_recording(RecordingCompletion {
+                total_samples: 5,
+                ..completion()
+            })
+            .unwrap_err();
+        assert!(error.downcast_ref::<RecordingConflict>().is_some());
+        assert!(error.to_string().contains("total_samples"));
+
+        assert_eq!(
+            store.complete_recording(completion()).unwrap().0,
+            CompleteRecordingOutcome::Created
+        );
+        assert_eq!(
+            store.complete_recording(completion()).unwrap(),
+            (CompleteRecordingOutcome::AlreadyExists, None)
+        );
+        assert_eq!(
+            store
+                .records("kibo", "general")
+                .unwrap()
+                .iter()
+                .filter(|event| event["kind"] == "clip")
+                .count(),
+            1
+        );
+
+        assert_eq!(
+            put_test_part(&store, "checked", 0, &[10, 20]).unwrap(),
+            PutRecordingPart::AlreadyExists
+        );
+        let error = put_test_part(&store, "checked", 0, &[99, 20]).unwrap_err();
+        assert!(error.downcast_ref::<RecordingConflict>().is_some());
+    }
+
+    #[test]
+    fn recording_completion_recovers_payload_renamed_before_event_append() {
+        let (_temporary, store) = store_with_general();
+        put_test_part(&store, "crash-window", 0, &[10, 20, 30]).unwrap();
+        let conversation_directory = store.conversation_dir("kibo", "general");
+        let parts_directory = store.recording_parts_dir("kibo", "general", "crash-window");
+        let assembled = assemble_recording(
+            &conversation_directory,
+            &parts_directory,
+            "crash-window",
+            1,
+            3,
+        )
+        .unwrap();
+        let final_path = store.clip_path("kibo", "general", "crash-window").unwrap();
+        fs::rename(assembled.path, &final_path).unwrap();
+        assert!(store.records("kibo", "general").unwrap().is_empty());
+
+        assert_eq!(
+            store
+                .complete_recording(RecordingCompletion {
+                    project_id: "kibo",
+                    conversation_id: "general",
+                    recording_id: "crash-window",
+                    part_count: 1,
+                    total_samples: 3,
+                })
+                .unwrap()
+                .0,
+            CompleteRecordingOutcome::Created
+        );
+        assert_eq!(store.records("kibo", "general").unwrap().len(), 1);
+        assert_eq!(file_sha256(&final_path), Some(assembled.sha256));
+    }
+
+    #[test]
+    fn recording_part_validates_hash_sample_count_and_canonical_format() {
+        let (_temporary, store) = store_with_general();
+        let bytes = test_wav(&[1, 2]);
+        let sha = hex_sha256(&bytes);
+        assert!(
+            store
+                .put_recording_part(RecordingPartUpload {
+                    project_id: "kibo",
+                    conversation_id: "general",
+                    recording_id: "validated",
+                    sequence: 0,
+                    bytes: &bytes,
+                    expected_sha256: "bad",
+                    sample_count: 2,
+                })
+                .is_err()
+        );
+        assert!(
+            store
+                .put_recording_part(RecordingPartUpload {
+                    project_id: "kibo",
+                    conversation_id: "general",
+                    recording_id: "validated",
+                    sequence: 0,
+                    bytes: &bytes,
+                    expected_sha256: &sha,
+                    sample_count: 3,
+                })
+                .is_err()
+        );
+        assert!(
+            store
+                .put_recording_part(RecordingPartUpload {
+                    project_id: "kibo",
+                    conversation_id: "general",
+                    recording_id: "validated",
+                    sequence: 0,
+                    bytes: b"RIFF not a canonical wave",
+                    expected_sha256: "bad",
+                    sample_count: 0,
+                })
+                .is_err()
+        );
+        assert!(store.records("kibo", "general").unwrap().is_empty());
     }
 
     #[test]

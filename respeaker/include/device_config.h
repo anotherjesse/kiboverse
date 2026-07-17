@@ -12,7 +12,10 @@
 #define RESPEAKER_I2S_SAMPLE_RATE 16000
 #define RESPEAKER_CAPTURE_CHANNEL 0
 
-// RAM-only prototype limits.
-#define RESPEAKER_MAX_RECORD_SECONDS 20
+// Recording is divided into independently acknowledged WAV parts. Four
+// 20-second PSRAM buffers allow capture to continue while earlier parts upload;
+// the total recording duration is not capped by RAM.
+#define RESPEAKER_RECORD_PART_SECONDS 20
+#define RESPEAKER_RECORD_BUFFER_COUNT 4
 #define RESPEAKER_SERIAL_TEST_SECONDS 4
 #define RESPEAKER_MIC_TEST_SECONDS 3

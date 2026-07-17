@@ -24,6 +24,24 @@ enum JournalWriteKind {
         recorded_at: u64,
         sha256: String,
     },
+    /// A clip assembled from streamed recording parts. Readers treat it as an
+    /// ordinary `clip`; the extra fields let completion retries prove they
+    /// match the committed recording.
+    #[serde(rename = "clip")]
+    RecordingClip {
+        id: String,
+        file: String,
+        mime: &'static str,
+        #[serde(rename = "ms")]
+        duration_ms: u64,
+        #[serde(rename = "peak")]
+        peak_pct: u32,
+        recorded_at: u64,
+        sha256: String,
+        samples: u64,
+        rate: u32,
+        part_count: u32,
+    },
     Turn {
         id: String,
         clips: Vec<String>,
@@ -151,6 +169,32 @@ impl JournalWrite {
             peak_pct,
             recorded_at,
             sha256: sha256.into(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn recording_clip(
+        id: impl Into<String>,
+        duration_ms: u64,
+        peak_pct: u32,
+        recorded_at: u64,
+        sha256: impl Into<String>,
+        samples: u64,
+        rate: u32,
+        part_count: u32,
+    ) -> Self {
+        let id = id.into();
+        Self(JournalWriteKind::RecordingClip {
+            file: format!("clips/{id}.wav"),
+            id,
+            mime: "audio/wav",
+            duration_ms,
+            peak_pct,
+            recorded_at,
+            sha256: sha256.into(),
+            samples,
+            rate,
+            part_count,
         })
     }
 
@@ -415,6 +459,17 @@ mod tests {
                 "kind":"clip", "id":"clip-1", "file":"clips/clip-1.wav",
                 "mime":"audio/wav", "ms":1200, "peak":87,
                 "recorded_at":42, "sha256":"abc"
+            })
+        );
+        assert_eq!(
+            value(JournalWrite::recording_clip(
+                "rec-1", 1200, 87, 42, "abc", 19_200, 16_000, 3
+            )),
+            json!({
+                "kind":"clip", "id":"rec-1", "file":"clips/rec-1.wav",
+                "mime":"audio/wav", "ms":1200, "peak":87,
+                "recorded_at":42, "sha256":"abc",
+                "samples":19_200, "rate":16_000, "part_count":3
             })
         );
         assert_eq!(

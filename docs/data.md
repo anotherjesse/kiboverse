@@ -67,6 +67,11 @@ kibo-data/
           turns.jsonl
           clips/
             <clip-id>.wav
+          recordings/
+            <recording-id>/
+              manifest.json
+              parts/
+                <eight-digit-sequence>.wav
           tts/
             <turn-id>.wav
 ```
@@ -372,6 +377,22 @@ terminal provider failure.
 - If the file exists without an event after a crash, a matching retry appends
 the missing event; different bytes are never silently overwritten.
 
+The ReSpeaker uses a bounded-memory variant of this lifecycle for recordings
+that can outlast device RAM. It sends canonical mono 16 kHz signed-16 WAV parts
+to a stable recording ID and sequence. A new part returns `201`; an identical
+retry returns `200`; the same sequence with different bytes returns `409`.
+Each acknowledged part and every newly created ancestor directory are synced
+before success is returned.
+
+Staged parts live under `recordings/` and are not events, pending clips, or
+transcription inputs. An explicit completion request supplies `part_count` and
+`total_samples`. The store validates a contiguous sequence, streams the PCM
+payloads into one final WAV, syncs and renames it, and appends exactly one
+ordinary `clip` event. Completion retries return the same clip without another
+event, including recovery from a crash between final rename and event append.
+Parts are currently retained after completion so a later ambiguous part retry
+can still be compared byte-for-byte; age-based cleanup is future work.
+
 ### 2. Transcribe and name
 
 Only one in-memory transcription supervisor runs per clip. Before calling the
@@ -504,6 +525,8 @@ The data-oriented API is:
 | `GET /v1/projects/{project}/conversations` | List conversation metadata. |
 | `POST /v1/projects/{project}/conversations` | Create a named or placeholder conversation. |
 | `PUT /v1/projects/{project}/conversations/{conversation}/clips/{clip}` | Commit a WAV and `clip` event. |
+| `PUT .../recordings/{recording}/parts/{sequence}` | Durably stage one canonical WAV part, idempotently by ID, sequence, and hash. |
+| `POST .../recordings/{recording}/complete` | Assemble staged parts and atomically expose one ordinary clip. |
 | `GET .../clips/{clip}/audio` | Return the stored user WAV. |
 | `POST .../turns` | Idempotently create a turn and claim pending clips. |
 | `GET .../turns/{turn}/speech?from_sample=N` | Stream live or stored signed-16 little-endian mono PCM from a sample offset within one `X-Speech-Generation`. |

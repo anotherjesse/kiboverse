@@ -238,7 +238,7 @@ The table omits the common `kind`, `seq`, and `at` fields.
 
 | Kind | Additional fields | Meaning |
 |---|---|---|
-| `clip` | `id`, `file`, `mime`, `ms`, `peak`, `recorded_at`, `sha256` | A committed user recording. `file` is currently `clips/<id>.wav`, `mime` is `audio/wav`, `ms` is client-reported duration, and `peak` is a client-reported percentage capped at 100. |
+| `clip` | `id`, `file`, `mime`, `ms`, `peak`, `recorded_at`, `sha256` | A committed user recording. `file` is currently `clips/<id>.wav`, `mime` is `audio/wav`, `ms` is client-reported duration, and `peak` is a client-reported percentage capped at 100. Clips assembled from streamed recording parts additionally carry server-computed `samples`, `rate`, and `part_count`. |
 | `transcript_started` | `clip`, `attempt` | A transcription attempt began. An unmatched started event is durable interrupted work, not an instruction to start a duplicate task. |
 | `transcript_retry_requested` | `clip`, `reason` | Explicitly reopens non-successful transcription at attempt 1. Reasons include `payload_repaired`, `explicit_retry`, `turn_retry`, `startup_recovery`, and `supervisor_recovery`; an already-successful transcript remains authoritative. |
 | `transcript_retry_scheduled` | `clip`, `attempt`, `error`, `retry_at_ms` | A retryable transcription attempt failed and its next attempt has a durable deadline. This distinct kind keeps older clients from mistaking a retry for a terminal error. |
@@ -390,8 +390,12 @@ transcription inputs. An explicit completion request supplies `part_count` and
 payloads into one final WAV, syncs and renames it, and appends exactly one
 ordinary `clip` event. Completion retries return the same clip without another
 event, including recovery from a crash between final rename and event append.
-Parts are currently retained after completion so a later ambiguous part retry
-can still be compared byte-for-byte; age-based cleanup is future work.
+If the committed payload itself is missing or corrupt, a completion retry
+reassembles the staged parts and repairs it under the single-clip contract:
+`transcript_retry_requested` is durable before the bytes are restored, and the
+internal outcome is the distinct `Repaired`. Parts are currently retained after
+completion so a later ambiguous part retry can still be compared byte-for-byte;
+age-based cleanup is future work.
 
 ### 2. Transcribe and name
 

@@ -47,6 +47,7 @@ pub enum PutRecordingPart {
 pub enum CompleteRecordingOutcome {
     Created,
     AlreadyExists,
+    Repaired,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -706,11 +707,27 @@ impl Store {
                 )
                 .into());
             }
+            // Restore a missing/corrupt payload exactly like put_clip: persist
+            // the reopen intent before replacing the bytes, so a crash or
+            // append failure cannot turn a completed repair into an
+            // indistinguishable, workflow-inert replay.
+            let event = self
+                .append_unlocked(
+                    completion.project_id,
+                    completion.conversation_id,
+                    JournalWrite::transcript_retry_requested(
+                        completion.recording_id,
+                        "payload_repaired",
+                    ),
+                )
+                .inspect_err(|_| {
+                    let _ = fs::remove_file(&assembled.path);
+                })?;
             fs::rename(&assembled.path, &final_path).inspect_err(|_| {
                 let _ = fs::remove_file(&assembled.path);
             })?;
             sync_parent(&final_path)?;
-            return Ok((CompleteRecordingOutcome::AlreadyExists, None));
+            return Ok((CompleteRecordingOutcome::Repaired, Some(event)));
         }
 
         if final_path.exists() {
@@ -1683,6 +1700,46 @@ mod tests {
         );
         assert_eq!(store.records("kibo", "general").unwrap().len(), 1);
         assert_eq!(file_sha256(&final_path), Some(assembled.sha256));
+    }
+
+    #[test]
+    fn recording_payload_repair_persists_retry_intent_before_restoring_bytes() {
+        let (_temporary, store) = store_with_general();
+        put_test_part(&store, "repairable", 0, &[10, 20]).unwrap();
+        let completion = || RecordingCompletion {
+            project_id: "kibo",
+            conversation_id: "general",
+            recording_id: "repairable",
+            part_count: 1,
+            total_samples: 2,
+        };
+        assert_eq!(
+            store.complete_recording(completion()).unwrap().0,
+            CompleteRecordingOutcome::Created
+        );
+        let path = store.clip_path("kibo", "general", "repairable").unwrap();
+        fs::write(&path, b"damaged").unwrap();
+
+        store.fail_append_after(0);
+        assert!(store.complete_recording(completion()).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"damaged");
+        assert_eq!(store.records("kibo", "general").unwrap().len(), 1);
+
+        let (outcome, event) = store.complete_recording(completion()).unwrap();
+        assert_eq!(outcome, CompleteRecordingOutcome::Repaired);
+        let event = event.unwrap();
+        assert_eq!(event["kind"], "transcript_retry_requested");
+        assert_eq!(event["clip"], "repairable");
+        assert_eq!(event["reason"], "payload_repaired");
+        let mut reader = hound::WavReader::open(&path).unwrap();
+        let samples: Vec<i16> = reader.samples().collect::<Result<_, _>>().unwrap();
+        assert_eq!(samples, [10, 20]);
+        assert_eq!(store.records("kibo", "general").unwrap().len(), 2);
+
+        assert_eq!(
+            store.complete_recording(completion()).unwrap(),
+            (CompleteRecordingOutcome::AlreadyExists, None)
+        );
     }
 
     #[test]

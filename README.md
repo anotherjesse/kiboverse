@@ -84,6 +84,8 @@ connections are restricted to the page's own origin.
 - **USB speaker + microphone** — enumerates as `AIRHUG 01` (`2f9d:320a`),
   ALSA card name `A01`; both playback and capture on the one device
 - **Servos** — driven via `servo_controller.py` / WiringPi on the Pi
+- **ReSpeaker Lite + XIAO ESP32-S3** — standalone Wi-Fi client prototype in
+  `respeaker/`; 2-mic XMOS front end, onboard speaker, PSRAM-only recording
 - 1.28" round touch LCD (Waveshare) — on the Pi but not wired into the face
   scripts yet
 - Happy Hacking Keyboard Lite2 plugged in for local console use
@@ -137,6 +139,11 @@ aplay -D plughw:A01,0 /tmp/t.wav
   `turns.jsonl`, blob before metadata), button 1 plays back everything since
   the last reply (simulated AI turn). No audio C libraries; `arecord`/`aplay`
   are used only as thin device shims.
+- `respeaker/` — PlatformIO firmware for the ReSpeaker Lite/XIAO ESP32-S3.
+  It records processed 16 kHz audio into PSRAM, queues clips to `kibod` over
+  LAN HTTP, and separately asks Kibo to answer all waiting clips while
+  resampling streamed 24 kHz replies for the onboard speaker. See its README
+  for the USR=record and MUTE=ask solder bridges and serial provisioning.
 - `pi-config/` — files that live on the office/dev Pi, kept here so it's reproducible:
   the WirePlumber rule (→ `~/.config/wireplumber/main.lua.d/`) and the ptt
   systemd unit (→ `/etc/systemd/system/`).

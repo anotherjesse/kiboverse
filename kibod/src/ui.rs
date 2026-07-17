@@ -244,7 +244,7 @@ fn knowledge_redirect(project_id: &str, notice: &str) -> Response {
 
 fn knowledge_action_error(project_id: &str, error: anyhow::Error) -> Response {
     let body = format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><link rel=\"stylesheet\" href=\"/assets/app.css?v=6\"><title>Knowledge error · Kibo</title></head><body><main class=\"action-error\"><p class=\"eyebrow\">Knowledge ingestion</p><h1>That didn’t work.</h1><p>{}</p><a class=\"primary-link\" href=\"/app/{}/knowledge\">Back to knowledge</a></main></body></html>",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><link rel=\"stylesheet\" href=\"/assets/app.css?v=7\"><title>Knowledge error · Kibo</title></head><body><main class=\"action-error\"><p class=\"eyebrow\">Knowledge ingestion</p><h1>That didn’t work.</h1><p>{}</p><a class=\"primary-link\" href=\"/app/{}/knowledge\">Back to knowledge</a></main></body></html>",
         escape(&error.to_string()),
         url_component(project_id)
     );
@@ -311,7 +311,7 @@ fn render_page(
 <html lang=\"en\"><head>
 <meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\">
 <title>{conversation} · Kibo</title><meta name=\"description\" content=\"A durable voice conversation with Kibo\">
-	<link rel=\"stylesheet\" href=\"/assets/app.css?v=6\"><script src=\"/assets/htmx.min.js\" defer></script><script src=\"/assets/app.js?v=6\" defer></script>
+	<link rel=\"stylesheet\" href=\"/assets/app.css?v=7\"><script src=\"/assets/htmx.min.js\" defer></script><script src=\"/assets/app.js?v=7\" defer></script>
 	</head><body data-project-id=\"{project_id}\" data-conversation-id=\"{conversation_id}\" data-last-seq=\"{last_seq}\" data-conversation-url=\"{base}\" data-timeline-url=\"{page_url}/timeline\" data-events-url=\"{base}/events\">
 	<div class=\"app-shell\"><aside class=\"sidebar\"><div class=\"brand\"><span class=\"brand-mark\">k</span>Kibo</div>{navigation}
 	<details class=\"new-item\"><summary>New project</summary><form method=\"post\" action=\"/ui/projects\"><label>Name<input name=\"name\" maxlength=\"100\" required></label><button> create </button></form></details>
@@ -365,7 +365,7 @@ fn render_project_page(state: &AppState, project_id: &str) -> anyhow::Result<Str
 <html lang=\"en\"><head>
 <meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\">
 <title>{project} · Kibo</title><meta name=\"description\" content=\"Voice chats organized in Kibo projects\">
-<link rel=\"stylesheet\" href=\"/assets/app.css?v=6\"><script src=\"/assets/htmx.min.js\" defer></script><script src=\"/assets/app.js?v=6\" defer></script>
+<link rel=\"stylesheet\" href=\"/assets/app.css?v=7\"><script src=\"/assets/htmx.min.js\" defer></script><script src=\"/assets/app.js?v=7\" defer></script>
 </head><body data-project-id=\"{project_id}\">
 <div class=\"app-shell\"><aside class=\"sidebar\"><div class=\"brand\"><span class=\"brand-mark\">k</span>Kibo</div>{navigation}
 <details class=\"new-item\"><summary>New project</summary><form method=\"post\" action=\"/ui/projects\"><label>Name<input name=\"name\" maxlength=\"100\" required></label><button> create </button></form></details>
@@ -436,7 +436,7 @@ fn render_knowledge_page(
 <html lang=\"en\"><head>
 <meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
 <title>Knowledge · {project}</title><meta name=\"description\" content=\"Ingest conversations and web sources into project Markdown\">
-<link rel=\"stylesheet\" href=\"/assets/app.css?v=6\"><script src=\"/assets/app.js?v=6\" defer></script>
+<link rel=\"stylesheet\" href=\"/assets/app.css?v=7\"><script src=\"/assets/app.js?v=7\" defer></script>
 </head><body data-project-id=\"{project_id}\"><div class=\"app-shell\"><aside class=\"sidebar\"><div class=\"brand\"><span class=\"brand-mark\">k</span>Kibo</div>{navigation}
 <details class=\"new-item\"><summary>New project</summary><form method=\"post\" action=\"/ui/projects\"><label>Name<input name=\"name\" maxlength=\"100\" required></label><button> create </button></form></details>
 </aside><main class=\"main knowledge-main\"><div class=\"knowledge-wrap\">
@@ -467,7 +467,7 @@ fn render_knowledge_query_page(state: &AppState, project_id: &str) -> anyhow::Re
 <meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\">
 <base href=\"/app/{project_id}/knowledge/files/wiki/\">
 <title>Ask knowledge · {project}</title><meta name=\"description\" content=\"Ask an agent to investigate this project's knowledge base\">
-<link rel=\"stylesheet\" href=\"/assets/app.css?v=6\"><script src=\"/assets/knowledge-query.js?v=1\" defer></script>
+<link rel=\"stylesheet\" href=\"/assets/app.css?v=7\"><script src=\"/assets/knowledge-query.js?v=1\" defer></script>
 </head><body data-project-id=\"{project_id}\" data-query-url=\"/v1/projects/{project_id}/knowledge/query\"><div class=\"app-shell\"><aside class=\"sidebar\"><div class=\"brand\"><span class=\"brand-mark\">k</span>Kibo</div>{navigation}
 <details class=\"new-item\"><summary>New project</summary><form method=\"post\" action=\"/ui/projects\"><label>Name<input name=\"name\" maxlength=\"100\" required></label><button> create </button></form></details>
 </aside><main class=\"main knowledge-query-main\"><div class=\"knowledge-query-shell\">
@@ -596,7 +596,7 @@ fn render_knowledge_file_page(
         })
         .collect::<String>();
     Ok(format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><base href=\"/app/{project_id}/knowledge/files/wiki/\"><title>{path} · {project}</title><link rel=\"stylesheet\" href=\"/assets/app.css?v=6\"></head><body data-project-id=\"{project_id}\"><div class=\"app-shell\"><aside class=\"sidebar\"><div class=\"brand\"><span class=\"brand-mark\">k</span>Kibo</div>{navigation}</aside><main class=\"main markdown-main\"><div class=\"markdown-shell\"><aside class=\"file-rail\"><a class=\"back-link\" href=\"/app/{project_id}/knowledge\">← Knowledge</a><p class=\"eyebrow\">Markdown files</p><ul>{file_links}</ul></aside><article class=\"markdown-document\"><header><p class=\"eyebrow\">{path}</p></header><div class=\"markdown-body\">{rendered}</div><details class=\"raw-markdown\"><summary>View raw Markdown</summary><pre>{raw}</pre></details></article></div></main></div></body></html>",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><base href=\"/app/{project_id}/knowledge/files/wiki/\"><title>{path} · {project}</title><link rel=\"stylesheet\" href=\"/assets/app.css?v=7\"></head><body data-project-id=\"{project_id}\"><div class=\"app-shell\"><aside class=\"sidebar\"><div class=\"brand\"><span class=\"brand-mark\">k</span>Kibo</div>{navigation}</aside><main class=\"main markdown-main\"><div class=\"markdown-shell\"><aside class=\"file-rail\"><a class=\"back-link\" href=\"/app/{project_id}/knowledge\">← Knowledge</a><p class=\"eyebrow\">Markdown files</p><ul>{file_links}</ul></aside><article class=\"markdown-document\"><header><p class=\"eyebrow\">{path}</p></header><div class=\"markdown-body\">{rendered}</div><details class=\"raw-markdown\"><summary>View raw Markdown</summary><pre>{raw}</pre></details></article></div></main></div></body></html>",
         project = escape(&project.name),
         project_id = escape_attr(project_id),
         path = escape(path),

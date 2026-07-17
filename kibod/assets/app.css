@@ -1198,6 +1198,9 @@ body[data-knowledge-busy="true"] form[data-knowledge-action] button { cursor: wa
 .media-card { margin: 0; }
 .media-card img {
   width: 100%;
+  /* The width/height attributes are layout hints; height must return to
+     auto or the attribute wins over aspect-ratio. */
+  height: auto;
   aspect-ratio: 1;
   object-fit: cover;
   border-radius: 0.75rem;

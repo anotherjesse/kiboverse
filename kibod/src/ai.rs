@@ -618,11 +618,16 @@ fn http_status_is_retryable(status: reqwest::StatusCode) -> bool {
 
 fn previous_interaction_rejected(error: &anyhow::Error) -> bool {
     error.downcast_ref::<HttpFailure>().is_some_and(|failure| {
-        failure.status == reqwest::StatusCode::BAD_REQUEST
-            && failure
-                .body
-                .to_ascii_lowercase()
-                .contains("previous_interaction")
+        // This predicate is consulted only on the chained call, where a 404
+        // means the provider purged the stored interaction (they expire).
+        // Provider state is an optimization, never the source of truth —
+        // both shapes fall back to the durable-history prompt.
+        failure.status == reqwest::StatusCode::NOT_FOUND
+            || (failure.status == reqwest::StatusCode::BAD_REQUEST
+                && failure
+                    .body
+                    .to_ascii_lowercase()
+                    .contains("previous_interaction"))
     })
 }
 
@@ -1156,5 +1161,35 @@ mod tests {
         assert!(ai.failure_is_retryable(&failure(reqwest::StatusCode::TOO_MANY_REQUESTS)));
         assert!(ai.failure_is_retryable(&failure(reqwest::StatusCode::BAD_GATEWAY)));
         assert!(ai.failure_is_retryable(&anyhow!("connection reset")));
+    }
+
+    #[test]
+    fn expired_or_rejected_interaction_anchors_fall_back_to_durable_history() {
+        let failure = |status: reqwest::StatusCode, body: &str| {
+            anyhow::Error::new(HttpFailure {
+                status,
+                body: body.into(),
+            })
+        };
+        // The provider purged the stored interaction: 404 not_found.
+        assert!(previous_interaction_rejected(&failure(
+            reqwest::StatusCode::NOT_FOUND,
+            r#"{"error":{"message":"Requested entity was not found.","code":"not_found"}}"#,
+        )));
+        // Explicit rejection of the anchor field.
+        assert!(previous_interaction_rejected(&failure(
+            reqwest::StatusCode::BAD_REQUEST,
+            "invalid previous_interaction_id",
+        )));
+        // Unrelated failures must NOT silently drop provider context.
+        assert!(!previous_interaction_rejected(&failure(
+            reqwest::StatusCode::BAD_REQUEST,
+            "image exceeds provider limits",
+        )));
+        assert!(!previous_interaction_rejected(&failure(
+            reqwest::StatusCode::UNAUTHORIZED,
+            "bad key",
+        )));
+        assert!(!previous_interaction_rejected(&anyhow!("connection reset")));
     }
 }

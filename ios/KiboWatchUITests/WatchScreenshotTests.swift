@@ -12,19 +12,28 @@ import XCTest
 ///     -only-testing:KiboWatchUITests/WatchScreenshotTests \
 ///     -destination 'platform=watchOS Simulator,name=Apple Watch Series 11 (46mm)'
 ///
-/// Two capture channels, because the renderer is wall-clock driven and there is
-/// no pixel-identical automation:
-///   1. XCTAttachment (exported from the .xcresult) for every state we can hold
-///      or land on — including the transient recording/ask-armed states, which
-///      we hold for a few seconds and grab from a background thread mid-hold.
-///   2. Stage markers on stdout (`KIBO_WALK: <name> …`) so a host-side
-///      `simctl io screenshot` burst loop can correlate its frames with the
-///      truly app-driven transients (thinking/speaking, ~0.6s each on mock).
+/// Capture is entirely in-process via XCUIScreen/XCUIApplication screenshots.
+/// It MUST be in-process: on the watchOS simulator `simctl io screenshot`
+/// captures the watch face, not the foreground app, so a host-side screenshot
+/// loop cannot see these screens at all. There is no pixel-identical automation
+/// either (the renderer is wall-clock driven), so this is an eyeball harness.
+///
+/// Stable states (idle / pending / reply-played / settled-history) are grabbed
+/// on the test thread. The transient states — recording, ask-armed, and the
+/// sub-second thinking/speaking window — are grabbed from a background thread
+/// while a gesture or the ask flow blocks the test thread, then attached once
+/// the captures are synchronized. `flushShots` blocks on a `DispatchGroup`
+/// until every scheduled capture has run and asserts none were dropped, so the
+/// walk cannot pass green with a transient state silently missing.
 ///
 /// `failed-retry` is env-gated in a separate method: plain mock kibod
 /// transcribes unconditionally, so a terminal failure needs the host to restart
 /// kibod with bogus Gemini credentials first (see `testFailedRetryFixture`).
 final class WatchScreenshotTests: XCTestCase {
+    /// How many frames the ask-flow burst schedules across the post-release
+    /// window; every scheduled frame must land (see the flush assertion).
+    private static let askflowFrameCount = 34
+
     private var serverURL: String {
         ProcessInfo.processInfo.environment["KIBO_WATCH_TEST_SERVER_URL"]
             ?? "http://127.0.0.1:3011/"
@@ -37,10 +46,13 @@ final class WatchScreenshotTests: XCTestCase {
             ?? "new-conversation-c7f17cfd"
     }
 
-    /// Screenshots captured off the test thread while a gesture blocks it,
-    /// flushed as attachments back on the main thread once the gesture returns.
+    /// Screenshots captured off the test thread, flushed as attachments back on
+    /// the main thread once their scheduled captures have completed.
     private var deferredShots: [(name: String, shot: XCUIScreenshot)] = []
     private let shotLock = NSLock()
+    /// Balanced enter/leave per scheduled capture so a flush can block until all
+    /// pending background captures have actually run.
+    private let shotGroup = DispatchGroup()
 
     private func makeApp() -> XCUIApplication {
         let app = XCUIApplication()
@@ -73,7 +85,11 @@ final class WatchScreenshotTests: XCTestCase {
         stage("recording begin")
         scheduleShot("walk-2-recording", after: 1.5)
         talkButton.press(forDuration: 3.0)
-        flushShots()
+        let recordingShots = flushShots()
+        XCTAssertTrue(
+            recordingShots.contains("walk-2-recording"),
+            "Recording capture was not attached."
+        )
         stage("recording end")
 
         let pending = app.staticTexts.matching(
@@ -94,12 +110,13 @@ final class WatchScreenshotTests: XCTestCase {
         stage("ask-armed begin")
         scheduleShot("walk-3-ask-armed", after: 1.8)
         // The ask fires on release (~3.2s into this gesture); the transients —
-        // thinking (~1s) and speaking (~0.6s on mock) — blow past XCUITest's
-        // per-query snapshot, so grab the whole post-release window as a fast
-        // background pixel burst. XCUIScreen capture is the ONLY channel that
-        // sees the watch app: host-side `simctl io screenshot` grabs the watch
-        // face, not the foreground app, on the watchOS simulator.
-        scheduleShotSeries(prefix: "askflow", count: 34, interval: 0.2, startAfter: 3.4)
+        // thinking (~1s) and speaking (~0.6s on mock) — are far too brief for
+        // XCUITest's per-query snapshots, so grab the whole post-release window
+        // as a fast fixed-cadence background burst of XCUIScreen captures. The
+        // clean thinking/speaking stills are picked from these askflow frames.
+        scheduleShotSeries(
+            prefix: "askflow", count: Self.askflowFrameCount, interval: 0.2, startAfter: 3.4
+        )
         start.press(
             forDuration: 0.1, thenDragTo: end,
             withVelocity: .default, thenHoldForDuration: 3.0
@@ -115,11 +132,19 @@ final class WatchScreenshotTests: XCTestCase {
         attach("walk-6-reply-played", app)
         stage("reply-played end")
 
-        // Let the background askflow burst finish, then flush ask-armed + the
-        // thinking/speaking window frames (askflow-NN) as attachments; the
-        // clean thinking and speaking stills are picked from those.
-        sleep(4)
-        flushShots()
+        // flushShots blocks until the whole askflow burst has landed (no fixed
+        // sleep), then we assert nothing was dropped.
+        let askShots = flushShots()
+        XCTAssertTrue(
+            askShots.contains("walk-3-ask-armed"),
+            "Ask-armed capture was not attached."
+        )
+        let askflowFrames = askShots.filter { $0.hasPrefix("askflow-") }.count
+        XCTAssertEqual(
+            askflowFrames, Self.askflowFrameCount,
+            "Ask-flow burst dropped frames (\(askflowFrames)/\(Self.askflowFrameCount)); "
+            + "the thinking/speaking window may not have been captured."
+        )
         stage("askflow burst flushed")
 
         // --- settled-history -----------------------------------------------
@@ -189,20 +214,26 @@ final class WatchScreenshotTests: XCTestCase {
 
     /// Grab the screen `delay` seconds from now, off the test thread, so a
     /// blocking press/hold — or an app-driven transient — can be photographed
-    /// without waiting on the (slow) accessibility query path.
+    /// without waiting on the (slow) accessibility query path. Enters
+    /// `shotGroup` up front and leaves once the capture has run, so `flushShots`
+    /// can block until it lands.
     private func scheduleShot(_ name: String, after delay: TimeInterval) {
+        let group = shotGroup
+        group.enter()
         DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [weak self] in
             let shot = XCUIScreen.main.screenshot()
-            guard let self else { return }
-            self.shotLock.lock()
-            self.deferredShots.append((name, shot))
-            self.shotLock.unlock()
+            if let self {
+                self.shotLock.lock()
+                self.deferredShots.append((name, shot))
+                self.shotLock.unlock()
+            }
+            group.leave()
         }
     }
 
-    /// A fast fixed-cadence burst of background captures — the reliable way to
-    /// catch sub-second, app-driven states (thinking/speaking) on the watch
-    /// simulator, where the only capture path that sees the app is XCUIScreen.
+    /// A fast fixed-cadence burst of background XCUIScreen captures — the way to
+    /// catch sub-second, app-driven states (thinking/speaking), which pass
+    /// faster than XCUITest can query and land on them.
     private func scheduleShotSeries(
         prefix: String, count: Int, interval: TimeInterval, startAfter: TimeInterval
     ) {
@@ -214,8 +245,18 @@ final class WatchScreenshotTests: XCTestCase {
         }
     }
 
+    /// Block until every scheduled capture has run, then attach them. Returns
+    /// the set of captured names so the caller can assert none were dropped —
+    /// without the barrier a still-pending background shot would be silently
+    /// lost and the walk could pass with a state missing.
     @MainActor
-    private func flushShots() {
+    @discardableResult
+    private func flushShots(timeout: TimeInterval = 25) -> Set<String> {
+        let completion = shotGroup.wait(timeout: .now() + timeout)
+        XCTAssertEqual(
+            completion, .success,
+            "Scheduled screenshot captures did not complete within \(timeout)s."
+        )
         shotLock.lock()
         let shots = deferredShots
         deferredShots.removeAll()
@@ -226,9 +267,11 @@ final class WatchScreenshotTests: XCTestCase {
             attachment.lifetime = .keepAlways
             add(attachment)
         }
+        return Set(shots.map(\.name))
     }
 
-    /// A stage marker on stdout for host-side burst-loop correlation.
+    /// A breadcrumb on stdout/NSLog marking each state transition, so the run
+    /// log reads as the walk it drove.
     private func stage(_ label: String) {
         NSLog("KIBO_WALK: \(label)")
         print("KIBO_WALK: \(label)")

@@ -47,65 +47,101 @@ final class TalkGestureTests: XCTestCase {
         XCTAssertEqual(TalkGestureOutcome.resolve(heldFor: 0.999, swiped: true), .askPending)
     }
 
-    // MARK: - Release event sequences
+    // MARK: - Release event sequences (normal case: wasArmed == final swiped)
 
     func testDiscardEmitsCanceledOnly() {
         // Not armed: no `.armedChanged(false)`, no ask.
-        XCTAssertEqual(TalkGestureEvent.release(heldFor: 0.5, swiped: false), [.canceled])
+        XCTAssertEqual(TalkGestureEvent.release(heldFor: 0.5, swiped: false, wasArmed: false), [.canceled])
     }
 
     func testSaveEmitsSavedOnly() {
-        XCTAssertEqual(TalkGestureEvent.release(heldFor: 1.5, swiped: false), [.saved])
+        XCTAssertEqual(TalkGestureEvent.release(heldFor: 1.5, swiped: false, wasArmed: false), [.saved])
     }
 
     func testSaveAndAskDisarmsThenSavesThenAsks() {
         XCTAssertEqual(
-            TalkGestureEvent.release(heldFor: 1.5, swiped: true),
+            TalkGestureEvent.release(heldFor: 1.5, swiped: true, wasArmed: true),
             [.armedChanged(false), .saved, .askRequested]
         )
     }
 
     func testAskPendingDisarmsThenCancelsThenAsks() {
         XCTAssertEqual(
-            TalkGestureEvent.release(heldFor: 0.5, swiped: true),
+            TalkGestureEvent.release(heldFor: 0.5, swiped: true, wasArmed: true),
             [.armedChanged(false), .canceled, .askRequested]
         )
+    }
+
+    // MARK: - Tracked-armed disarm (edge case: sample gap at release)
+
+    /// The last change sample armed the gesture, but the terminal sample
+    /// crosses back below the threshold with no intervening change sample. The
+    /// terminal outcome resolves from the final (un-swiped) translation — save
+    /// or discard, never an ask — yet the caller MUST still be disarmed, or its
+    /// `swipeArmed` stays stuck true forever (the modifier's own state already
+    /// reset). Disarm therefore keys on the tracked `wasArmed`, not on `swiped`.
+    func testTrackedArmedButFinalNotSwipedStillDisarmsSavesNoAsk() {
+        let events = TalkGestureEvent.release(heldFor: 1.5, swiped: false, wasArmed: true)
+        XCTAssertEqual(events, [.armedChanged(false), .saved])
+        XCTAssertFalse(events.contains(.askRequested))
+    }
+
+    func testTrackedArmedButFinalNotSwipedShortHoldDisarmsCancelsNoAsk() {
+        let events = TalkGestureEvent.release(heldFor: 0.5, swiped: false, wasArmed: true)
+        XCTAssertEqual(events, [.armedChanged(false), .canceled])
+        XCTAssertFalse(events.contains(.askRequested))
+    }
+
+    /// The mirror gap: never tracked-armed, but the final sample is past the
+    /// threshold. The ask fires (terminal keys on `swiped`) and no disarm is
+    /// emitted — the caller was never armed, so nothing is stuck.
+    func testFinalSwipedButNeverArmedAsksWithoutDisarm() {
+        let events = TalkGestureEvent.release(heldFor: 1.5, swiped: true, wasArmed: false)
+        XCTAssertEqual(events, [.saved, .askRequested])
+        XCTAssertFalse(events.contains(.armedChanged(false)))
     }
 
     // MARK: - Ordering invariants
 
     func testArmedReleaseDisarmsBeforeAnyTerminal() {
-        // On every armed (swiped) release, `.armedChanged(false)` is first.
+        // On every tracked-armed release, `.armedChanged(false)` is first.
         for heldFor in [0.5, 1.0, 1.5] {
-            let events = TalkGestureEvent.release(heldFor: heldFor, swiped: true)
-            XCTAssertEqual(events.first, .armedChanged(false),
-                           "armed release held \(heldFor)s must disarm before terminals")
+            for swiped in [true, false] {
+                let events = TalkGestureEvent.release(heldFor: heldFor, swiped: swiped, wasArmed: true)
+                XCTAssertEqual(events.first, .armedChanged(false),
+                               "tracked-armed release held \(heldFor)s (swiped \(swiped)) must disarm before terminals")
+            }
         }
     }
 
     func testNonArmedReleaseNeverDisarms() {
         for heldFor in [0.5, 1.0, 1.5] {
-            let events = TalkGestureEvent.release(heldFor: heldFor, swiped: false)
-            XCTAssertFalse(events.contains(.armedChanged(false)),
-                           "non-armed release held \(heldFor)s must not emit disarm")
+            for swiped in [true, false] {
+                let events = TalkGestureEvent.release(heldFor: heldFor, swiped: swiped, wasArmed: false)
+                XCTAssertFalse(events.contains(.armedChanged(false)),
+                               "non-tracked-armed release held \(heldFor)s (swiped \(swiped)) must not emit disarm")
+            }
         }
     }
 
     func testTerminalPrecedesAskRequested() {
         // `.saved`/`.canceled` always precede `.askRequested`.
-        let saveAndAsk = TalkGestureEvent.release(heldFor: 1.5, swiped: true)
+        let saveAndAsk = TalkGestureEvent.release(heldFor: 1.5, swiped: true, wasArmed: true)
         XCTAssertLessThan(saveAndAsk.firstIndex(of: .saved)!,
                           saveAndAsk.firstIndex(of: .askRequested)!)
 
-        let askPending = TalkGestureEvent.release(heldFor: 0.5, swiped: true)
+        let askPending = TalkGestureEvent.release(heldFor: 0.5, swiped: true, wasArmed: true)
         XCTAssertLessThan(askPending.firstIndex(of: .canceled)!,
                           askPending.firstIndex(of: .askRequested)!)
     }
 
-    func testAskRequestedOnlyOnSwipe() {
-        XCTAssertFalse(TalkGestureEvent.release(heldFor: 0.5, swiped: false).contains(.askRequested))
-        XCTAssertFalse(TalkGestureEvent.release(heldFor: 1.5, swiped: false).contains(.askRequested))
-        XCTAssertTrue(TalkGestureEvent.release(heldFor: 0.5, swiped: true).contains(.askRequested))
-        XCTAssertTrue(TalkGestureEvent.release(heldFor: 1.5, swiped: true).contains(.askRequested))
+    func testAskRequestedOnlyOnFinalSwipe() {
+        // The ask keys on the final translation, independent of tracked arming.
+        for wasArmed in [true, false] {
+            XCTAssertFalse(TalkGestureEvent.release(heldFor: 0.5, swiped: false, wasArmed: wasArmed).contains(.askRequested))
+            XCTAssertFalse(TalkGestureEvent.release(heldFor: 1.5, swiped: false, wasArmed: wasArmed).contains(.askRequested))
+            XCTAssertTrue(TalkGestureEvent.release(heldFor: 0.5, swiped: true, wasArmed: wasArmed).contains(.askRequested))
+            XCTAssertTrue(TalkGestureEvent.release(heldFor: 1.5, swiped: true, wasArmed: wasArmed).contains(.askRequested))
+        }
     }
 }

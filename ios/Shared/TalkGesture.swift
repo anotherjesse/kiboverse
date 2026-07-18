@@ -57,14 +57,18 @@ enum TalkGestureOutcome: Equatable {
 }
 
 extension TalkGestureEvent {
-    /// The full, ordered event sequence a release emits. When the release ends
-    /// an armed (swiped) gesture, `.armedChanged(false)` precedes the terminal
-    /// events so the face/status can never stay visually ask-armed after
-    /// release. Arming is edge-triggered with no hysteresis, so being armed at
-    /// release is exactly `swiped`.
-    static func release(heldFor: TimeInterval, swiped: Bool) -> [TalkGestureEvent] {
+    /// The full, ordered event sequence a release emits.
+    ///
+    /// The disarm is keyed on `wasArmed` — the tracked armed state the caller
+    /// last observed — NOT on the final translation: if the terminal sample
+    /// crosses back below the threshold without an intervening change sample,
+    /// the caller must still be told to disarm, or its `swipeArmed` stays stuck
+    /// true forever. The terminal outcome (`saved`/`canceled`/`askRequested`)
+    /// resolves from the final translation (`swiped`). When `.armedChanged(false)`
+    /// is emitted it always precedes the terminal events.
+    static func release(heldFor: TimeInterval, swiped: Bool, wasArmed: Bool) -> [TalkGestureEvent] {
         var events: [TalkGestureEvent] = []
-        if swiped { events.append(.armedChanged(false)) }
+        if wasArmed { events.append(.armedChanged(false)) }
         events.append(contentsOf: TalkGestureOutcome.resolve(heldFor: heldFor, swiped: swiped).terminalEvents)
         return events
     }
@@ -96,10 +100,15 @@ private struct HoldToTalkGesture: ViewModifier {
                 .onEnded { value in
                     let startedAt = holdStartedAt
                     holdStartedAt = nil
+                    // Capture the tracked armed state before resetting: the
+                    // disarm event must key on what the caller last saw, not on
+                    // the final translation (which may cross back below the
+                    // threshold with no change sample to disarm the caller).
+                    let wasArmed = armed
                     armed = false
                     let heldFor = startedAt.map { value.time.timeIntervalSince($0) } ?? 0
                     let swiped = value.translation.height <= -swipeThreshold
-                    for event in TalkGestureEvent.release(heldFor: heldFor, swiped: swiped) {
+                    for event in TalkGestureEvent.release(heldFor: heldFor, swiped: swiped, wasArmed: wasArmed) {
                         onEvent(event)
                     }
                 }

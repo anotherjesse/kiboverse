@@ -41,6 +41,12 @@ final class AppStore: ObservableObject {
     @Published private(set) var recoveryItemCount = 0
     @Published private(set) var pendingClips: [PendingClip] = []
     @Published private(set) var pendingAttachments: [PendingAttachment] = []
+    /// The conversation as the constellation renders it: server events plus
+    /// this device's spooled/queued local state. Rebuilt at the choke points
+    /// where events or the spool change — never per frame; the view layer
+    /// only does geometry. Nothing reads this yet; a later phase wires it
+    /// into the phone's talk-mode/composer UI.
+    @Published private(set) var constellationMarkers: [ConstellationEvent] = []
     /// True once the launch selection restore (projects → conversations →
     /// events) has settled — success or failure. RootView holds intent-driven
     /// navigation until then.
@@ -69,6 +75,8 @@ final class AppStore: ObservableObject {
     private let imageCache = ConversationImageCache()
     private var clipRecoveryItemCount = 0
     private var attachmentRecoveryItemCount = 0
+    private var clipRecoveryItemIDs: [String] = []
+    private var attachmentRecoveryItemIDs: [String] = []
     private var isCreating = false
     private var serverVersion = 0
     private var projectSelectionVersion = 0
@@ -100,8 +108,11 @@ final class AppStore: ObservableObject {
         clipRecoveryItemCount = inventory.recoveryItems.count
         attachmentRecoveryItemCount = attachmentInventory.recoveryItems.count
         recoveryItemCount = clipRecoveryItemCount + attachmentRecoveryItemCount
+        clipRecoveryItemIDs = inventory.recoveryItems.map(\.id)
+        attachmentRecoveryItemIDs = attachmentInventory.recoveryItems.map(\.id)
         pendingClips = inventory.clips
         pendingAttachments = attachmentInventory.attachments
+        rebuildConstellationMarkers()
     }
 
     deinit {
@@ -127,11 +138,9 @@ final class AppStore: ObservableObject {
     var localAskableClipCount: Int {
         guard let projectID = selectedProjectID,
               let conversationID = selectedConversationID else { return 0 }
-        let destinationKey = "\(projectID)/\(conversationID)"
-        let serverURL = self.serverURL
-        return pendingClips.lazy.filter {
-            $0.serverURL == serverURL && $0.destinationKey == destinationKey
-        }.count
+        return pendingClips.matching(
+            serverURL: serverURL, destinationKey: "\(projectID)/\(conversationID)"
+        ).count
     }
     /// Locally spooled image attachments destined for the selected
     /// conversation on the current server.
@@ -145,12 +154,8 @@ final class AppStore: ObservableObject {
         }.count
     }
     var requestDestination: KiboDestination? {
-        guard let projectID = selectedProjectID,
-              let conversationID = selectedConversationID else { return nil }
-        return KiboDestination(
-            serverURL: serverURL,
-            projectID: projectID,
-            conversationID: conversationID
+        KiboDestination(
+            serverURL: serverURL, projectID: selectedProjectID, conversationID: selectedConversationID
         )
     }
 
@@ -208,6 +213,7 @@ final class AppStore: ObservableObject {
         selectedConversationID = retainedConversationID
         conversations = []
         events = []
+        rebuildConstellationMarkers()
         persist(id, key: Key.projectID)
         guard let id else { conversations = []; return }
         do {
@@ -227,6 +233,7 @@ final class AppStore: ObservableObject {
         eventSelectionVersion += 1
         selectedConversationID = id
         events = []
+        rebuildConstellationMarkers()
         persist(id, key: Key.conversationID)
         persistDestinationCache()
         await refreshEvents()
@@ -235,6 +242,7 @@ final class AppStore: ObservableObject {
     func refreshEvents() async {
         guard let project = selectedProjectID, let conversation = selectedConversationID else {
             events = []
+            rebuildConstellationMarkers()
             return
         }
         let version = eventSelectionVersion
@@ -741,6 +749,7 @@ final class AppStore: ObservableObject {
             projects = []
             conversations = []
             events = []
+            rebuildConstellationMarkers()
             try await api.setServerURL(canonicalURL)
             serverURL = canonicalURL
             UserDefaults.standard.set(serverURL, forKey: Key.serverURL)
@@ -864,6 +873,8 @@ final class AppStore: ObservableObject {
         clipRecoveryItemCount = inventory.recoveryItems.count
         attachmentRecoveryItemCount = attachmentInventory.recoveryItems.count
         recoveryItemCount = clipRecoveryItemCount + attachmentRecoveryItemCount
+        clipRecoveryItemIDs = inventory.recoveryItems.map(\.id)
+        attachmentRecoveryItemIDs = attachmentInventory.recoveryItems.map(\.id)
         pendingClips = inventory.clips
         pendingAttachments = attachmentInventory.attachments
         if recoveryItemCount > 0 && !isUploading && errorMessage == nil {
@@ -871,6 +882,36 @@ final class AppStore: ObservableObject {
                 ? "Recording recovery needed"
                 : "Photo recovery needed"
         }
+        rebuildConstellationMarkers()
+    }
+
+    /// Inventory → [LocalMarker] mapping + one ConstellationAssembly.markers
+    /// call — the phone's counterpart to WatchStore.rebuildConstellation,
+    /// with two additional local kinds the watch has no concept of: pending
+    /// image attachments (.image, .working) and attachment recovery
+    /// (.image, .failed) — a quarantined photo must render as a failed
+    /// diamond, never a voice star.
+    private func rebuildConstellationMarkers() {
+        var locals: [LocalMarker] = []
+        if let projectID = selectedProjectID,
+           let conversationID = selectedConversationID {
+            let destinationKey = "\(projectID)/\(conversationID)"
+            for clip in pendingClips.matching(serverURL: serverURL, destinationKey: destinationKey) {
+                locals.append(LocalMarker(id: clip.id, kind: .voice, phase: .working))
+            }
+            for attachment in pendingAttachments
+            where attachment.serverURL == serverURL && attachment.destinationKey == destinationKey {
+                locals.append(LocalMarker(id: attachment.id, kind: .image, phase: .working))
+            }
+        }
+        for recoveryID in clipRecoveryItemIDs {
+            locals.append(LocalMarker(id: "recovery-\(recoveryID)", kind: .voice, phase: .failed))
+        }
+        for recoveryID in attachmentRecoveryItemIDs {
+            locals.append(LocalMarker(id: "recovery-\(recoveryID)", kind: .image, phase: .failed))
+        }
+        let markers = ConstellationAssembly.markers(events: events, local: locals)
+        if constellationMarkers != markers { constellationMarkers = markers }
     }
 
     func refreshRecordingInventory() {

@@ -92,20 +92,14 @@ final class WatchStore: ObservableObject {
     var localAskableClipCount: Int {
         guard let projectID = selectedProjectID,
               let conversationID = selectedConversationID else { return 0 }
-        let destinationKey = "\(projectID)/\(conversationID)"
-        let serverURL = self.serverURL
-        return pendingClips.lazy.filter {
-            $0.serverURL == serverURL && $0.destinationKey == destinationKey
-        }.count
+        return pendingClips.matching(
+            serverURL: serverURL, destinationKey: "\(projectID)/\(conversationID)"
+        ).count
     }
 
     var requestDestination: KiboDestination? {
-        guard let projectID = selectedProjectID,
-              let conversationID = selectedConversationID else { return nil }
-        return KiboDestination(
-            serverURL: serverURL,
-            projectID: projectID,
-            conversationID: conversationID
+        KiboDestination(
+            serverURL: serverURL, projectID: selectedProjectID, conversationID: selectedConversationID
         )
     }
 
@@ -583,33 +577,24 @@ final class WatchStore: ObservableObject {
     }
 
     private func rebuildConstellation() {
-        var markers = events.constellation()
-        var known = Set(markers.map(\.id))
+        var locals: [LocalMarker] = []
         // Spooled clips for the selected destination render as in-flight
         // voice markers. The spool ID becomes the server clip ID on upload,
         // so each marker keeps its place when the server event lands.
         if let projectID = selectedProjectID,
            let conversationID = selectedConversationID {
             let destinationKey = "\(projectID)/\(conversationID)"
-            let serverURL = self.serverURL
-            for clip in pendingClips
-            where clip.serverURL == serverURL && clip.destinationKey == destinationKey {
-                guard known.insert(clip.id).inserted else { continue }
-                markers.append(ConstellationEvent(
-                    id: clip.id, kind: .voice, phase: .working, contextIDs: []
-                ))
+            for clip in pendingClips.matching(serverURL: serverURL, destinationKey: destinationKey) {
+                locals.append(LocalMarker(id: clip.id, kind: .voice, phase: .working))
             }
         }
         // Recovery items block every ask, so they show regardless of the
         // selected conversation. Prefixed: a quarantined clip must not
         // collide with a server marker for the same recording.
         for recoveryID in recoveryItemIDs {
-            let markerID = "recovery-\(recoveryID)"
-            guard known.insert(markerID).inserted else { continue }
-            markers.append(ConstellationEvent(
-                id: markerID, kind: .voice, phase: .failed, contextIDs: []
-            ))
+            locals.append(LocalMarker(id: "recovery-\(recoveryID)", kind: .voice, phase: .failed))
         }
+        let markers = ConstellationAssembly.markers(events: events, local: locals)
         if constellationMarkers != markers { constellationMarkers = markers }
     }
 

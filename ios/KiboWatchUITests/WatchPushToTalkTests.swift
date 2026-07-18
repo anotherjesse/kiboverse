@@ -22,14 +22,20 @@ final class WatchPushToTalkTests: XCTestCase {
         ProcessInfo.processInfo.environment["KIBO_WATCH_TEST_SERVER_URL"]
             ?? "http://127.0.0.1:3001/"
     }
+    private var projectID: String {
+        ProcessInfo.processInfo.environment["KIBO_WATCH_TEST_PROJECT_ID"] ?? "kibo"
+    }
+    private var conversationID: String {
+        ProcessInfo.processInfo.environment["KIBO_WATCH_TEST_CONVERSATION_ID"] ?? "general"
+    }
 
     override func setUpWithError() throws {
         continueAfterFailure = false
         app = XCUIApplication()
         app.launchArguments = [
             "-watchServerURL", serverURL,
-            "-watchSelectedProjectID", "kibo",
-            "-watchSelectedConversationID", "general"
+            "-watchSelectedProjectID", projectID,
+            "-watchSelectedConversationID", conversationID
         ]
         app.launch()
     }
@@ -97,9 +103,9 @@ final class WatchPushToTalkTests: XCTestCase {
         let url = base
             .appending(path: "v1")
             .appending(path: "projects")
-            .appending(path: "kibo")
+            .appending(path: projectID)
             .appending(path: "conversations")
-            .appending(path: "general")
+            .appending(path: conversationID)
             .appending(path: "events")
         let (data, response) = try await URLSession.shared.data(from: url)
         XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)

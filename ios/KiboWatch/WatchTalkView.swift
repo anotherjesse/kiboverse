@@ -232,27 +232,64 @@ struct WatchTalkView: View {
         }
     }
 
-    /// Non-scrolling main screen: destination at top, dominant mic in the
-    /// center, compact Ask/Retry + one-line status at the bottom. Fits 42mm
-    /// and 46mm faces without scrolling.
+    /// The single state the status line, face expression, and constellation
+    /// animation all render.
+    private var centerState: WatchCenterState {
+        .derive(
+            hasConversation: store.selectedConversationID != nil,
+            swipeArmed: swipeArmed,
+            isStarting: audio.isStarting,
+            isRecording: audio.isRecording,
+            errorMessage: errorText,
+            isSending: store.isUploading,
+            isThinking: store.isAskingKibo,
+            isLoadingReply: audio.loadingID != nil,
+            isSpeaking: audio.playingID != nil,
+            didFinishReply: audio.lastFinishedID != nil,
+            recoveryItemCount: store.recoveryItemCount,
+            hasRetryableFailure: store.events.retryableFailure != nil,
+            pendingCount: askableClipCount,
+            savedCount: store.pendingUploadCount
+        )
+    }
+
+    /// Non-scrolling main screen: the conversation constellation fills the
+    /// display with Kibo's face dead center (the Canvas and the face must
+    /// share a center for the ring/tick geometry to line up), destination at
+    /// the top, compact Retry/Review + one-line status at the bottom.
     private var mainContent: some View {
-        VStack(spacing: 2) {
-            conversationHeader
-            Spacer(minLength: 2)
-            talkButton
-            Spacer(minLength: 2)
-            bottomRow
+        ZStack {
+            // Face and Canvas share one coordinate space (and one offset):
+            // the ring/tick geometry is drawn around the Canvas center.
+            ZStack {
+                WatchConstellationView(
+                    markers: store.constellationMarkers,
+                    state: centerState,
+                    level: audio.level,
+                    faceDiameter: micDiameter
+                )
+                talkButton
+            }
+            .offset(y: 10)
+            .ignoresSafeArea()
+            VStack(spacing: 2) {
+                conversationHeader
+                Spacer(minLength: 2)
+                bottomRow
+            }
+            .padding(.horizontal, 6)
         }
-        .padding(.horizontal, 6)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     /// Display-only destination label; switching lives behind the folder
-    /// button in the toolbar.
+    /// button in the toolbar. Serif echoes the Kibo wordmark in the concept
+    /// art; dimmed so the constellation stays the subject.
     private var conversationHeader: some View {
         Text(selectedConversationName)
-            .font(.footnote.weight(.semibold))
-            .foregroundStyle(.secondary)
+            .font(.system(size: 12, weight: .semibold, design: .serif).smallCaps())
+            .kerning(1.1)
+            .foregroundStyle(.white.opacity(0.5))
             .lineLimit(1)
             .frame(maxWidth: .infinity)
     }
@@ -261,13 +298,15 @@ struct WatchTalkView: View {
     /// holds Retry when recovery is possible, a Review shortcut when saved
     /// recordings are blocking asks, otherwise just the status line.
     private var bottomRow: some View {
+        // Caption above, pill below: the button hugs the screen's bottom
+        // edge instead of clipping the bunny's chin.
         VStack(spacing: 2) {
+            statusLabel
             if let target = store.events.retryableFailure {
                 retryButton(target)
             } else if store.recoveryItemCount > 0 {
                 reviewButton
             }
-            statusLabel
         }
     }
 
@@ -288,14 +327,30 @@ struct WatchTalkView: View {
         .buttonStyle(.borderedProminent)
         .tint(.kiboCoral)
         .controlSize(.mini)
+        // Hug the label: a full-width capsule would cover the face above.
+        .fixedSize()
         .accessibilityIdentifier("watch-review-button")
     }
 
+    /// Captions join the design system: small, letter-spaced, with the
+    /// state-carrying token in coral (the count when thoughts are pending).
+    /// Amber, not red, for attention — red is reserved for destruction.
     private var statusLabel: some View {
-        Text(statusText)
+        let state = centerState
+        let line = state.statusLine
+        let restColor: Color = state.isError ? .kiboAmber : .white.opacity(0.55)
+        let text: Text
+        if case let .idle(pendingCount, _) = state, pendingCount > 0,
+           let space = line.firstIndex(of: " ") {
+            text = Text(line[..<space]).foregroundStyle(Color.kiboCoralBright)
+                + Text(line[space...]).foregroundStyle(restColor)
+        } else {
+            text = Text(line).foregroundStyle(restColor)
+        }
+        return text
             .accessibilityIdentifier("watch-status")
-            .font(.caption2)
-            .foregroundStyle(errorText == nil ? Color.secondary : Color.red)
+            .font(.system(size: 13, weight: .medium))
+            .kerning(0.6)
             .lineLimit(1)
             .truncationMode(.tail)
             .frame(maxWidth: .infinity, minHeight: 14)
@@ -320,48 +375,42 @@ struct WatchTalkView: View {
         .buttonStyle(.borderedProminent)
         .tint(.kiboCoral)
         .controlSize(.mini)
+        .fixedSize()
         .disabled(store.isRetryingFailedWork)
         .accessibilityIdentifier("watch-retry-button")
     }
 
-    /// Clips the next "Ask" would submit: unclaimed on the server plus any
-    /// queued on this watch for the SELECTED conversation — clips spooled
-    /// for other conversations and recovery items never count.
+    /// Media the next "Ask" would submit: unclaimed clips AND images on the
+    /// server plus any clips queued on this watch for the SELECTED
+    /// conversation — spooled clips for other conversations and recovery
+    /// items never count. Images count because a turn claims them too; the
+    /// status line must agree with the constellation's bright markers.
     private var askableClipCount: Int {
-        store.events.unclaimedClipCount + store.localAskableClipCount
+        store.events.unclaimedMediaCount + store.localAskableClipCount
     }
 
     private var selectedConversationName: String {
         store.selectedConversation?.name ?? "Choose conversation"
     }
 
-    /// Mic circle diameter sized to dominate the center on any watch face.
+    /// Face diameter: still the dominant press target, but sized to leave
+    /// the constellation a legible orbit band around it.
     private var micDiameter: CGFloat {
-        WKInterfaceDevice.current().screenBounds.width * 0.55
+        WKInterfaceDevice.current().screenBounds.width * 0.48
     }
 
     private var talkButton: some View {
-        ZStack {
-            if audio.isRecording {
-                WatchRecordingRing(diameter: micDiameter, delay: 0.0)
-                WatchRecordingRing(diameter: micDiameter, delay: 0.45)
-                WatchRecordingRing(diameter: micDiameter, delay: 0.9)
-            }
-            Circle()
-                .fill(audio.isRecording ? Color.red : Color.kiboCoral)
-                .frame(width: micDiameter, height: micDiameter)
-                .shadow(
-                    color: (audio.isRecording ? Color.red : Color.kiboCoral).opacity(0.35),
-                    radius: micDiameter * 0.11,
-                    y: micDiameter * 0.045
-                )
-                .scaleEffect(audio.isRecording ? 1 + audio.level * 0.12 : 1)
-                .animation(.easeOut(duration: 0.08), value: audio.level)
-            Image(systemName: micGlyph)
-                .font(.system(size: micDiameter * 0.4, weight: .semibold))
-                .foregroundStyle(.white)
-        }
-        .frame(width: micDiameter, height: micDiameter)
+        // The sprite is a cut-out bunny on transparency — it sits directly
+        // on the OLED black inside the state ring, no backing disc. Sprite
+        // swaps are instant; a crossfade reads as a glitch at watch size.
+        Image(centerState.faceAssetName)
+            .resizable()
+            .scaledToFit()
+            .frame(width: micDiameter * 0.92, height: micDiameter * 0.92)
+            .scaleEffect(audio.isRecording ? 1 + audio.level * 0.10 : 1)
+            .animation(.easeOut(duration: 0.08), value: audio.level)
+            .frame(width: micDiameter, height: micDiameter)
+            .contentShape(Circle())
         .opacity(store.selectedConversationID != nil ? 1 : 0.4)
         .accessibilityElement(children: .ignore)
         .accessibilityIdentifier("watch-talk-button")
@@ -412,30 +461,8 @@ struct WatchTalkView: View {
         .allowsHitTesting(store.selectedConversationID != nil)
     }
 
-    private var micGlyph: String {
-        if swipeArmed { return "sparkles" }
-        return audio.isRecording ? "waveform" : "mic.fill"
-    }
-
     private var errorText: String? {
         audio.recordingErrorMessage ?? audio.playbackErrorMessage ?? store.errorMessage
-    }
-
-    /// Dynamic states only — no persistent instructional copy.
-    private var statusText: String {
-        if let errorText { return errorText }
-        if swipeArmed { return "Release to ask" }
-        if audio.isStarting { return "Opening microphone…" }
-        if audio.isRecording { return "Listening…" }
-        if store.isUploading { return "Sending…" }
-        if store.isAskingKibo { return "Kibo is thinking…" }
-        if audio.loadingID != nil { return "Loading reply…" }
-        if audio.playingID != nil { return "Kibo is speaking" }
-        if audio.lastFinishedID != nil { return "Reply played" }
-        if store.recoveryItemCount > 0 { return "Recording needs review" }
-        if askableClipCount > 0 { return "\(askableClipCount) pending" }
-        if store.pendingUploadCount > 0 { return "Saved on watch" }
-        return ""
     }
 
     private func askKibo() {
@@ -564,43 +591,6 @@ struct WatchTalkView: View {
         case .wait:
             break
         }
-    }
-}
-
-/// One expanding, fading ring of the recording pulse — the same treatment as
-/// iOS's MicButton: red fill + staggered rings means a single static frame
-/// mid-recording still reads as "recording".
-private struct WatchRecordingRing: View {
-    let diameter: CGFloat
-    let delay: Double
-    @State private var expanded = false
-    @State private var faded = false
-
-    var body: some View {
-        // Rings start at 1.15x so a fresh ring immediately clears the fill
-        // (which grows to 1.12x with level), and opacity fades linearly
-        // while scale eases out — a static frame at any phase shows 2–3
-        // visible staggered rings.
-        Circle()
-            .stroke(Color.red.opacity(faded ? 0 : 0.6), lineWidth: 3)
-            .frame(width: diameter, height: diameter)
-            .scaleEffect(expanded ? 1.8 : 1.15)
-            .onAppear {
-                withAnimation(
-                    .easeOut(duration: 1.35)
-                        .repeatForever(autoreverses: false)
-                        .delay(delay)
-                ) {
-                    expanded = true
-                }
-                withAnimation(
-                    .linear(duration: 1.35)
-                        .repeatForever(autoreverses: false)
-                        .delay(delay)
-                ) {
-                    faded = true
-                }
-            }
     }
 }
 

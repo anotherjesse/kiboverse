@@ -17,7 +17,7 @@ enum WatchRetryWorkOutcome: Equatable {
 
 @MainActor
 final class WatchStore: ObservableObject {
-    static let defaultServerURL = "https://wideboi.stingray-nominal.ts.net/"
+    static let defaultServerURL = "https://jstew.stingray-nominal.ts.net/"
 
     private enum Key {
         static let serverURL = "watchServerURL"
@@ -40,6 +40,11 @@ final class WatchStore: ObservableObject {
     @Published var pendingUploadCount = 0
     @Published private(set) var recoveryItemCount = 0
     @Published private(set) var pendingClips: [PendingClip] = []
+    /// The conversation as the constellation renders it: server events plus
+    /// watch-local spool state. Rebuilt when events or the spool change —
+    /// never per frame; the view layer only does geometry.
+    @Published private(set) var constellationMarkers: [ConstellationEvent] = []
+    private var recoveryItemIDs: [String] = []
 
     /// Poll cadence contract (Tier 2 plan, Phase 0): no network while the
     /// scene is inactive; delta fetches only; fast cadence only while work
@@ -119,6 +124,8 @@ final class WatchStore: ObservableObject {
         pendingUploadCount = inventory.protectedCount(for: canonical)
         recoveryItemCount = inventory.recoveryItems.count
         pendingClips = inventory.clips
+        recoveryItemIDs = inventory.recoveryItems.map(\.id)
+        rebuildConstellation()
     }
 
     deinit {
@@ -565,6 +572,7 @@ final class WatchStore: ObservableObject {
     private func resetEventLog() {
         events = []
         eventsCursor = 0
+        rebuildConstellation()
     }
 
     private func updatePendingUploadCount() {
@@ -572,9 +580,42 @@ final class WatchStore: ObservableObject {
         pendingUploadCount = inventory.protectedCount(for: serverURL)
         recoveryItemCount = inventory.recoveryItems.count
         pendingClips = inventory.clips
+        recoveryItemIDs = inventory.recoveryItems.map(\.id)
+        rebuildConstellation()
         if recoveryItemCount > 0 && !isUploading && errorMessage == nil {
             status = "Recording recovery needed"
         }
+    }
+
+    private func rebuildConstellation() {
+        var markers = events.constellation()
+        var known = Set(markers.map(\.id))
+        // Spooled clips for the selected destination render as in-flight
+        // voice markers. The spool ID becomes the server clip ID on upload,
+        // so each marker keeps its place when the server event lands.
+        if let projectID = selectedProjectID,
+           let conversationID = selectedConversationID {
+            let destinationKey = "\(projectID)/\(conversationID)"
+            let serverURL = self.serverURL
+            for clip in pendingClips
+            where clip.serverURL == serverURL && clip.destinationKey == destinationKey {
+                guard known.insert(clip.id).inserted else { continue }
+                markers.append(ConstellationEvent(
+                    id: clip.id, kind: .voice, phase: .working, contextIDs: []
+                ))
+            }
+        }
+        // Recovery items block every ask, so they show regardless of the
+        // selected conversation. Prefixed: a quarantined clip must not
+        // collide with a server marker for the same recording.
+        for recoveryID in recoveryItemIDs {
+            let markerID = "recovery-\(recoveryID)"
+            guard known.insert(markerID).inserted else { continue }
+            markers.append(ConstellationEvent(
+                id: markerID, kind: .voice, phase: .failed, contextIDs: []
+            ))
+        }
+        if constellationMarkers != markers { constellationMarkers = markers }
     }
 
     func refreshRecordingInventory() {

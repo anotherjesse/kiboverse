@@ -108,7 +108,7 @@ xcodebuild -project Kibo.xcodeproj -scheme KiboWatch \
 ```
 
 Start the server from the repository root with `KIBO_AI_MODE=mock cargo run -p
-kibod`. Both apps default to `https://wideboi.stingray-nominal.ts.net/` and
+kibod`. Both apps default to `https://jstew.stingray-nominal.ts.net/` and
 Settings can point them at another URL. For local integration testing, use
 `http://127.0.0.1:3000`. Plain HTTP is enabled only for the current trusted
 local-network server phase and should not be used on a public network.

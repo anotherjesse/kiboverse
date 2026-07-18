@@ -19,7 +19,7 @@ final class AppStore: ObservableObject {
         let conversationID: String?
     }
 
-    static let defaultServerURL = "https://wideboi.stingray-nominal.ts.net/"
+    static let defaultServerURL = "https://jstew.stingray-nominal.ts.net/"
     private enum Key {
         static let serverURL = "serverURL"
         static let projectID = "selectedProjectID"

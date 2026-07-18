@@ -187,6 +187,7 @@ struct WatchTalkView: View {
             .sheet(isPresented: $showingServer) { WatchServerView(store: store) }
             .onAppear {
                 replyCommandScope.appear(isActive: scenePhase == .active)
+                store.setSceneActive(scenePhase == .active)
             }
             .task {
                 await store.start()
@@ -211,6 +212,7 @@ struct WatchTalkView: View {
                 audio.conversationChanged()
             }
             .onChange(of: scenePhase) { _, phase in
+                store.setSceneActive(phase == .active)
                 replyCommandScope.setActive(phase == .active)
                 if phase != .active {
                     cancelReplyCommand()

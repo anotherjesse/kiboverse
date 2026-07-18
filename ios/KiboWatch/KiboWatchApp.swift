@@ -41,12 +41,29 @@ final class WatchStore: ObservableObject {
     @Published private(set) var recoveryItemCount = 0
     @Published private(set) var pendingClips: [PendingClip] = []
 
+    /// Poll cadence contract (Tier 2 plan, Phase 0): no network while the
+    /// scene is inactive; delta fetches only; fast cadence only while work
+    /// is in flight, degrading if it never resolves.
+    static let idlePollInterval: Duration = .seconds(10)
+    static let fastPollInterval: Duration = .milliseconds(500)
+    /// A fast window that runs this long without resolving degrades to the
+    /// idle cadence — a wedged turn must not burn the radio indefinitely.
+    static let fastPollingDegradeAfter: Duration = .seconds(120)
+    /// Sleep granularity of the poll loop: cadence changes (an ask starting,
+    /// a reply landing) take effect within one tick, no wakeup wiring.
+    private static let pollTick: Duration = .milliseconds(500)
+
     private let defaults = UserDefaults.standard
     private let spool = PendingUploadSpool(directoryName: PendingUploadSpool.watchDirectoryName)
     private var api: KiboAPI
     private var pollTask: Task<Void, Never>?
     private var uploadTask: Task<Bool, Never>?
     private var hasStarted = false
+    private var isSceneActive = true
+    private var fastPollingSince: ContinuousClock.Instant?
+    /// Events with seq ≤ this are already in `events`; kibod filters
+    /// server-side, so each poll transfers only the delta.
+    private(set) var eventsCursor: UInt64 = 0
     private var loadVersion = 0
     private var selectionVersion = 0
     private var eventRequestVersion = 0
@@ -114,8 +131,24 @@ final class WatchStore: ObservableObject {
         hasStarted = true
         await load()
         _ = await retryPendingUploads()
-        beginPolling()
+        if isSceneActive { beginPolling() }
     }
+
+    /// Phase 0 contract: zero network while the scene is inactive. The poll
+    /// loop exists only while the app is frontmost and awake.
+    func setSceneActive(_ active: Bool) {
+        guard active != isSceneActive else { return }
+        isSceneActive = active
+        if active {
+            guard hasStarted else { return }
+            beginPolling(refreshingImmediately: true)
+        } else {
+            pollTask?.cancel()
+            pollTask = nil
+        }
+    }
+
+    var isPolling: Bool { pollTask != nil }
 
     func load() async {
         loadVersion += 1
@@ -143,7 +176,7 @@ final class WatchStore: ObservableObject {
         selectedProjectID = id
         selectedConversationID = nil
         conversations = []
-        events = []
+        resetEventLog()
         persist(id, key: Key.projectID)
         guard let id else { return }
         do {
@@ -162,7 +195,7 @@ final class WatchStore: ObservableObject {
     func selectConversation(_ id: String?) async {
         selectionVersion += 1
         selectedConversationID = id
-        events = []
+        resetEventLog()
         persist(id, key: Key.conversationID)
         await refreshEvents()
     }
@@ -177,13 +210,19 @@ final class WatchStore: ObservableObject {
         do {
             let loaded = try await api.events(
                 projectID: projectID,
-                conversationID: conversationID
+                conversationID: conversationID,
+                after: eventsCursor
             )
             guard version == selectionVersion,
                   requestVersion == eventRequestVersion,
                   projectID == selectedProjectID,
                   conversationID == selectedConversationID else { return false }
-            events = loaded.events
+            // Only the newest-issued request can pass the guard above, so no
+            // two responses ever append against the same cursor value.
+            if !loaded.events.isEmpty {
+                events.append(contentsOf: loaded.events)
+            }
+            eventsCursor = loaded.latest_seq
             if eventRevision < .max { eventRevision += 1 }
             updatePendingUploadCount()
             if pendingUploadCount == 0 && !isUploading {
@@ -380,7 +419,7 @@ final class WatchStore: ObservableObject {
             selectedConversationID = nil
             projects = []
             conversations = []
-            events = []
+            resetEventLog()
             try await api.setServerURL(canonicalURL)
             defaults.set(canonicalURL, forKey: Key.serverURL)
             await load()
@@ -480,19 +519,52 @@ final class WatchStore: ObservableObject {
         status = "Saved recordings discarded"
     }
 
-    private func beginPolling() {
+    private func beginPolling(refreshingImmediately: Bool = false) {
         pollTask?.cancel()
+        fastPollingSince = nil
         pollTask = Task { [weak self] in
+            var lastFetch: ContinuousClock.Instant? = refreshingImmediately ? nil : .now
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(2))
-                guard let self else { return }
+                if lastFetch != nil {
+                    try? await Task.sleep(for: Self.pollTick)
+                }
+                guard let self, !Task.isCancelled else { return }
+                let now = ContinuousClock.now
+                let due = lastFetch.map {
+                    $0.duration(to: now) >= self.nextPollInterval(now: now)
+                } ?? true
+                guard due else { continue }
                 if self.projects.isEmpty {
                     await self.load()
                 } else {
                     await self.refreshEvents(quiet: true)
                 }
+                lastFetch = ContinuousClock.now
             }
         }
+    }
+
+    /// Decides the current fetch cadence: fast only while kibod is doing
+    /// work this watch is waiting on, degrading after
+    /// `fastPollingDegradeAfter` so an unresolved window cannot poll fast
+    /// forever. While `projects` is empty only `load()` retries, at the
+    /// idle cadence.
+    func nextPollInterval(now: ContinuousClock.Instant = .now) -> Duration {
+        let needsFast = !projects.isEmpty && (isSubmitting || events.needsFastPolling)
+        guard needsFast else {
+            fastPollingSince = nil
+            return Self.idlePollInterval
+        }
+        let since = fastPollingSince ?? now
+        fastPollingSince = since
+        return since.duration(to: now) > Self.fastPollingDegradeAfter
+            ? Self.idlePollInterval
+            : Self.fastPollInterval
+    }
+
+    private func resetEventLog() {
+        events = []
+        eventsCursor = 0
     }
 
     private func updatePendingUploadCount() {

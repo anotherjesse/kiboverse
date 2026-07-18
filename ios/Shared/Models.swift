@@ -66,6 +66,31 @@ extension Array where Element == KiboEvent {
         }
     }
 
+    /// True while kibod is producing something this device is waiting on —
+    /// a reply still thinking/retrying, or reply speech not yet terminal.
+    /// Unclaimed-clip transcription is excluded: it drives no wrist-visible
+    /// state, so it never justifies the fast poll cadence.
+    var needsFastPolling: Bool {
+        let projection = ConversationPresentation(events: self)
+        for turnID in projection.turnIDs {
+            switch projection.replies[turnID] {
+            case .thinking, .retrying, nil:
+                return true
+            case .failed:
+                continue
+            case let .ready(reply):
+                guard reply.audio != nil else { continue }
+                switch projection.speech[turnID] {
+                case .streaming, .retrying, nil:
+                    return true
+                case .ready, .failed:
+                    continue
+                }
+            }
+        }
+        return false
+    }
+
     /// Server-side clips not yet claimed by any turn — the recordings the
     /// next "Ask Kibo" would submit. Mirrors `pendingTurnIDs`.
     var unclaimedClipIDs: Set<String> {

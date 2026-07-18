@@ -139,15 +139,10 @@ struct WatchTalkView: View {
     @State private var replyCommandScope = WatchReplyCommandScope()
     @State private var replyCommandTask: Task<Void, Never>?
     @State private var showingServer = false
-    @State private var holdStartedAt: Date?
     @State private var swipeArmed = false
 
     /// Swiping up past this arms release-to-ask.
     private static let swipeThreshold: CGFloat = 30
-    /// Sub-second releases never produce a recording: with a swipe they ask
-    /// with what's already pending, without one the capture is silently
-    /// discarded. Only holds of 1s+ are real recordings.
-    private static let recordThreshold: TimeInterval = 1.0
 
     init() {
         let store = WatchStore()
@@ -390,41 +385,29 @@ struct WatchTalkView: View {
         // With no separate Ask button, the swipe gesture needs an
         // accessibility equivalent.
         .accessibilityAction(named: "Ask Kibo") { askKibo() }
-        .gesture(
-            DragGesture(minimumDistance: 0)
-                .onChanged { value in
-                    if holdStartedAt == nil {
-                        holdStartedAt = value.time
-                        beginHold()
-                    }
-                    let armed = value.translation.height <= -Self.swipeThreshold
-                    if armed != swipeArmed {
-                        swipeArmed = armed
-                        if armed { WKInterfaceDevice.current().play(.directionUp) }
-                    }
+        // Shared hold-to-talk semantics; watch haptics and the askable-count
+        // guard stay here — the release just ended by our own hand, so the ask
+        // path skips the capture-state guards whose published values may not
+        // have settled on this exact tick.
+        .holdToTalkGesture(swipeThreshold: Self.swipeThreshold) { event in
+            switch event {
+            case .began:
+                beginHold()
+            case let .armedChanged(armed):
+                swipeArmed = armed
+                if armed { WKInterfaceDevice.current().play(.directionUp) }
+            case .canceled:
+                audio.cancelHold()
+            case .saved:
+                endHold()
+            case .askRequested:
+                if askableClipCount > 0 {
+                    performAsk()
+                } else {
+                    WKInterfaceDevice.current().play(.failure)
                 }
-                .onEnded { value in
-                    let startedAt = holdStartedAt
-                    holdStartedAt = nil
-                    swipeArmed = false
-                    let heldFor = startedAt.map { value.time.timeIntervalSince($0) } ?? 0
-                    let swiped = value.translation.height <= -Self.swipeThreshold
-                    if heldFor < Self.recordThreshold {
-                        audio.cancelHold()
-                    } else {
-                        endHold()
-                    }
-                    guard swiped else { return }
-                    // The hold just ended by our own hand — skip the
-                    // capture-state guards, whose published values may not
-                    // have settled on this exact tick.
-                    if askableClipCount > 0 {
-                        performAsk()
-                    } else {
-                        WKInterfaceDevice.current().play(.failure)
-                    }
-                }
-        )
+            }
+        }
         .allowsHitTesting(store.selectedConversationID != nil)
     }
 

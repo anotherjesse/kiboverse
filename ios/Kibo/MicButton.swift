@@ -23,12 +23,7 @@ struct MicButton: View {
 
     /// Swiping up past this arms release-to-ask.
     private static let swipeThreshold: CGFloat = 55
-    /// Sub-second releases never produce a recording: with a swipe they ask
-    /// with what's already pending, without one the capture is silently
-    /// discarded. Only holds of 1s+ are real recordings.
-    private static let recordThreshold: TimeInterval = 1.0
 
-    @State private var holdStartedAt: Date?
     @State private var swipeArmed = false
 
     var body: some View {
@@ -66,31 +61,22 @@ struct MicButton: View {
         // With no separate Ask button, the swipe gesture needs an
         // accessibility equivalent.
         .accessibilityAction(named: "Ask Kibo") { askKibo() }
-        .gesture(
-            DragGesture(minimumDistance: 0)
-                .onChanged { value in
-                    if holdStartedAt == nil {
-                        holdStartedAt = value.time
-                        beginHold()
-                    }
-                    let armed = value.translation.height <= -Self.swipeThreshold
-                    if armed != swipeArmed { swipeArmed = armed }
-                }
-                .onEnded { value in
-                    let startedAt = holdStartedAt
-                    holdStartedAt = nil
-                    swipeArmed = false
-                    let heldFor = startedAt.map { value.time.timeIntervalSince($0) } ?? 0
-                    let swiped = value.translation.height <= -Self.swipeThreshold
-                    if heldFor < Self.recordThreshold {
-                        cancelHold()
-                        if swiped { askKibo() }
-                    } else {
-                        endHold()
-                        if swiped { askKibo() }
-                    }
-                }
-        )
+        // Shared hold-to-talk semantics; the swipe-armed state (feeding the
+        // hint capsule and `.sensoryFeedback`) and store/audio wiring stay here.
+        .holdToTalkGesture(swipeThreshold: Self.swipeThreshold) { event in
+            switch event {
+            case .began:
+                beginHold()
+            case let .armedChanged(armed):
+                swipeArmed = armed
+            case .canceled:
+                cancelHold()
+            case .saved:
+                endHold()
+            case .askRequested:
+                askKibo()
+            }
+        }
         .allowsHitTesting(isEnabled)
         .accessibilityIdentifier("talk-button")
     }

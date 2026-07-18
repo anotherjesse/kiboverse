@@ -234,7 +234,7 @@ struct WatchTalkView: View {
 
     /// The single state the status line, face expression, and constellation
     /// animation all render.
-    private var centerState: WatchCenterState {
+    private var centerState: CenterState {
         .derive(
             hasConversation: store.selectedConversationID != nil,
             swipeArmed: swipeArmed,
@@ -313,69 +313,32 @@ struct WatchTalkView: View {
     /// Recovery items block every ask until they are reviewed; give that
     /// state a direct way out instead of a truncated instruction.
     private var reviewButton: some View {
-        Button {
+        CoralActionPill(title: "Review saved", systemImage: "exclamationmark.arrow.circlepath") {
             showingServer = true
-        } label: {
-            HStack(spacing: 4) {
-                Image(systemName: "exclamationmark.arrow.circlepath")
-                Text("Review saved")
-                    .lineLimit(1)
-            }
-            .font(.footnote.weight(.semibold))
-            .padding(.horizontal, 10)
         }
-        .buttonStyle(.borderedProminent)
-        .tint(.kiboCoral)
         .controlSize(.mini)
-        // Hug the label: a full-width capsule would cover the face above.
-        .fixedSize()
         .accessibilityIdentifier("watch-review-button")
     }
 
-    /// Captions join the design system: small, letter-spaced, with the
-    /// state-carrying token in coral (the count when thoughts are pending).
-    /// Amber, not red, for attention — red is reserved for destruction.
     private var statusLabel: some View {
-        let state = centerState
-        let line = state.statusLine
-        let restColor: Color = state.isError ? .kiboAmber : .white.opacity(0.55)
-        let text: Text
-        if case let .idle(pendingCount, _) = state, pendingCount > 0,
-           let space = line.firstIndex(of: " ") {
-            text = Text(line[..<space]).foregroundStyle(Color.kiboCoralBright)
-                + Text(line[space...]).foregroundStyle(restColor)
-        } else {
-            text = Text(line).foregroundStyle(restColor)
-        }
-        return text
-            .accessibilityIdentifier("watch-status")
-            .font(.system(size: 13, weight: .medium))
-            .kerning(0.6)
-            .lineLimit(1)
-            .truncationMode(.tail)
-            .frame(maxWidth: .infinity, minHeight: 14)
+        StatusLabel(
+            state: centerState,
+            style: .onDark,
+            font: .system(size: 13, weight: .medium),
+            kerning: 0.6
+        )
+        .accessibilityIdentifier("watch-status")
     }
 
     private func retryButton(_ target: RetryTarget) -> some View {
-        Button {
+        CoralActionPill(
+            title: "Retry",
+            systemImage: "arrow.clockwise",
+            isBusy: store.isRetryingFailedWork
+        ) {
             retryFailedWork(target)
-        } label: {
-            HStack(spacing: 4) {
-                if store.isRetryingFailedWork {
-                    ProgressView().controlSize(.mini)
-                } else {
-                    Image(systemName: "arrow.clockwise")
-                }
-                Text("Retry")
-                    .lineLimit(1)
-            }
-            .font(.footnote.weight(.semibold))
-            .padding(.horizontal, 10)
         }
-        .buttonStyle(.borderedProminent)
-        .tint(.kiboCoral)
         .controlSize(.mini)
-        .fixedSize()
         .disabled(store.isRetryingFailedWork)
         .accessibilityIdentifier("watch-retry-button")
     }
@@ -583,7 +546,7 @@ struct WatchTalkView: View {
         case .complete:
             replyPlaybackIntent.clear()
         case .failed:
-            let playbackID = "reply-\(turnID)"
+            let playbackID = PlaybackID.reply(turnID)
             replyPlaybackIntent.clear()
             if audio.loadingID == playbackID || audio.playingID == playbackID {
                 audio.stopReply()

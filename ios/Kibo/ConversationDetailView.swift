@@ -237,8 +237,8 @@ struct ConversationDetailView: View {
     }
 
     private func playbackID(for item: TimelineItem) -> String? {
-        if let clipID = item.clipID { return "clip-\(clipID)" }
-        if item.canPlay, let turnID = item.turnID { return "reply-\(turnID)" }
+        if let clipID = item.clipID { return PlaybackID.clip(clipID) }
+        if item.canPlay, let turnID = item.turnID { return PlaybackID.reply(turnID) }
         return nil
     }
 

@@ -130,10 +130,10 @@ struct TalkModeView: View {
         if store.isUploading {
             return "Sending…"
         }
-        if audio.playingID?.hasPrefix("reply-") == true {
+        if PlaybackID.isReply(audio.playingID) {
             return "Kibo is speaking"
         }
-        if store.isAskingKibo || audio.loadingID?.hasPrefix("reply-") == true {
+        if store.isAskingKibo || PlaybackID.isReply(audio.loadingID) {
             return "Loading reply…"
         }
         if store.recoveryItemCount > 0 {

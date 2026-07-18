@@ -122,7 +122,7 @@ struct ConstellationLayout: Equatable {
 /// Purely decorative — hit testing stays with the face button above it.
 struct WatchConstellationView: View {
     let markers: [ConstellationEvent]
-    let state: WatchCenterState
+    let state: CenterState
     let level: CGFloat
     let faceDiameter: CGFloat
 
@@ -173,7 +173,7 @@ struct WatchConstellationView: View {
         _ graphics: GraphicsContext,
         size: CGSize,
         layout: ConstellationLayout,
-        state: WatchCenterState,
+        state: CenterState,
         level: CGFloat,
         faceDiameter: CGFloat,
         time: TimeInterval
@@ -268,7 +268,7 @@ struct WatchConstellationView: View {
         center: CGPoint,
         band: (inner: CGFloat, outer: CGFloat),
         faceRadius: CGFloat,
-        mode: WatchConstellationMode,
+        mode: ConstellationMode,
         level: CGFloat,
         time: TimeInterval
     ) {
@@ -403,7 +403,7 @@ struct WatchConstellationView: View {
     private static func drawThreadLines(
         _ graphics: GraphicsContext,
         layout: ConstellationLayout,
-        state: WatchCenterState,
+        state: CenterState,
         positions: [String: CGPoint],
         center: CGPoint,
         faceRadius: CGFloat,
@@ -454,7 +454,7 @@ struct WatchConstellationView: View {
         _ graphics: GraphicsContext,
         placed: ConstellationLayout.Placed,
         at point: CGPoint,
-        mode: WatchConstellationMode,
+        mode: ConstellationMode,
         time: TimeInterval
     ) {
         let event = placed.event
@@ -623,7 +623,7 @@ struct WatchConstellationView: View {
         _ graphics: GraphicsContext,
         center: CGPoint,
         faceRadius: CGFloat,
-        mode: WatchConstellationMode,
+        mode: ConstellationMode,
         level: CGFloat,
         time: TimeInterval
     ) {

@@ -259,7 +259,7 @@ final class ReplySession: ObservableObject {
         case .complete:
             lifecycle.clearPlayback()
         case .failed:
-            let playbackID = "reply-\(turnID)"
+            let playbackID = PlaybackID.reply(turnID)
             lifecycle.clearPlayback()
             if audio.loadingID == playbackID || audio.playingID == playbackID {
                 audio.stopReply()

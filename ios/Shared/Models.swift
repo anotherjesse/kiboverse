@@ -330,7 +330,7 @@ extension Array where Element == KiboEvent {
             return projection.replies[turnID]?.isFailed == true ? .failed : .wait
         }
         guard reply.audio != nil else { return .complete }
-        let playbackID = "reply-\(turnID)"
+        let playbackID = PlaybackID.reply(turnID)
         guard let speech = projection.speech[turnID] else { return .wait }
         switch speech {
         case .failed:

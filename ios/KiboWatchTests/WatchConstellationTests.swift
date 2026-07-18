@@ -182,7 +182,7 @@ final class WatchConstellationTests: XCTestCase {
 
     func testCenterStatePriorities() {
         // Live interaction outranks a sticky error message.
-        let recording = WatchCenterState.derive(
+        let recording = CenterState.derive(
             hasConversation: true, swipeArmed: false, isStarting: false,
             isRecording: true, errorMessage: "stale network error",
             isSending: false, isThinking: false, isLoadingReply: false,
@@ -194,7 +194,7 @@ final class WatchConstellationTests: XCTestCase {
 
         // Active work also outranks a sticky error; the error resurfaces
         // once nothing is in flight.
-        let sending = WatchCenterState.derive(
+        let sending = CenterState.derive(
             hasConversation: true, swipeArmed: false, isStarting: false,
             isRecording: false, errorMessage: "server unreachable",
             isSending: true, isThinking: true, isLoadingReply: false,
@@ -203,7 +203,7 @@ final class WatchConstellationTests: XCTestCase {
         )
         XCTAssertEqual(sending, .sending)
 
-        let error = WatchCenterState.derive(
+        let error = CenterState.derive(
             hasConversation: true, swipeArmed: false, isStarting: false,
             isRecording: false, errorMessage: "server unreachable",
             isSending: false, isThinking: false, isLoadingReply: false,
@@ -215,7 +215,7 @@ final class WatchConstellationTests: XCTestCase {
 
         // "Reply played" is sticky in the audio layer; a thought that
         // arrived after the reply matters more than the afterglow.
-        let playedThenPending = WatchCenterState.derive(
+        let playedThenPending = CenterState.derive(
             hasConversation: true, swipeArmed: false, isStarting: false,
             isRecording: false, errorMessage: nil,
             isSending: false, isThinking: false, isLoadingReply: false,
@@ -224,7 +224,7 @@ final class WatchConstellationTests: XCTestCase {
         )
         XCTAssertEqual(playedThenPending.statusLine, "1 pending")
 
-        let played = WatchCenterState.derive(
+        let played = CenterState.derive(
             hasConversation: true, swipeArmed: false, isStarting: false,
             isRecording: false, errorMessage: nil,
             isSending: false, isThinking: false, isLoadingReply: false,
@@ -233,7 +233,7 @@ final class WatchConstellationTests: XCTestCase {
         )
         XCTAssertEqual(played, .replyDone)
 
-        let pending = WatchCenterState.derive(
+        let pending = CenterState.derive(
             hasConversation: true, swipeArmed: false, isStarting: false,
             isRecording: false, errorMessage: nil,
             isSending: false, isThinking: false, isLoadingReply: false,
@@ -242,16 +242,16 @@ final class WatchConstellationTests: XCTestCase {
         )
         XCTAssertEqual(pending.statusLine, "3 pending")
 
-        let saved = WatchCenterState.derive(
+        let saved = CenterState.derive(
             hasConversation: true, swipeArmed: false, isStarting: false,
             isRecording: false, errorMessage: nil,
             isSending: false, isThinking: false, isLoadingReply: false,
             isSpeaking: false, didFinishReply: false, recoveryItemCount: 0,
             pendingCount: 0, savedCount: 2
         )
-        XCTAssertEqual(saved.statusLine, "Saved on watch")
+        XCTAssertEqual(saved.statusLine, "2 saved")
 
-        let review = WatchCenterState.derive(
+        let review = CenterState.derive(
             hasConversation: true, swipeArmed: false, isStarting: false,
             isRecording: false, errorMessage: nil,
             isSending: false, isThinking: false, isLoadingReply: false,

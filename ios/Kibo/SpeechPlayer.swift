@@ -85,13 +85,13 @@ final class SpeechPlayer: ObservableObject {
     }
 
     func toggleReply(turnID: String, destination: KiboDestination, store: AppStore) {
-        let id = "reply-\(turnID)"
+        let id = PlaybackID.reply(turnID)
         if playingID == id || loadingID == id { stop(); return }
         playReply(turnID: turnID, destination: destination, store: store)
     }
 
     func playReply(turnID: String, destination: KiboDestination, store: AppStore) {
-        playReply(id: "reply-\(turnID)") { fromSample, generation in
+        playReply(id: PlaybackID.reply(turnID)) { fromSample, generation in
             try await store.speechStream(
                 destination: destination,
                 turnID: turnID,
@@ -108,7 +108,7 @@ final class SpeechPlayer: ObservableObject {
     }
 
     func toggleClip(clipID: String, store: AppStore) {
-        let id = "clip-\(clipID)"
+        let id = PlaybackID.clip(clipID)
         if playingID == id || loadingID == id { stop(); return }
         playClip(id: id) { try await store.clipAudio(clipID: clipID) }
     }

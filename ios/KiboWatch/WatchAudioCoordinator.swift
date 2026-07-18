@@ -138,7 +138,7 @@ final class WatchAudioCoordinator: ObservableObject {
     }
 
     func playReply(turnID: String, destination: KiboDestination, store: WatchStore) {
-        player.play(id: "reply-\(turnID)") { fromSample, generation in
+        player.play(id: PlaybackID.reply(turnID)) { fromSample, generation in
             try await store.speechStream(
                 destination: destination,
                 turnID: turnID,

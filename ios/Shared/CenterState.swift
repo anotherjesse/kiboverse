@@ -7,7 +7,7 @@ import Foundation
 /// Live interaction (arming, opening the mic, recording) outranks errors on
 /// purpose: `WatchStore.errorMessage` is sticky until a clean refresh, and a
 /// stale network error must not put a grimace on Kibo mid-recording.
-enum WatchCenterState: Equatable {
+enum CenterState: Equatable {
     case noConversation
     case swipeArmed
     case starting
@@ -39,7 +39,7 @@ enum WatchCenterState: Equatable {
         hasRetryableFailure: Bool = false,
         pendingCount: Int,
         savedCount: Int
-    ) -> WatchCenterState {
+    ) -> CenterState {
         if swipeArmed { return .swipeArmed }
         if isStarting { return .starting }
         if isRecording { return .recording }
@@ -57,27 +57,46 @@ enum WatchCenterState: Equatable {
         return .idle(pendingCount: pendingCount, savedCount: savedCount)
     }
 
-    /// Dynamic states only — no persistent instructional copy.
-    var statusLine: String {
+    /// Structured status: the state-carrying token (if any) plus the
+    /// remainder, so presentation code never re-parses a rendered string to
+    /// find where the accent color's substring starts.
+    var status: StatusContent {
         switch self {
-        case .noConversation: ""
-        case .swipeArmed: "Release to ask"
-        case .starting: "Opening microphone…"
-        case .recording: "Listening…"
-        case let .error(message): message
-        case .sending: "Sending…"
-        case .thinking: "Kibo is thinking…"
-        case .loadingReply: "Loading reply…"
-        case .speaking: "Kibo is speaking"
-        case .replyDone: "Reply played"
-        case .needsReview: "Recording needs review"
-        case .attention: ""
+        case .noConversation, .attention:
+            StatusContent(accent: nil, text: "")
+        case .swipeArmed:
+            StatusContent(accent: nil, text: "Release to ask")
+        case .starting:
+            StatusContent(accent: nil, text: "Opening microphone…")
+        case .recording:
+            StatusContent(accent: nil, text: "Listening…")
+        case let .error(message):
+            StatusContent(accent: nil, text: message)
+        case .sending:
+            StatusContent(accent: nil, text: "Sending…")
+        case .thinking:
+            StatusContent(accent: nil, text: "Kibo is thinking…")
+        case .loadingReply:
+            StatusContent(accent: nil, text: "Loading reply…")
+        case .speaking:
+            StatusContent(accent: nil, text: "Kibo is speaking")
+        case .replyDone:
+            StatusContent(accent: nil, text: "Reply played")
+        case .needsReview:
+            StatusContent(accent: nil, text: "Recording needs review")
         case let .idle(pendingCount, savedCount):
-            if pendingCount > 0 { "\(pendingCount) pending" }
-            else if savedCount > 0 { "Saved on watch" }
-            else { "" }
+            if pendingCount > 0 {
+                StatusContent(accent: "\(pendingCount)", text: " pending")
+            } else if savedCount > 0 {
+                StatusContent(accent: nil, text: "\(savedCount) saved")
+            } else {
+                StatusContent(accent: nil, text: "")
+            }
         }
     }
+
+    /// Derived for a11y + tests — no view builds this string itself.
+    var statusLine: String { (status.accent ?? "") + status.text }
 
     var isError: Bool {
         if case .error = self { return true }
@@ -108,7 +127,7 @@ enum WatchCenterState: Equatable {
     }
 
     /// How the constellation animates around the face.
-    var constellationMode: WatchConstellationMode {
+    var constellationMode: ConstellationMode {
         switch self {
         case .swipeArmed, .starting, .recording: .recording
         case .sending, .thinking, .loadingReply: .thinking
@@ -119,7 +138,15 @@ enum WatchCenterState: Equatable {
     }
 }
 
-enum WatchConstellationMode: Equatable {
+/// The state-carrying token of a status line ("3" in "3 pending") plus the
+/// remainder, so presentation code never re-parses a rendered string to find
+/// where the accent color starts.
+struct StatusContent: Equatable {
+    var accent: String?
+    var text: String
+}
+
+enum ConstellationMode: Equatable {
     case idle
     /// Warm fade after a reply finishes playing — the payoff state should
     /// not be the emptiest screen in the flow.

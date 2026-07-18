@@ -10,11 +10,6 @@ struct KiboWatchApp: App {
     }
 }
 
-enum WatchRetryWorkOutcome: Equatable {
-    case notAccepted
-    case accepted(requiredEventsRevision: UInt64)
-}
-
 @MainActor
 final class WatchStore: ObservableObject {
     static let defaultServerURL = "https://jstew.stingray-nominal.ts.net/"
@@ -358,7 +353,7 @@ final class WatchStore: ObservableObject {
         serverURL: String,
         projectID: String,
         conversationID: String
-    ) async -> WatchRetryWorkOutcome {
+    ) async -> RetryWorkOutcome {
         guard serverURL == self.serverURL,
               projectID == selectedProjectID,
               conversationID == selectedConversationID,

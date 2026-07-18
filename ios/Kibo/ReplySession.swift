@@ -14,98 +14,19 @@ struct ReplyAutoplayGate: Equatable {
     }
 }
 
-struct ReplyCommandClaim: Equatable {
-    fileprivate let generation: UUID
-    fileprivate let destination: KiboDestination
-}
-
-/// Owns the view-local command epoch and the one reply that may autoplay.
-/// Teardown transitions invalidate command completions before audio objects
-/// publish their own stop notifications.
-struct ReplyLifecycle: Equatable {
-    private var generation = UUID()
-    private(set) var isVisible = false
-    private(set) var isActive = false
-    private(set) var awaitedTurnID: String?
-    private(set) var awaitedDestination: KiboDestination?
-    private(set) var attemptedSpeechEventSeq: UInt64?
-
-    var allowsPlayback: Bool { isVisible && isActive }
-
-    mutating func appear(isActive: Bool) {
-        generation = UUID()
-        isVisible = true
-        self.isActive = isActive
-    }
-
-    mutating func beginCommand(destination: KiboDestination) -> ReplyCommandClaim? {
-        guard isVisible, isActive else { return nil }
-        generation = UUID()
-        return ReplyCommandClaim(generation: generation, destination: destination)
-    }
-
-    func accepts(
-        _ claim: ReplyCommandClaim,
-        destination: KiboDestination?
-    ) -> Bool {
-        isVisible
-            && isActive
-            && generation == claim.generation
-            && destination == claim.destination
-    }
-
-    mutating func awaitReply(to turnID: String, destination: KiboDestination) {
-        awaitedTurnID = turnID
-        awaitedDestination = destination
-        attemptedSpeechEventSeq = nil
-    }
-
-    mutating func markPlaybackAttempt(speechEventSeq: UInt64) {
-        attemptedSpeechEventSeq = speechEventSeq
-    }
-
-    /// Preserve which reply the user asked for, but allow its durable speech
-    /// event to start a fresh transport when playback becomes safe again.
-    mutating func suspendPlayback() {
-        attemptedSpeechEventSeq = nil
-    }
-
-    mutating func clearPlayback() {
-        awaitedTurnID = nil
-        awaitedDestination = nil
-        attemptedSpeechEventSeq = nil
-    }
-
-    mutating func selectionChanged() {
-        generation = UUID()
-        clearPlayback()
-    }
-
-    mutating func becomeInactive() {
-        generation = UUID()
-        isActive = false
-        suspendPlayback()
-    }
-
-    mutating func becomeActive() {
-        isActive = isVisible
-    }
-
-    mutating func disappear() {
-        generation = UUID()
-        isVisible = false
-        isActive = false
-        clearPlayback()
-    }
-}
-
 /// The single submit + reply-autoplay code path, shared by
 /// ConversationDetailView and TalkModeView. Extracted from the old TalkView:
 /// asking Kibo goes through `startSubmit()`, and the spoken reply autoplays
 /// once the gate allows it — never from a screen sitting under an overlay.
+///
+/// The command epoch/visibility lives in `ReplyCommandScope`; the awaited
+/// reply and its afterglow live in `ReplyPlaybackIntent`. `intent` is
+/// `@Published` because `CenterState.derive` reads `intent.finishedTurnID`
+/// and mutations happen inside audio `.onChange` handlers that must re-render.
 @MainActor
 final class ReplySession: ObservableObject {
-    private var lifecycle = ReplyLifecycle()
+    @Published private(set) var intent = ReplyPlaybackIntent()
+    private var scope = ReplyCommandScope()
     private var commandTask: Task<Void, Never>?
     private weak var store: AppStore?
     private weak var audio: AudioCoordinator?
@@ -133,7 +54,7 @@ final class ReplySession: ObservableObject {
             playAwaitedReplyIfReady()
             return
         }
-        lifecycle.appear(isActive: sceneIsActive)
+        scope.appear(isActive: sceneIsActive)
     }
 
     /// The screen was covered by the full-screen talk mode, not dismissed.
@@ -146,13 +67,14 @@ final class ReplySession: ObservableObject {
     }
 
     func sceneBecameInactive() {
-        lifecycle.becomeInactive()
+        scope.setActive(false)
+        intent.suspendPlayback()
         cancelCommand()
         audio?.stopForInactivity()
     }
 
     func sceneBecameActive() {
-        lifecycle.becomeActive()
+        scope.setActive(true)
         if let audio {
             Task { await audio.prepare() }
         }
@@ -162,17 +84,19 @@ final class ReplySession: ObservableObject {
     /// Invalidate every UI-owned completion before stop notifications can
     /// cause another autoplay evaluation.
     func destinationChanged() {
-        lifecycle.selectionChanged()
+        scope.selectionChanged()
+        intent.clear()
         cancelCommand()
         audio?.stop()
     }
 
     func suspendPlayback() {
-        lifecycle.suspendPlayback()
+        intent.suspendPlayback()
     }
 
     func disappear() {
-        lifecycle.disappear()
+        scope.disappear()
+        intent.clear()
         cancelCommand()
         audio?.stop()
     }
@@ -213,23 +137,23 @@ final class ReplySession: ObservableObject {
         guard !store.isAskingKibo,
               let destination = store.requestDestination else { return }
         commandTask?.cancel()
-        guard let claim = lifecycle.beginCommand(destination: destination) else { return }
-        lifecycle.clearPlayback()
+        guard let claim = scope.beginCommand(destination: destination) else { return }
+        intent.clear()
         audio.resumeAutomaticPlayback()
         commandTask = Task { [weak self, weak store] in
             guard let self, let store, !Task.isCancelled,
-                  self.lifecycle.accepts(claim, destination: store.requestDestination) else { return }
+                  self.scope.accepts(claim, destination: store.requestDestination) else { return }
             // A swipe-up ask fires the instant the clip is queued: wait for
             // its upload so the turn includes everything just said.
             await store.waitForRecordingTasks()
             guard !Task.isCancelled,
-                  self.lifecycle.accepts(claim, destination: store.requestDestination) else { return }
+                  self.scope.accepts(claim, destination: store.requestDestination) else { return }
             let turnID = await store.submitTurn()
             guard !Task.isCancelled,
-                  self.lifecycle.accepts(claim, destination: store.requestDestination) else { return }
+                  self.scope.accepts(claim, destination: store.requestDestination) else { return }
             self.commandTask = nil
             guard let turnID else { return }
-            self.lifecycle.awaitReply(to: turnID, destination: claim.destination)
+            self.intent.awaitReply(to: turnID, destination: claim.destination)
             self.playAwaitedReplyIfReady()
         }
     }
@@ -237,34 +161,26 @@ final class ReplySession: ObservableObject {
     func playAwaitedReplyIfReady() {
         guard let store, let audio else { return }
         let gate = ReplyAutoplayGate(
-            sceneIsActive: sceneIsActive && lifecycle.allowsPlayback,
+            sceneIsActive: sceneIsActive && scope.allowsPlayback,
             systemPlaybackSuspended: audio.automaticPlaybackSuspended,
             captureIsActive: audio.isHolding || audio.isRecording || audio.isStarting,
             overlayIsPresented: overlayIsPresented
         )
         guard gate.allowsPlayback else { return }
-        guard let turnID = lifecycle.awaitedTurnID,
-              let destination = lifecycle.awaitedDestination,
+        guard let destination = intent.awaitedDestination,
               destination == store.requestDestination else { return }
-        switch store.events.replyAutoPlayAction(
-            for: turnID,
-            attemptedSpeechEventSeq: lifecycle.attemptedSpeechEventSeq,
+        // The phone never sets the retry fence, so it supplies no revision.
+        switch intent.advance(
+            events: store.events,
             loadingID: audio.loadingID,
             playingID: audio.playingID,
             lastFinishedID: audio.lastFinishedID
         ) {
-        case let .startPlayback(speechEventSeq):
-            lifecycle.markPlaybackAttempt(speechEventSeq: speechEventSeq)
+        case let .play(turnID, destination, _):
             audio.playReply(turnID: turnID, destination: destination, store: store)
-        case .complete:
-            lifecycle.clearPlayback()
-        case .failed:
-            let playbackID = PlaybackID.reply(turnID)
-            lifecycle.clearPlayback()
-            if audio.loadingID == playbackID || audio.playingID == playbackID {
-                audio.stopReply()
-            }
-        case .wait:
+        case .stopPlayback:
+            audio.stopReply()
+        case .none:
             break
         }
     }

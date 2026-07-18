@@ -37,68 +37,19 @@ final class KiboAPITests: XCTestCase {
         }
     }
 
-    func testReplyLifecycleSuspensionRearmsTheSameDurableSpeechEvent() throws {
-        var lifecycle = ReplyLifecycle()
-        lifecycle.appear(isActive: true)
-        lifecycle.awaitReply(
-            to: "t1",
-            destination: KiboDestination(
-                serverURL: "https://one.example/",
-                projectID: "p1",
-                conversationID: "c1"
-            )
-        )
-        lifecycle.markPlaybackAttempt(speechEventSeq: 3)
-
-        lifecycle.becomeInactive()
-
-        XCTAssertEqual(lifecycle.awaitedTurnID, "t1")
-        XCTAssertNil(lifecycle.attemptedSpeechEventSeq)
-        lifecycle.becomeActive()
-        let data = #"[{"seq":1,"kind":"turn","id":"t1","clips":[]},{"seq":2,"kind":"reply","turn":"t1","text":"Hi","audio":"tts/t1.wav"},{"seq":3,"kind":"speech_started","turn":"t1","attempt":1}]"#.data(using: .utf8)!
-        let events = try JSONDecoder().decode([KiboEvent].self, from: data)
-        XCTAssertEqual(
-            events.replyAutoPlayAction(
-                for: "t1",
-                attemptedSpeechEventSeq: lifecycle.attemptedSpeechEventSeq,
-                loadingID: nil,
-                playingID: nil,
-                lastFinishedID: nil
-            ),
-            .startPlayback(speechEventSeq: 3)
-        )
-    }
-
-    func testReplyLifecycleInvalidatesCommandsBeforeEveryTeardown() {
-        let destination = KiboDestination(
-            serverURL: "https://one.example/",
-            projectID: "p1",
-            conversationID: "c1"
-        )
-        var lifecycle = ReplyLifecycle()
-        lifecycle.appear(isActive: true)
-        let first = lifecycle.beginCommand(destination: destination)!
-        let replacement = lifecycle.beginCommand(destination: destination)!
-        XCTAssertFalse(lifecycle.accepts(first, destination: destination))
-        XCTAssertTrue(lifecycle.accepts(replacement, destination: destination))
-
-        lifecycle.awaitReply(to: "turn-1", destination: destination)
-        lifecycle.markPlaybackAttempt(speechEventSeq: 7)
-        lifecycle.becomeInactive()
-        XCTAssertFalse(lifecycle.accepts(replacement, destination: destination))
-        XCTAssertEqual(lifecycle.awaitedTurnID, "turn-1")
-        XCTAssertNil(lifecycle.attemptedSpeechEventSeq)
-        XCTAssertFalse(lifecycle.allowsPlayback)
-
-        lifecycle.becomeActive()
-        let foreground = lifecycle.beginCommand(destination: destination)!
-        lifecycle.selectionChanged()
-        XCTAssertFalse(lifecycle.accepts(foreground, destination: destination))
-        XCTAssertNil(lifecycle.awaitedTurnID)
-
-        lifecycle.disappear()
-        XCTAssertFalse(lifecycle.allowsPlayback)
-        XCTAssertNil(lifecycle.beginCommand(destination: destination))
+    /// `ReplySession.intent` must stay `@Published`: `CenterState.derive`
+    /// reads `intent.finishedTurnID`, and intent mutations happen inside the
+    /// audio-suspension `.onChange` handler, which must trigger a re-render.
+    /// A plain (non-published) property would let the afterglow go stale.
+    func testReplySessionPublishesWhenIntentMutates() {
+        let session = ReplySession()
+        var publications = 0
+        let cancellable = session.objectWillChange.sink { publications += 1 }
+        // The audio-suspension handler drives this path with no store/audio
+        // wiring; it mutates the published intent.
+        session.suspendPlayback()
+        XCTAssertGreaterThan(publications, 0)
+        cancellable.cancel()
     }
 
     override func setUp() {

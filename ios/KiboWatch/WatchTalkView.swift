@@ -1,142 +1,12 @@
 import SwiftUI
 import WatchKit
 
-struct WatchReplyPlaybackIntent: Equatable {
-    private(set) var awaitedTurnID: String?
-    private(set) var awaitedDestination: KiboDestination?
-    private(set) var attemptedSpeechEventSeq: UInt64?
-    private(set) var requiredEventsRevision: UInt64?
-
-    mutating func awaitReply(to turnID: String, destination: KiboDestination) {
-        awaitedTurnID = turnID
-        awaitedDestination = destination
-        attemptedSpeechEventSeq = nil
-        requiredEventsRevision = nil
-    }
-
-    mutating func markPlaybackAttempt(speechEventSeq: UInt64) {
-        attemptedSpeechEventSeq = speechEventSeq
-    }
-
-    mutating func suspendPlayback() {
-        attemptedSpeechEventSeq = nil
-    }
-
-    mutating func clear() {
-        awaitedTurnID = nil
-        awaitedDestination = nil
-        attemptedSpeechEventSeq = nil
-        requiredEventsRevision = nil
-    }
-
-    mutating func retryFinished(
-        _ target: RetryTarget,
-        outcome: WatchRetryWorkOutcome,
-        destination: KiboDestination
-    ) {
-        guard case let .accepted(requiredEventsRevision) = outcome,
-              case let .turn(turnID) = target else { return }
-        awaitReply(to: turnID, destination: destination)
-        self.requiredEventsRevision = requiredEventsRevision
-    }
-
-    func canEvaluate(eventsRevision: UInt64) -> Bool {
-        guard let requiredEventsRevision else { return true }
-        return eventsRevision >= requiredEventsRevision
-    }
-
-    func autoPlayAction(
-        events: [KiboEvent],
-        eventsRevision: UInt64,
-        loadingID: String?,
-        playingID: String?,
-        lastFinishedID: String?
-    ) -> ReplyAutoPlayAction? {
-        guard let awaitedTurnID, canEvaluate(eventsRevision: eventsRevision) else { return nil }
-        return events.replyAutoPlayAction(
-            for: awaitedTurnID,
-            attemptedSpeechEventSeq: attemptedSpeechEventSeq,
-            loadingID: loadingID,
-            playingID: playingID,
-            lastFinishedID: lastFinishedID
-        )
-    }
-}
-
-struct WatchReplyCommandClaim: Equatable {
-    fileprivate let generation: UUID
-    fileprivate let destination: KiboDestination
-}
-
-struct WatchReplyCommandScope: Equatable {
-    private var generation = UUID()
-    private(set) var isVisible = false
-    private(set) var isActive = false
-
-    var allowsPlayback: Bool { isVisible && isActive }
-
-    mutating func appear(isActive: Bool) {
-        generation = UUID()
-        isVisible = true
-        self.isActive = isActive
-    }
-
-    mutating func setActive(_ active: Bool) {
-        if isActive && !active { generation = UUID() }
-        isActive = active
-    }
-
-    mutating func selectionChanged() {
-        generation = UUID()
-    }
-
-    mutating func disappear() {
-        generation = UUID()
-        isVisible = false
-        isActive = false
-    }
-
-    mutating func beginCommand(
-        serverURL: String,
-        projectID: String?,
-        conversationID: String?
-    ) -> WatchReplyCommandClaim? {
-        guard allowsPlayback, let projectID, let conversationID else { return nil }
-        generation = UUID()
-        return WatchReplyCommandClaim(
-            generation: generation,
-            destination: KiboDestination(
-                serverURL: serverURL,
-                projectID: projectID,
-                conversationID: conversationID
-            )
-        )
-    }
-
-    func accepts(
-        _ claim: WatchReplyCommandClaim,
-        serverURL: String,
-        projectID: String?,
-        conversationID: String?
-    ) -> Bool {
-        guard allowsPlayback,
-              claim.generation == generation,
-              let projectID,
-              let conversationID else { return false }
-        return claim.destination == KiboDestination(
-            serverURL: serverURL,
-            projectID: projectID,
-            conversationID: conversationID
-        )
-    }
-}
-
 struct WatchTalkView: View {
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var store: WatchStore
     @StateObject private var audio: WatchAudioCoordinator
-    @State private var replyPlaybackIntent = WatchReplyPlaybackIntent()
-    @State private var replyCommandScope = WatchReplyCommandScope()
+    @State private var replyPlaybackIntent = ReplyPlaybackIntent()
+    @State private var replyCommandScope = ReplyCommandScope()
     @State private var replyCommandTask: Task<Void, Never>?
     @State private var showingServer = false
     @State private var swipeArmed = false
@@ -240,7 +110,7 @@ struct WatchTalkView: View {
             isThinking: store.isAskingKibo,
             isLoadingReply: audio.loadingID != nil,
             isSpeaking: audio.playingID != nil,
-            didFinishReply: audio.lastFinishedID != nil,
+            didFinishReply: replyPlaybackIntent.finishedTurnID != nil,
             recoveryItemCount: store.recoveryItemCount,
             hasRetryableFailure: store.events.retryableFailure != nil,
             pendingCount: askableClipCount,
@@ -422,9 +292,7 @@ struct WatchTalkView: View {
 
     private func performAsk() {
         guard let claim = replyCommandScope.beginCommand(
-                serverURL: store.serverURL,
-                projectID: store.selectedProjectID,
-                conversationID: store.selectedConversationID
+                destination: store.requestDestination
               ) else { return }
         replyCommandTask?.cancel()
         replyPlaybackIntent.clear()
@@ -434,9 +302,7 @@ struct WatchTalkView: View {
             guard !Task.isCancelled,
                   replyCommandScope.accepts(
                     claim,
-                    serverURL: store.serverURL,
-                    projectID: store.selectedProjectID,
-                    conversationID: store.selectedConversationID
+                    destination: store.requestDestination
                   ) else { return }
             guard let turnID = await store.submitTurn(
                 serverURL: claim.destination.serverURL,
@@ -445,9 +311,7 @@ struct WatchTalkView: View {
             ), !Task.isCancelled,
                   replyCommandScope.accepts(
                     claim,
-                    serverURL: store.serverURL,
-                    projectID: store.selectedProjectID,
-                    conversationID: store.selectedConversationID
+                    destination: store.requestDestination
                   ) else { return }
             replyPlaybackIntent.awaitReply(to: turnID, destination: claim.destination)
             playAwaitedReplyIfReady()
@@ -456,9 +320,7 @@ struct WatchTalkView: View {
 
     private func retryFailedWork(_ target: RetryTarget) {
         guard let claim = replyCommandScope.beginCommand(
-            serverURL: store.serverURL,
-            projectID: store.selectedProjectID,
-            conversationID: store.selectedConversationID
+            destination: store.requestDestination
         ) else { return }
         replyCommandTask?.cancel()
         replyPlaybackIntent.clear()
@@ -468,9 +330,7 @@ struct WatchTalkView: View {
             guard !Task.isCancelled,
                   replyCommandScope.accepts(
                     claim,
-                    serverURL: store.serverURL,
-                    projectID: store.selectedProjectID,
-                    conversationID: store.selectedConversationID
+                    destination: store.requestDestination
                   ) else { return }
             let outcome = await store.retryFailedWork(
                 target,
@@ -481,9 +341,7 @@ struct WatchTalkView: View {
             guard !Task.isCancelled,
                   replyCommandScope.accepts(
                     claim,
-                    serverURL: store.serverURL,
-                    projectID: store.selectedProjectID,
-                    conversationID: store.selectedConversationID
+                    destination: store.requestDestination
                   ) else { return }
             replyPlaybackIntent.retryFinished(
                 target,
@@ -516,29 +374,20 @@ struct WatchTalkView: View {
     private func playAwaitedReplyIfReady() {
         guard replyCommandScope.allowsPlayback,
               !audio.automaticPlaybackSuspended,
-              let turnID = replyPlaybackIntent.awaitedTurnID,
               let destination = replyPlaybackIntent.awaitedDestination,
-              destination == store.requestDestination,
-              let action = replyPlaybackIntent.autoPlayAction(
-                events: store.events,
-                eventsRevision: store.eventRevision,
-                loadingID: audio.loadingID,
-                playingID: audio.playingID,
-                lastFinishedID: audio.lastFinishedID
-              ) else { return }
-        switch action {
-        case let .startPlayback(speechEventSeq):
-            replyPlaybackIntent.markPlaybackAttempt(speechEventSeq: speechEventSeq)
+              destination == store.requestDestination else { return }
+        switch replyPlaybackIntent.advance(
+            events: store.events,
+            eventsRevision: store.eventRevision,
+            loadingID: audio.loadingID,
+            playingID: audio.playingID,
+            lastFinishedID: audio.lastFinishedID
+        ) {
+        case let .play(turnID, destination, _):
             audio.playReply(turnID: turnID, destination: destination, store: store)
-        case .complete:
-            replyPlaybackIntent.clear()
-        case .failed:
-            let playbackID = PlaybackID.reply(turnID)
-            replyPlaybackIntent.clear()
-            if audio.loadingID == playbackID || audio.playingID == playbackID {
-                audio.stopReply()
-            }
-        case .wait:
+        case .stopPlayback:
+            audio.stopReply()
+        case .none:
             break
         }
     }

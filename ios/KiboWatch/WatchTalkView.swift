@@ -262,11 +262,12 @@ struct WatchTalkView: View {
             // Face and Canvas share one coordinate space (and one offset):
             // the ring/tick geometry is drawn around the Canvas center.
             ZStack {
-                WatchConstellationView(
+                ConstellationView(
                     markers: store.constellationMarkers,
                     state: centerState,
                     level: audio.level,
-                    faceDiameter: micDiameter
+                    faceDiameter: micDiameter,
+                    style: .watch
                 )
                 talkButton
             }

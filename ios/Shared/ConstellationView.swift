@@ -1,8 +1,129 @@
 import SwiftUI
 
+/// Geometry the layout projection consumes: how much history stays individual
+/// before it compresses, and the text keep-out arcs. A separately-`Equatable`
+/// value so the view can key its layout rebuild on it — a window resize that
+/// crosses a style boundary must re-derive compression and keep-out geometry.
+struct ConstellationLayoutMetrics: Equatable {
+    /// Oldest history beyond this many markers compresses into a faint inner
+    /// band so the most recent events stay legible.
+    var maxIndividual: Int
+    var recentKept: Int
+    /// Text keep-outs, in radians of arc removed around 12 and 6 o'clock.
+    var topGap: Double
+    var bottomGap: Double
+}
+
+/// Frame pacing per mode. Data, not a closure — a closure-valued field cannot
+/// be `Equatable` and would lie about pacing; the fps table is already data.
+struct FramePacing: Equatable {
+    var idle: TimeInterval
+    var afterglow: TimeInterval
+    var thinking: TimeInterval
+    var recording: TimeInterval
+    var speaking: TimeInterval
+
+    /// Watch pacing verbatim from the pre-unification renderer: battery-aware,
+    /// never faster than 30fps.
+    static let watch = FramePacing(
+        idle: 1.0 / 8.0, afterglow: 1.0 / 10.0, thinking: 1.0 / 15.0,
+        recording: 1.0 / 30.0, speaking: 1.0 / 30.0
+    )
+    /// Phone pacing: a bigger sky buys a higher frame rate (60fps in the
+    /// active states on ProMotion), still gentle at rest.
+    static let phone = FramePacing(
+        idle: 1.0 / 10.0, afterglow: 1.0 / 12.0, thinking: 1.0 / 20.0,
+        recording: 1.0 / 60.0, speaking: 1.0 / 60.0
+    )
+
+    func interval(for mode: ConstellationMode) -> TimeInterval {
+        switch mode {
+        case .idle: idle
+        case .afterglow: afterglow
+        case .thinking: thinking
+        case .recording: recording
+        case .speaking: speaking
+        }
+    }
+}
+
+/// Everything a container hands the renderer to scale the same organism to the
+/// hand: layout geometry, frame pacing, and rendering scale — three
+/// separately-`Equatable` concerns composed into one value. `.watch` holds
+/// every pre-unification constant verbatim (`dustDepthStrength` 0 ⇒
+/// byte-identical dust), so the watch render path is unchanged.
+struct ConstellationStyle: Equatable {
+    var layout: ConstellationLayoutMetrics
+    var pacing: FramePacing
+    /// Fixed dim specks scattered behind the field.
+    var dustCount: Int
+    /// Deep-layer parallax: a per-speck depth dims and slows the far dust.
+    /// 0 (watch) multiplies by exactly 1 — no depth, byte-identical output.
+    var dustDepthStrength: Double
+    /// Rendering scales — a bigger screen buys a richer, not different, look.
+    var markerScale: Double
+    var lineScale: Double
+    var driftScale: Double
+    var rippleCount: Int
+    var tickCount: Int
+    /// Points trimmed from the outer orbit band so the field clears platform
+    /// chrome (the watch's clock/toolbar).
+    var outerInset: CGFloat
+
+    /// Every field = today's watch constant.
+    static let watch = ConstellationStyle(
+        layout: ConstellationLayoutMetrics(
+            maxIndividual: 14, recentKept: 12, topGap: 1.7, bottomGap: 1.05
+        ),
+        pacing: .watch,
+        dustCount: 18,
+        dustDepthStrength: 0,
+        markerScale: 1.0,
+        lineScale: 1.0,
+        driftScale: 1.0,
+        rippleCount: 3,
+        tickCount: 36,
+        outerInset: 16
+    )
+
+    /// The phone sky: more orbiting history, deeper star field, larger marks,
+    /// farther ripples, finer amplitude ticks — same renderer, no new modes.
+    static let phone = ConstellationStyle(
+        layout: ConstellationLayoutMetrics(
+            maxIndividual: 22, recentKept: 18, topGap: 1.7, bottomGap: 1.05
+        ),
+        pacing: .phone,
+        dustCount: 44,
+        dustDepthStrength: 0.5,
+        markerScale: 1.6,
+        lineScale: 1.4,
+        driftScale: 1.5,
+        rippleCount: 4,
+        tickCount: 48,
+        outerInset: 8
+    )
+
+    /// The iPad/Mac seam: a small container gets the watch's tight look, a
+    /// large one the phone's richer field. `.expansive` lands here later.
+    static func fitting(minDimension: CGFloat) -> ConstellationStyle {
+        minDimension < 260 ? .watch : .phone
+    }
+
+    /// Deep dust is dimmer: strength 0 (watch) returns exactly 1.
+    func dustOpacityFactor(depth: Double) -> Double {
+        1 - depth * dustDepthStrength
+    }
+
+    /// Deep dust twinkles slower: strength 0 (watch) returns exactly 1.
+    func dustSpeedFactor(depth: Double) -> Double {
+        1 - depth * dustDepthStrength * 0.5
+    }
+}
+
 /// Deterministic placement of constellation markers. Pure function of the
-/// marker list — no clocks, no randomness — so an event keeps its spot
-/// across polls, relaunches, and the spool-to-server identity handoff.
+/// marker list and layout metrics — no clocks, no randomness — so an event
+/// keeps its spot across polls, relaunches, and the spool-to-server identity
+/// handoff.
 struct ConstellationLayout: Equatable {
     struct Placed: Equatable {
         let event: ConstellationEvent
@@ -19,19 +140,14 @@ struct ConstellationLayout: Equatable {
         let age: Double
     }
 
-    /// Oldest history beyond this many markers compresses into a faint
-    /// inner band so 8–12 recent events stay legible.
-    static let maxIndividual = 14
-    static let recentKept = 12
-
     let placed: [Placed]
     let compressedCount: Int
 
-    init(markers: [ConstellationEvent]) {
+    init(markers: [ConstellationEvent], metrics: ConstellationLayoutMetrics) {
         let kept: [ConstellationEvent]
-        if markers.count > Self.maxIndividual {
-            compressedCount = markers.count - Self.recentKept
-            kept = Array(markers.suffix(Self.recentKept))
+        if markers.count > metrics.maxIndividual {
+            compressedCount = markers.count - metrics.recentKept
+            kept = Array(markers.suffix(metrics.recentKept))
         } else {
             compressedCount = 0
             kept = markers
@@ -40,8 +156,9 @@ struct ConstellationLayout: Equatable {
         // across opposite sides of the screen. Markers live on two side
         // arcs: wedges at 12 o'clock (clock + title) and 6 o'clock (status
         // caption) stay permanently marker-free.
+        let arcs = Self.sideArcs(topGap: metrics.topGap, bottomGap: metrics.bottomGap)
         let slots = Double(max(kept.count, 8))
-        let slotWidth = Self.arcTotal / slots
+        let slotWidth = arcs.total / slots
         placed = kept.enumerated().map { index, event in
             let angleJitter = (Self.hash01(event.id, salt: 0xA11CE) - 0.5) * slotWidth * 0.6
             let radiusJitter = (Self.hash01(event.id, salt: 0xB0B) - 0.5) * 0.05
@@ -49,7 +166,7 @@ struct ConstellationLayout: Equatable {
             let along = (Double(index) + 0.5) * slotWidth + angleJitter
             return Placed(
                 event: event,
-                angle: Self.arcAngle(at: along),
+                angle: arcs.angle(at: along),
                 radiusFactor: Self.orbit(for: event) + radiusJitter,
                 phase: Self.hash01(event.id, salt: 0xFACE),
                 size: Self.baseSize(for: event),
@@ -75,22 +192,28 @@ struct ConstellationLayout: Equatable {
         }
     }
 
-    /// Text keep-outs, in radians of arc removed around 12 and 6 o'clock.
-    private static let topGap = 1.7
-    private static let bottomGap = 1.05
-    private static let rightArc = (start: topGap / 2, length: .pi - topGap / 2 - bottomGap / 2)
-    private static let leftArc = (
-        start: .pi + bottomGap / 2, length: .pi - topGap / 2 - bottomGap / 2
-    )
-    static let arcTotal = rightArc.length + leftArc.length
-
-    /// Maps a distance along the concatenated side arcs to a screen angle
+    /// The two marker-bearing side arcs, derived from the text keep-outs.
+    /// Maps a distance along the concatenated arcs to a screen angle
     /// (0 = up, clockwise positive).
-    static func arcAngle(at distance: Double) -> Double {
-        let clamped = min(max(distance, 0), arcTotal)
-        return clamped < rightArc.length
-            ? rightArc.start + clamped
-            : leftArc.start + (clamped - rightArc.length)
+    struct SideArcs: Equatable {
+        let rightStart: Double, rightLength: Double
+        let leftStart: Double, leftLength: Double
+        var total: Double { rightLength + leftLength }
+
+        func angle(at distance: Double) -> Double {
+            let clamped = min(max(distance, 0), total)
+            return clamped < rightLength
+                ? rightStart + clamped
+                : leftStart + (clamped - rightLength)
+        }
+    }
+
+    static func sideArcs(topGap: Double, bottomGap: Double) -> SideArcs {
+        let sideLength = .pi - topGap / 2 - bottomGap / 2
+        return SideArcs(
+            rightStart: topGap / 2, rightLength: sideLength,
+            leftStart: .pi + bottomGap / 2, leftLength: sideLength
+        )
     }
 
     private static func baseSize(for event: ConstellationEvent) -> Double {
@@ -120,15 +243,18 @@ struct ConstellationLayout: Equatable {
 /// recording, inward pull while thinking, ripples while speaking).
 ///
 /// Purely decorative — hit testing stays with the face button above it.
-struct WatchConstellationView: View {
+struct ConstellationView: View {
     let markers: [ConstellationEvent]
     let state: CenterState
     let level: CGFloat
     let faceDiameter: CGFloat
+    let style: ConstellationStyle
 
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.isLuminanceReduced) private var isLuminanceReduced
-    @State private var layout = ConstellationLayout(markers: [])
+    @State private var layout = ConstellationLayout(
+        markers: [], metrics: ConstellationStyle.watch.layout
+    )
 
     var body: some View {
         TimelineView(.animation(minimumInterval: frameInterval, paused: paused)) { context in
@@ -140,14 +266,20 @@ struct WatchConstellationView: View {
                     state: state,
                     level: level,
                     faceDiameter: faceDiameter,
+                    style: style,
                     time: context.date.timeIntervalSinceReferenceDate
                 )
             }
         }
-        // Projection runs when the conversation changes, never per frame —
-        // the frame closure above does trig only.
+        // Projection runs when the conversation OR the layout geometry changes,
+        // never per frame — the frame closure above does trig only. Keying on
+        // both means a window resize that crosses a style boundary can never
+        // retain stale compression or keep-out geometry.
         .onChange(of: markers, initial: true) { _, newMarkers in
-            layout = ConstellationLayout(markers: newMarkers)
+            layout = ConstellationLayout(markers: newMarkers, metrics: style.layout)
+        }
+        .onChange(of: style.layout) { _, newLayout in
+            layout = ConstellationLayout(markers: markers, metrics: newLayout)
         }
         .allowsHitTesting(false)
         .accessibilityHidden(true)
@@ -159,12 +291,7 @@ struct WatchConstellationView: View {
     }
 
     private var frameInterval: TimeInterval {
-        switch state.constellationMode {
-        case .idle: 1.0 / 8.0
-        case .afterglow: 1.0 / 10.0
-        case .thinking: 1.0 / 15.0
-        case .recording, .speaking: 1.0 / 30.0
-        }
+        style.pacing.interval(for: state.constellationMode)
     }
 
     // MARK: - Drawing
@@ -176,6 +303,7 @@ struct WatchConstellationView: View {
         state: CenterState,
         level: CGFloat,
         faceDiameter: CGFloat,
+        style: ConstellationStyle,
         time: TimeInterval
     ) {
         let center = CGPoint(x: size.width / 2, y: size.height / 2)
@@ -185,7 +313,7 @@ struct WatchConstellationView: View {
         // clear of the clock and toolbar buttons (sizes are points). Clamped
         // so a constrained container can never invert the band.
         let inner = faceRadius + 10
-        let band = (inner: inner, outer: max(inner + 8, maxRadius - 16))
+        let band = (inner: inner, outer: max(inner + 8, maxRadius - style.outerInset))
         let mode = state.constellationMode
 
         // While a reply is being generated, its context markers get pulled
@@ -198,7 +326,8 @@ struct WatchConstellationView: View {
         }()
 
         func position(of placed: ConstellationLayout.Placed) -> CGPoint {
-            let driftAmplitude = mode == .idle || mode == .afterglow ? 0.02 : 0.04
+            let driftAmplitude = (mode == .idle || mode == .afterglow ? 0.02 : 0.04)
+                * style.driftScale
             let angle = placed.angle - .pi / 2
                 + sin(time * 0.06 + placed.phase * 2 * .pi) * driftAmplitude
             var radius = band.inner + placed.radiusFactor * (band.outer - band.inner)
@@ -222,19 +351,19 @@ struct WatchConstellationView: View {
 
         drawAmbient(
             graphics, center: center, band: band, faceRadius: faceRadius,
-            mode: mode, level: level, time: time
+            mode: mode, level: level, style: style, time: time
         )
         drawCompressedHistory(graphics, layout: layout, center: center, band: band)
         drawHistoryChain(graphics, layout: layout, center: center, band: band)
         drawThreadLines(
             graphics, layout: layout, state: state,
             positions: positions, center: center,
-            faceRadius: faceRadius, time: time
+            faceRadius: faceRadius, style: style, time: time
         )
         for placed in layout.placed {
             drawMarker(
                 graphics, placed: placed, at: position(of: placed),
-                mode: mode, time: time
+                mode: mode, style: style, time: time
             )
         }
 
@@ -242,12 +371,12 @@ struct WatchConstellationView: View {
         case .recording:
             drawAmplitudeTicks(
                 graphics, center: center, faceRadius: faceRadius,
-                level: level, time: time
+                level: level, style: style, time: time
             )
         case .speaking:
             drawSpeechRipples(
                 graphics, center: center, faceRadius: faceRadius,
-                maxRadius: maxRadius, time: time
+                maxRadius: maxRadius, style: style, time: time
             )
         case .idle, .thinking, .afterglow:
             break
@@ -270,6 +399,7 @@ struct WatchConstellationView: View {
         faceRadius: CGFloat,
         mode: ConstellationMode,
         level: CGFloat,
+        style: ConstellationStyle,
         time: TimeInterval
     ) {
         // Tight, quiet halo — at full-field size the gradient reads as a
@@ -321,13 +451,19 @@ struct WatchConstellationView: View {
         )
 
         // Star dust: tiny fixed specks, each on its own slow twinkle phase.
-        for index in 0..<18 {
+        // A per-speck depth (a new salt off the same FNV helper) dims and
+        // slows the far layer — parallax without a parallax system. At
+        // `dustDepthStrength` 0 both factors are exactly 1, so the watch's
+        // specks are byte-identical.
+        for index in 0..<style.dustCount {
             let key = "dust-\(index)"
             let angle = ConstellationLayout.hash01(key, salt: 0xD5) * 2 * .pi
             let spread = ConstellationLayout.hash01(key, salt: 0xD6)
             let radius = faceRadius + 8 + spread * (band.outer - faceRadius - 4)
             let phase = ConstellationLayout.hash01(key, salt: 0xD7)
-            let twinkle = 0.5 + 0.5 * sin(time * 0.8 + phase * 2 * .pi)
+            let depth = ConstellationLayout.hash01(key, salt: 0xD8)
+            let twinkleSpeed = 0.8 * style.dustSpeedFactor(depth: depth)
+            let twinkle = 0.5 + 0.5 * sin(time * twinkleSpeed + phase * 2 * .pi)
             let size: CGFloat = spread > 0.7 ? 1.4 : 1.0
             let point = CGPoint(
                 x: center.x + cos(angle) * radius,
@@ -338,7 +474,9 @@ struct WatchConstellationView: View {
                     x: point.x - size / 2, y: point.y - size / 2,
                     width: size, height: size
                 )),
-                with: .color(.white.opacity(0.05 + 0.11 * twinkle))
+                with: .color(.white.opacity(
+                    (0.05 + 0.11 * twinkle) * style.dustOpacityFactor(depth: depth)
+                ))
             )
         }
     }
@@ -407,6 +545,7 @@ struct WatchConstellationView: View {
         positions: [String: CGPoint],
         center: CGPoint,
         faceRadius: CGFloat,
+        style: ConstellationStyle,
         time: TimeInterval
     ) {
         if state == .swipeArmed {
@@ -428,7 +567,7 @@ struct WatchConstellationView: View {
                 graphics.stroke(
                     path,
                     with: .color(.kiboCoralBright.opacity(0.5)),
-                    lineWidth: 1.5
+                    lineWidth: 1.5 * style.lineScale
                 )
             }
             return
@@ -445,7 +584,7 @@ struct WatchConstellationView: View {
             graphics.stroke(
                 path,
                 with: .color(.kiboCoralDim.opacity(opacity)),
-                lineWidth: 1.5
+                lineWidth: 1.5 * style.lineScale
             )
         }
     }
@@ -455,9 +594,11 @@ struct WatchConstellationView: View {
         placed: ConstellationLayout.Placed,
         at point: CGPoint,
         mode: ConstellationMode,
+        style: ConstellationStyle,
         time: TimeInterval
     ) {
         let event = placed.event
+        let markerSize = placed.size * style.markerScale
         let twinkleSpeed: Double = switch mode {
         case .idle: 1.0
         case .afterglow: 1.2
@@ -478,7 +619,7 @@ struct WatchConstellationView: View {
         // wrist size, and finding the failed item is the whole point.
         case (.reply, .working), (.reply, .seen), (.reply, .unseen):
             let color: Color = event.phase == .working ? .kiboCoralDim : .kiboCoral
-            let radius = placed.size
+            let radius = markerSize
             // The newest settled reply is the resting hero: a faint bloom
             // keeps the eye on the latest turn even when nothing moves.
             if event.phase == .seen && placed.age >= 0.999 {
@@ -514,7 +655,7 @@ struct WatchConstellationView: View {
             }
 
         case (_, .seen):
-            let radius = placed.size
+            let radius = markerSize
             graphics.fill(
                 Path(ellipseIn: CGRect(
                     x: point.x - radius, y: point.y - radius,
@@ -529,7 +670,7 @@ struct WatchConstellationView: View {
             // Diamonds cover less area than stars at equal radius; scale up
             // so a pending image carries the same luminance as a pending
             // thought.
-            let unit = event.kind == .image ? placed.size * 1.2 : placed.size
+            let unit = event.kind == .image ? markerSize * 1.2 : markerSize
             let shape = event.kind == .image
                 ? diamondPath(at: point, radius: unit * boost)
                 : starPath(at: point, radius: unit * boost)
@@ -540,7 +681,7 @@ struct WatchConstellationView: View {
             graphics.fill(halo, with: .color(color.opacity(0.18 * pulse)))
             graphics.fill(shape, with: .color(color.opacity(pulse)))
             if event.phase == .working {
-                drawOrbitArc(graphics, at: point, radius: placed.size + 4, time: time, color: color)
+                drawOrbitArc(graphics, at: point, radius: markerSize + 4, time: time, color: color)
             }
         }
     }
@@ -568,9 +709,10 @@ struct WatchConstellationView: View {
         center: CGPoint,
         faceRadius: CGFloat,
         level: CGFloat,
+        style: ConstellationStyle,
         time: TimeInterval
     ) {
-        let ticks = 36
+        let ticks = style.tickCount
         let innerRadius = faceRadius + 7
         for index in 0..<ticks {
             let angle = 2 * .pi * Double(index) / Double(ticks)
@@ -600,10 +742,12 @@ struct WatchConstellationView: View {
         center: CGPoint,
         faceRadius: CGFloat,
         maxRadius: CGFloat,
+        style: ConstellationStyle,
         time: TimeInterval
     ) {
-        for ring in 0..<3 {
-            let progress = (time * 0.45 + Double(ring) / 3)
+        let rings = style.rippleCount
+        for ring in 0..<rings {
+            let progress = (time * 0.45 + Double(ring) / Double(rings))
                 .truncatingRemainder(dividingBy: 1)
             let radius = faceRadius + 4 + progress * (maxRadius - faceRadius) * 0.85
             graphics.stroke(

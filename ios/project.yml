@@ -127,6 +127,7 @@ targets:
     platform: iOS
     sources:
       - path: KiboTests
+      - path: SharedTests
     dependencies:
       - target: Kibo
     settings:
@@ -149,6 +150,7 @@ targets:
     platform: watchOS
     sources:
       - path: KiboWatchTests
+      - path: SharedTests
     dependencies:
       - target: KiboWatch
     settings:

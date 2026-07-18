@@ -1,10 +1,14 @@
 import XCTest
+#if canImport(Kibo)
+@testable import Kibo
+#else
 @testable import Kibo_Watch
+#endif
 
 /// The constellation projection and layout: conversation events must render
 /// as the spec's marker lifecycle (working → unseen → seen / failed), keep
 /// walk order, and land in deterministic positions.
-final class WatchConstellationTests: XCTestCase {
+final class ConstellationTests: XCTestCase {
     private var nextSeq: UInt64 = 0
 
     override func setUp() {
@@ -125,6 +129,8 @@ final class WatchConstellationTests: XCTestCase {
 
     // MARK: - Layout
 
+    private var watchMetrics: ConstellationLayoutMetrics { ConstellationStyle.watch.layout }
+
     func testLayoutIsDeterministic() {
         var events: [KiboEvent] = []
         events += clip("c1")
@@ -132,8 +138,8 @@ final class WatchConstellationTests: XCTestCase {
         events += clip("c2")
         let markers = events.constellation()
         XCTAssertEqual(
-            ConstellationLayout(markers: markers),
-            ConstellationLayout(markers: markers)
+            ConstellationLayout(markers: markers, metrics: watchMetrics),
+            ConstellationLayout(markers: markers, metrics: watchMetrics)
         )
     }
 
@@ -147,8 +153,8 @@ final class WatchConstellationTests: XCTestCase {
         let landed = [ConstellationEvent(
             id: "c1", kind: .voice, phase: .unseen, contextIDs: []
         )]
-        let before = ConstellationLayout(markers: uploading).placed[0]
-        let after = ConstellationLayout(markers: landed).placed[0]
+        let before = ConstellationLayout(markers: uploading, metrics: watchMetrics).placed[0]
+        let after = ConstellationLayout(markers: landed, metrics: watchMetrics).placed[0]
         XCTAssertEqual(before.angle, after.angle)
         XCTAssertEqual(before.phase, after.phase)
     }
@@ -161,14 +167,36 @@ final class WatchConstellationTests: XCTestCase {
         }
         let markers = events.constellation()
         XCTAssertEqual(markers.count, 24)
-        let layout = ConstellationLayout(markers: markers)
-        XCTAssertEqual(layout.placed.count, ConstellationLayout.recentKept)
+        let layout = ConstellationLayout(markers: markers, metrics: watchMetrics)
+        XCTAssertEqual(layout.placed.count, watchMetrics.recentKept)
         XCTAssertEqual(
             layout.compressedCount,
-            markers.count - ConstellationLayout.recentKept
+            markers.count - watchMetrics.recentKept
         )
         // The newest markers survive compression.
         XCTAssertEqual(layout.placed.last?.event.id, markers.last?.id)
+    }
+
+    /// Layout geometry is keyed on the metrics: the phone's larger keep-count
+    /// leaves the same 24-event history uncompressed where the watch trims it.
+    func testCompressionFollowsMetrics() {
+        var events: [KiboEvent] = []
+        for index in 0..<12 {
+            events += clip("c\(index)")
+            events += answeredTurn("t\(index)", clips: ["c\(index)"])
+        }
+        let markers = events.constellation()
+        XCTAssertEqual(markers.count, 24)
+
+        // Watch: 24 > 14, so compress to the 12 most recent.
+        let watch = ConstellationLayout(markers: markers, metrics: ConstellationStyle.watch.layout)
+        XCTAssertEqual(watch.placed.count, 12)
+        XCTAssertEqual(watch.compressedCount, 12)
+
+        // Phone: 24 > 22, so compress to the 18 most recent.
+        let phone = ConstellationLayout(markers: markers, metrics: ConstellationStyle.phone.layout)
+        XCTAssertEqual(phone.placed.count, 18)
+        XCTAssertEqual(phone.compressedCount, 6)
     }
 
     func testHashIsStableAndSaltSensitive() {
@@ -176,6 +204,42 @@ final class WatchConstellationTests: XCTestCase {
         XCTAssertEqual(first, ConstellationLayout.hash01("clip-abc", salt: 1))
         XCTAssertNotEqual(first, ConstellationLayout.hash01("clip-abc", salt: 2))
         XCTAssertTrue((0.0..<1.0).contains(first))
+    }
+
+    // MARK: - Style
+
+    /// The watch frame pacing must match the historical per-mode intervals
+    /// verbatim — the battery contract the cadence check gates.
+    func testFramePacingWatchMatchesHistoricalIntervals() {
+        let pacing = FramePacing.watch
+        XCTAssertEqual(pacing.interval(for: .idle), 1.0 / 8.0)
+        XCTAssertEqual(pacing.interval(for: .afterglow), 1.0 / 10.0)
+        XCTAssertEqual(pacing.interval(for: .thinking), 1.0 / 15.0)
+        XCTAssertEqual(pacing.interval(for: .recording), 1.0 / 30.0)
+        XCTAssertEqual(pacing.interval(for: .speaking), 1.0 / 30.0)
+    }
+
+    /// At `dustDepthStrength` 0 (the watch preset) both dust factors multiply
+    /// by exactly 1.0 for every depth — the guarantee that the watch's star
+    /// dust is byte-identical after the style split.
+    func testDustDepthStrengthZeroIsIdentity() {
+        let style = ConstellationStyle.watch
+        XCTAssertEqual(style.dustDepthStrength, 0)
+        for depth in [0.0, 0.13, 0.5, 0.87, 1.0] {
+            XCTAssertEqual(style.dustOpacityFactor(depth: depth), 1.0)
+            XCTAssertEqual(style.dustSpeedFactor(depth: depth), 1.0)
+        }
+        // And the phone preset genuinely attenuates, so the seam isn't a no-op.
+        XCTAssertLessThan(ConstellationStyle.phone.dustOpacityFactor(depth: 1.0), 1.0)
+        XCTAssertLessThan(ConstellationStyle.phone.dustSpeedFactor(depth: 1.0), 1.0)
+    }
+
+    /// The iPad/Mac seam picks the watch look below 260pt and the phone look
+    /// at and above it.
+    func testFittingBoundaryAt260() {
+        XCTAssertEqual(ConstellationStyle.fitting(minDimension: 259), .watch)
+        XCTAssertEqual(ConstellationStyle.fitting(minDimension: 260), .phone)
+        XCTAssertEqual(ConstellationStyle.fitting(minDimension: 261), .phone)
     }
 
     // MARK: - Center state

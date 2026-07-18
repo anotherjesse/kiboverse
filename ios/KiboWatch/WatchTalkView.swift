@@ -328,6 +328,9 @@ struct WatchTalkView: View {
             font: .system(size: 13, weight: .medium),
             kerning: 0.6
         )
+        .lineLimit(1)
+        .truncationMode(.tail)
+        .frame(maxWidth: .infinity, minHeight: 14)
         .accessibilityIdentifier("watch-status")
     }
 

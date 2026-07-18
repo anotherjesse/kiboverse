@@ -20,9 +20,11 @@ struct StatusStyle: Equatable {
 /// state-carrying token in coral (the count when thoughts are pending).
 /// Amber, not red, for attention — red is reserved for destruction.
 ///
-/// Accessibility identifiers, `controlSize`, and font/kerning are pinned
-/// per-platform test contracts — callers supply font/kerning; identifiers
-/// are applied at the call site.
+/// Accessibility identifiers, font/kerning, and layout (line limit,
+/// truncation, frame) are pinned per-platform test/design contracts and
+/// applied at the call site — the watch pins this to one line, but the
+/// phone talk-mode error surface needs room to wrap, so this view only
+/// composes the text and its coloring.
 struct StatusLabel: View {
     let state: CenterState
     var style: StatusStyle
@@ -42,9 +44,6 @@ struct StatusLabel: View {
         return text
             .font(font)
             .kerning(kerning)
-            .lineLimit(1)
-            .truncationMode(.tail)
-            .frame(maxWidth: .infinity, minHeight: 14)
     }
 }
 

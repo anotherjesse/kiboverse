@@ -145,27 +145,51 @@ struct TalkModeView: View {
             .allowsHitTesting(store.selectedConversationID != nil)
     }
 
+    /// Whether the swipe hint shows, and whether it reads as armed. Live
+    /// hold/armed state normally; under the presentation-only UITest override
+    /// both derive from the forced state so the screenshots render faithfully:
+    /// forced `.recording` shows the "Swipe up to ask" hint, forced
+    /// `.swipeArmed` the "Release to ask" armed capsule — neither of which the
+    /// mic-revoked sim can produce for real. No audio/store mutation.
+    private var hintVisible: Bool {
+        #if DEBUG
+        if let forced = Self.uiTestOverrideState {
+            return forced == .recording || forced == .swipeArmed
+        }
+        #endif
+        return audio.isHolding || audio.isRecording
+    }
+
+    private var hintArmed: Bool {
+        #if DEBUG
+        if let forced = Self.uiTestOverrideState {
+            return forced == .swipeArmed
+        }
+        #endif
+        return swipeArmed
+    }
+
     /// Transient, hold-only affordance for the release gesture — appears while
     /// the finger is down and highlights once the swipe is armed. Small and
     /// quiet, riding just above the face so the eye stays on the thumb.
     @ViewBuilder
     private func swipeHint(faceDiameter: CGFloat) -> some View {
-        if audio.isHolding || audio.isRecording {
+        if hintVisible {
             HStack(spacing: 5) {
-                Image(systemName: swipeArmed ? "sparkles" : "chevron.up")
-                Text(swipeArmed ? "Release to ask" : "Swipe up to ask")
+                Image(systemName: hintArmed ? "sparkles" : "chevron.up")
+                Text(hintArmed ? "Release to ask" : "Swipe up to ask")
             }
             .font(.footnote.weight(.semibold))
-            .foregroundStyle(swipeArmed ? Color.white : Color.white.opacity(0.7))
+            .foregroundStyle(hintArmed ? Color.white : Color.white.opacity(0.7))
             .padding(.horizontal, 12)
             .padding(.vertical, 7)
             .background(
-                swipeArmed ? AnyShapeStyle(Color.kiboCoral) : AnyShapeStyle(.ultraThinMaterial),
+                hintArmed ? AnyShapeStyle(Color.kiboCoral) : AnyShapeStyle(.ultraThinMaterial),
                 in: Capsule()
             )
             .offset(y: -(faceDiameter * 0.5 + 34))
             .allowsHitTesting(false)
-            .animation(.easeOut(duration: 0.15), value: swipeArmed)
+            .animation(.easeOut(duration: 0.15), value: hintArmed)
             .transition(.opacity)
         }
     }
@@ -327,13 +351,20 @@ struct TalkModeView: View {
     }
 
     /// Amplitude fed to the face pulse and the constellation's amplitude ticks.
-    /// The real mic level in the running app; only the recording-state UITest
-    /// override injects a synthetic level, so the ticks and face pulse actually
-    /// render in screenshots — both collapse at level 0, which the mic-revoked
-    /// simulator always reports. Presentation-only, like the state override.
+    /// The real mic level in the running app; the mic-open UITest overrides
+    /// (`.recording` and `.swipeArmed`) inject a synthetic level, so the ticks
+    /// and face pulse actually render in screenshots — both collapse at level 0,
+    /// which the mic-revoked simulator always reports. Presentation-only, like
+    /// the state override.
     private var renderLevel: CGFloat {
         #if DEBUG
-        if Self.uiTestOverrideState == .recording { return 0.35 }
+        // Both mic-open states inject a synthetic level so the amplitude ticks
+        // and face pulse render in screenshots — the mic-revoked sim always
+        // reports 0. `.swipeArmed` animates the same recording constellation
+        // (ticks visible), so it needs the level too.
+        if let forced = Self.uiTestOverrideState, forced == .recording || forced == .swipeArmed {
+            return 0.35
+        }
         #endif
         return audio.level
     }

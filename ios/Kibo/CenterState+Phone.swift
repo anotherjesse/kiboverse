@@ -16,6 +16,55 @@ import Foundation
 ///   from the timeline sets `audio.lastFinishedID` but never `finishedTurnID`,
 ///   so no false `.replyDone`.
 extension CenterState {
+    /// The phone input mapping as a pure function of plain values — the
+    /// testable core the `@MainActor` convenience wrapper delegates to. Split
+    /// out so the phone-specific bindings (the `isStarting || isHolding`
+    /// disjunction, the recording → playback → store error precedence, the
+    /// reply-only playback filter) can be unit-tested without constructing an
+    /// `AppStore`/`AudioCoordinator`/`ReplySession`.
+    static func derivePhone(
+        hasConversation: Bool,
+        swipeArmed: Bool,
+        audioIsStarting: Bool,
+        audioIsHolding: Bool,
+        audioIsRecording: Bool,
+        recordingErrorMessage: String?,
+        playbackErrorMessage: String?,
+        storeErrorMessage: String?,
+        isUploading: Bool,
+        isAskingKibo: Bool,
+        loadingID: String?,
+        playingID: String?,
+        finishedTurnID: String?,
+        recoveryItemCount: Int,
+        hasRetryableFailure: Bool,
+        pendingCount: Int,
+        savedCount: Int
+    ) -> CenterState {
+        derive(
+            hasConversation: hasConversation,
+            swipeArmed: swipeArmed,
+            isStarting: audioIsStarting || audioIsHolding,
+            isRecording: audioIsRecording,
+            // Same source order as the old statusLine chain: a recording
+            // error, then a playback error, then a store error.
+            errorMessage: recordingErrorMessage
+                ?? playbackErrorMessage
+                ?? storeErrorMessage,
+            isSending: isUploading,
+            isThinking: isAskingKibo,
+            // The phone plays recorded clips too, so filter loading/speaking
+            // through PlaybackID.isReply — a clip playing is not a reply.
+            isLoadingReply: PlaybackID.isReply(loadingID),
+            isSpeaking: PlaybackID.isReply(playingID),
+            didFinishReply: finishedTurnID != nil,
+            recoveryItemCount: recoveryItemCount,
+            hasRetryableFailure: hasRetryableFailure,
+            pendingCount: pendingCount,
+            savedCount: savedCount
+        )
+    }
+
     @MainActor
     static func derive(
         store: AppStore,
@@ -23,23 +72,20 @@ extension CenterState {
         session: ReplySession,
         swipeArmed: Bool
     ) -> CenterState {
-        derive(
+        derivePhone(
             hasConversation: store.selectedConversationID != nil,
             swipeArmed: swipeArmed,
-            isStarting: audio.isStarting || audio.isHolding,
-            isRecording: audio.isRecording,
-            // Same source order as the old statusLine chain: a recording
-            // error, then a playback error, then a store error.
-            errorMessage: audio.recordingErrorMessage
-                ?? audio.playbackErrorMessage
-                ?? store.errorMessage,
-            isSending: store.isUploading,
-            isThinking: store.isAskingKibo,
-            // The phone plays recorded clips too, so filter loading/speaking
-            // through PlaybackID.isReply — a clip playing is not a reply.
-            isLoadingReply: PlaybackID.isReply(audio.loadingID),
-            isSpeaking: PlaybackID.isReply(audio.playingID),
-            didFinishReply: session.intent.finishedTurnID != nil,
+            audioIsStarting: audio.isStarting,
+            audioIsHolding: audio.isHolding,
+            audioIsRecording: audio.isRecording,
+            recordingErrorMessage: audio.recordingErrorMessage,
+            playbackErrorMessage: audio.playbackErrorMessage,
+            storeErrorMessage: store.errorMessage,
+            isUploading: store.isUploading,
+            isAskingKibo: store.isAskingKibo,
+            loadingID: audio.loadingID,
+            playingID: audio.playingID,
+            finishedTurnID: session.intent.finishedTurnID,
             recoveryItemCount: store.recoveryItemCount,
             hasRetryableFailure: store.events.retryableFailure != nil,
             pendingCount: store.askableItemCount,

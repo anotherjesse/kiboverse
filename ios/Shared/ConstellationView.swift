@@ -761,6 +761,18 @@ struct ConstellationView: View {
         }
     }
 
+    /// Whether `drawFaceRing` animates for this mode — i.e. its treatment reads
+    /// `time`. `.idle` and `.afterglow` draw a static ring (fixed strokes, no
+    /// clock), so a face-ring-only host (`KiboStateRing`) can pause its
+    /// TimelineView at rest instead of redrawing an unchanging frame. Kept
+    /// beside `drawFaceRing` so the two can never drift.
+    static func faceRingAnimates(_ mode: ConstellationMode) -> Bool {
+        switch mode {
+        case .idle, .afterglow: false
+        case .recording, .thinking, .speaking: true
+        }
+    }
+
     /// The coral ring hugging the face — dim at rest, hot while recording,
     /// breathing while thinking, pulsing while speaking. Internal (not
     /// private) so `KiboStateRing` can render the same ring language — the

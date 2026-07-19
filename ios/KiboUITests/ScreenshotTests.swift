@@ -184,8 +184,10 @@ final class ScreenshotTests: XCTestCase {
 
 /// Minimal mock-kibod REST client for seeding walk fixtures. Runs on the host
 /// against the same loopback mock the simulator uses. Synchronous by design
-/// (semaphore-blocked) so the walk reads top-to-bottom.
-private struct MockSeed {
+/// (semaphore-blocked) so the walk reads top-to-bottom. Internal (not private)
+/// so `ImageFlowTests` can reuse `settleConversation` to make the shared "General"
+/// conversation deterministic before driving the UI.
+struct MockSeed {
     let base = URL(string: "http://127.0.0.1:3011")!
     let projectID = "kibo"
 

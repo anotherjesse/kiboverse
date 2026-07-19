@@ -39,8 +39,14 @@ struct KiboStateRing: View {
     }
 
     /// The TimelineView is the battery cost, not the trig-only Canvas frame.
+    /// The always-visible composer ring also pauses whenever the drawn
+    /// treatment is static (`.idle`, `.afterglow` don't read `time`), so at
+    /// rest it stops redrawing an unchanging frame ~10×/sec — only the animated
+    /// modes keep their cadence.
     private var paused: Bool {
-        scenePhase != .active || isLuminanceReduced
+        scenePhase != .active
+            || isLuminanceReduced
+            || !ConstellationView.faceRingAnimates(state.constellationMode)
     }
 
     private var frameInterval: TimeInterval {

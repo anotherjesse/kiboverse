@@ -11,6 +11,14 @@ import XCTest
 final class ImageFlowTests: XCTestCase {
     @MainActor
     func testAttachFromLibraryThenAskRendersImageCardAndMockReply() throws {
+        // The mock kibod is long-running and durable; a prior run can leave
+        // unclaimed media in "General", which would make this run's ask claim
+        // more than the single image it attaches (reply "I see 2 image(s)")
+        // and break the image-only-turn assertions. Settle the conversation
+        // via REST first so the one image attached below is the only unclaimed
+        // item and the mock reply is deterministically "I see 1 image".
+        MockSeed().settleConversation(named: "General")
+
         let app = XCUIApplication()
         app.launch()
 

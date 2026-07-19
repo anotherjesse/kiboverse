@@ -202,6 +202,17 @@ struct ConversationDetailView: View {
         }
     }
 
+    /// True when the visible `.error` is the playback error the "Audio
+    /// unavailable" alert already presents (mirrors that alert's binding
+    /// source). Recording/store errors have no alert on this screen, so the
+    /// status slot must render them instead of leaving a confused face with no
+    /// message.
+    private var alertPresentsError: Bool {
+        audio.recordingErrorMessage == nil
+            && audio.playbackErrorMessage != nil
+            && !router.isTalkModePresented
+    }
+
     /// Swipe up on the face is the ask gesture; this replaces the old Ask
     /// button with passive feedback — what a swipe would submit, or the ask in
     /// flight — via the shared `StatusLabel`. The recovery button survives as
@@ -217,10 +228,12 @@ struct ConversationDetailView: View {
                 Label("Recovery needed", systemImage: "exclamationmark.arrow.circlepath")
                     .font(.subheadline.weight(.medium))
             }
-        } else if !centerState.isError {
-            // §2.1: the "Audio unavailable" alert already owns error surfacing
-            // on this screen (with modal dismissal), so the status slot renders
-            // nothing on `.error` — one error surface per screen.
+        } else if !(centerState.isError && alertPresentsError) {
+            // Exactly one error surface per screen: the "Audio unavailable"
+            // alert owns playback errors (with modal dismissal), so the status
+            // slot stays silent only for those. Recording and store errors have
+            // no alert here, so they render in the shared StatusLabel as talk
+            // mode does — never a confused face with zero message.
             StatusLabel(
                 state: centerState,
                 style: .adaptive,

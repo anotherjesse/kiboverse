@@ -762,8 +762,10 @@ struct ConstellationView: View {
     }
 
     /// The coral ring hugging the face — dim at rest, hot while recording,
-    /// breathing while thinking, pulsing while speaking.
-    private static func drawFaceRing(
+    /// breathing while thinking, pulsing while speaking. Internal (not
+    /// private) so `KiboStateRing` can render the same ring language — the
+    /// composer's creature — without the surrounding field.
+    static func drawFaceRing(
         _ graphics: GraphicsContext,
         center: CGPoint,
         faceRadius: CGFloat,

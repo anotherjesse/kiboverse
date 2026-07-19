@@ -8,6 +8,9 @@ struct ConversationDetailView: View {
     @StateObject private var session = ReplySession()
     @State private var isPhotoLibraryPresented = false
     @State private var isCameraPresented = false
+    /// Fed by the shared gesture's `.armedChanged`; drives the excited face,
+    /// the "Release to ask" copy, and the armed haptic.
+    @State private var swipeArmed = false
 
     var body: some View {
         Group {
@@ -95,21 +98,7 @@ struct ConversationDetailView: View {
 
     private var composer: some View {
         HStack(spacing: 16) {
-            MicButton(
-                diameter: 60,
-                isRecording: audio.isRecording,
-                isHolding: audio.isHolding,
-                level: audio.level,
-                isEnabled: store.selectedConversationID != nil,
-                beginHold: { session.beginHold() },
-                endHold: { session.endHold() },
-                cancelHold: { session.cancelHold() },
-                askKibo: {
-                    if store.askableItemCount > 0 {
-                        session.startSubmit(afterCaptureEnded: true)
-                    }
-                }
-            )
+            creature
             Spacer()
             composerStatus
             attachButton
@@ -120,9 +109,103 @@ struct ConversationDetailView: View {
         .background(.ultraThinMaterial)
     }
 
-    /// Swipe up on the mic is the ask gesture; this replaces the old Ask
-    /// button with passive feedback — what a swipe would submit, or the ask
-    /// in flight.
+    /// The inline creature: Kibo's face on a `kiboInk` disc (the white sprite
+    /// needs dark backing over the light material) wrapped by the shared
+    /// `KiboStateRing`. The disc and gesture footprint stay 60pt — the old mic
+    /// size — while the ring rides just outside it. Same shared hold-to-talk
+    /// semantics the watch and talk mode use; the armed state (feeding the hint
+    /// and haptic) and the askable guard stay here.
+    private var creature: some View {
+        let state = centerState
+        let isEnabled = store.selectedConversationID != nil
+        return ZStack {
+            KiboStateRing(state: state, level: audio.level, diameter: 60, pacing: .phone)
+                .frame(width: 80, height: 80)
+            Circle()
+                .fill(Color.kiboInk)
+                .frame(width: 60, height: 60)
+                .overlay(Circle().strokeBorder(Color.white.opacity(0.08), lineWidth: 0.5))
+                .shadow(color: Color.black.opacity(0.2), radius: 4, y: 2)
+            KiboFace(state: state, level: audio.level, diameter: 60)
+        }
+        // Keep the layout footprint at the old 60pt disc; the ring overflows
+        // visually into the composer's vertical padding without clipping.
+        .frame(width: 60, height: 60)
+        .opacity(isEnabled ? 1 : 0.4)
+        .contentShape(Circle())
+        .overlay(alignment: .top) { swipeHint }
+        .sensoryFeedback(.impact(weight: .medium), trigger: swipeArmed)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Hold to talk")
+        .accessibilityValue(audio.isRecording ? "Recording" : "Ready")
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction {
+            if audio.isHolding { session.endHold() } else { session.beginHold() }
+        }
+        // With no separate Ask button, the swipe gesture needs an
+        // accessibility equivalent.
+        .accessibilityAction(named: "Ask Kibo") { askKibo() }
+        .holdToTalkGesture(swipeThreshold: 55) { event in
+            switch event {
+            case .began:
+                session.beginHold()
+            case let .armedChanged(armed):
+                swipeArmed = armed
+            case .canceled:
+                session.cancelHold()
+            case .saved:
+                session.endHold()
+            case .askRequested:
+                askKibo()
+            }
+        }
+        .allowsHitTesting(isEnabled)
+        .accessibilityIdentifier("talk-button")
+    }
+
+    /// Transient, hold-only affordance for the release gesture — appears while
+    /// the finger is down and highlights once the swipe is armed.
+    @ViewBuilder
+    private var swipeHint: some View {
+        if audio.isHolding || audio.isRecording {
+            HStack(spacing: 5) {
+                Image(systemName: swipeArmed ? "sparkles" : "chevron.up")
+                Text(swipeArmed ? "Release to ask" : "Swipe up to ask")
+            }
+            .font(.footnote.weight(.semibold))
+            .foregroundStyle(swipeArmed ? Color.white : Color.secondary)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .background(
+                swipeArmed ? AnyShapeStyle(Color.kiboCoral) : AnyShapeStyle(.thinMaterial),
+                in: Capsule()
+            )
+            .offset(y: -(60 * 0.24 + 44))
+            .allowsHitTesting(false)
+            .animation(.easeOut(duration: 0.15), value: swipeArmed)
+            .transition(.opacity)
+        }
+    }
+
+    /// The one phone-composer derivation of "what is Kibo doing right now" —
+    /// drives the face sprite, the state ring, and the status label.
+    private var centerState: CenterState {
+        CenterState.derive(store: store, audio: audio, session: session, swipeArmed: swipeArmed)
+    }
+
+    /// The askable guard lives here — the release just ended (or discarded) the
+    /// hold by our own hand, so `startSubmit` skips the capture-state guards
+    /// whose published values may not have settled this tick.
+    private func askKibo() {
+        if store.askableItemCount > 0 {
+            session.startSubmit(afterCaptureEnded: true)
+        }
+    }
+
+    /// Swipe up on the face is the ask gesture; this replaces the old Ask
+    /// button with passive feedback — what a swipe would submit, or the ask in
+    /// flight — via the shared `StatusLabel`. The recovery button survives as
+    /// its own actionable affordance.
     @ViewBuilder
     private var composerStatus: some View {
         if store.recoveryItemCount > 0 {
@@ -134,17 +217,16 @@ struct ConversationDetailView: View {
                 Label("Recovery needed", systemImage: "exclamationmark.arrow.circlepath")
                     .font(.subheadline.weight(.medium))
             }
-        } else if store.isAskingKibo {
-            HStack(spacing: 8) {
-                ProgressView()
-                Text("Asking Kibo…")
-            }
-            .font(.subheadline.weight(.medium))
-            .foregroundStyle(.secondary)
-        } else if store.askableItemCount > 0 {
-            Text("\(store.askableItemCount) pending")
-                .font(.subheadline.weight(.medium))
-                .foregroundStyle(.secondary)
+        } else if !centerState.isError {
+            // §2.1: the "Audio unavailable" alert already owns error surfacing
+            // on this screen (with modal dismissal), so the status slot renders
+            // nothing on `.error` — one error surface per screen.
+            StatusLabel(
+                state: centerState,
+                style: .adaptive,
+                font: .subheadline.weight(.medium),
+                kerning: 0
+            )
         }
     }
 

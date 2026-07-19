@@ -237,7 +237,7 @@ final class WatchStore: ObservableObject {
         }
     }
 
-    func queueRecording(_ recording: WatchLocalRecording) {
+    func queueRecording(_ recording: LocalRecording) {
         guard let projectID = selectedProjectID,
               let conversationID = selectedConversationID else {
             errorMessage = "Choose a conversation first."

@@ -2,41 +2,6 @@
 import Combine
 import Foundation
 
-enum AudioSessionIntent: Equatable {
-    case prepareCapture
-    case beginCapture
-    case beginPlayback
-    case rebuildPlayback
-}
-
-enum AudioSystemEvent: Equatable {
-    case outputRouteUnavailable
-    case playbackConfigurationChanged
-    case interruptionBegan
-    case mediaServicesReset
-}
-
-@MainActor
-protocol AudioSessionControlling: AnyObject {
-    func activate(for intent: AudioSessionIntent) throws
-    func deactivate()
-}
-
-@MainActor
-protocol AudioCapturing: AnyObject {
-    var objectWillChange: ObservableObjectPublisher { get }
-    var isRecording: Bool { get }
-    var isStarting: Bool { get }
-    var level: CGFloat { get }
-    var errorMessage: String? { get set }
-    func prepare() async
-    func start(holdID: UUID) async -> Bool
-    func stop(holdID: UUID) -> LocalRecording?
-    func cancel(holdID: UUID?)
-    func preserveForRecovery(holdID: UUID?)
-    func resetAudioObjects()
-}
-
 extension AudioRecorder: AudioCapturing {}
 
 @MainActor
@@ -76,7 +41,7 @@ final class AudioCoordinator: ObservableObject {
     private var recorderStartTask: Task<Void, Never>?
     private var configurationRebuildTask: Task<Void, Never>?
     private var cancellables: Set<AnyCancellable> = []
-    private var notificationTokens: [NSObjectProtocol] = []
+    private var systemObserver: AudioSystemObserver?
     @Published private(set) var automaticPlaybackSuspended = false
 
     init(
@@ -98,11 +63,12 @@ final class AudioCoordinator: ObservableObject {
         self.player.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
-        if observeNotifications { observeAudioSystem() }
+        if observeNotifications {
+            systemObserver = AudioSystemObserver { [weak self] event in self?.handleSystemEvent(event) }
+        }
     }
 
     deinit {
-        for token in notificationTokens { NotificationCenter.default.removeObserver(token) }
         recorderStartTask?.cancel()
         configurationRebuildTask?.cancel()
     }
@@ -232,61 +198,6 @@ final class AudioCoordinator: ObservableObject {
 
     private func restorePlaybackAfterCapture() {
         player.resumeAfterRecording()
-    }
-
-    private func observeAudioSystem() {
-        let center = NotificationCenter.default
-        notificationTokens.append(center.addObserver(
-            forName: AVAudioSession.routeChangeNotification,
-            object: AVAudioSession.sharedInstance(),
-            queue: .main
-        ) { [weak self] note in
-            Task { @MainActor in self?.handleRouteChangeNotification(note) }
-        })
-        notificationTokens.append(center.addObserver(
-            forName: AVAudioSession.interruptionNotification,
-            object: AVAudioSession.sharedInstance(),
-            queue: .main
-        ) { [weak self] note in
-            Task { @MainActor in self?.handleInterruptionNotification(note) }
-        })
-        notificationTokens.append(center.addObserver(
-            forName: AVAudioSession.mediaServicesWereResetNotification,
-            object: AVAudioSession.sharedInstance(),
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in self?.handleSystemEvent(.mediaServicesReset) }
-        })
-        notificationTokens.append(center.addObserver(
-            forName: .AVAudioEngineConfigurationChange,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in self?.handleSystemEvent(.playbackConfigurationChanged) }
-        })
-    }
-
-    private func handleRouteChangeNotification(_ notification: Notification) {
-        let raw = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
-        let reason = raw.flatMap(AVAudioSession.RouteChangeReason.init(rawValue:))
-        if reason == .oldDeviceUnavailable {
-            handleSystemEvent(.outputRouteUnavailable)
-            return
-        }
-        if reason == .newDeviceAvailable || reason == .routeConfigurationChange {
-            handleSystemEvent(.playbackConfigurationChanged)
-        }
-    }
-
-    private func handleInterruptionNotification(_ notification: Notification) {
-        guard let event = Self.interruptionEvent(from: notification) else { return }
-        handleSystemEvent(event)
-    }
-
-    static func interruptionEvent(from notification: Notification) -> AudioSystemEvent? {
-        guard let raw = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
-              AVAudioSession.InterruptionType(rawValue: raw) == .began else { return nil }
-        return .interruptionBegan
     }
 
     func handleSystemEvent(_ event: AudioSystemEvent) {

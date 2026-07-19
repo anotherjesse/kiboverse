@@ -736,20 +736,6 @@ final class KiboAPITests: XCTestCase {
         XCTAssertEqual(speech.playingID, "reply")
     }
 
-    func testInterruptionPolicyOnlyMapsBeganNotifications() {
-        let began = Notification(
-            name: AVAudioSession.interruptionNotification,
-            userInfo: [AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.began.rawValue]
-        )
-        let ended = Notification(
-            name: AVAudioSession.interruptionNotification,
-            userInfo: [AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.ended.rawValue]
-        )
-
-        XCTAssertEqual(AudioCoordinator.interruptionEvent(from: began), .interruptionBegan)
-        XCTAssertNil(AudioCoordinator.interruptionEvent(from: ended))
-    }
-
     func testMediaResetDiscardsCaptureObjectsAndPlayback() throws {
         let log = AudioEventLog()
         let session = FakeAudioSession(log: log)

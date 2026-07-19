@@ -2,35 +2,15 @@
 import Combine
 import Foundation
 
-enum WatchAudioSessionIntent: Equatable {
-    case prepareCapture
-    case beginCapture
-    case beginPlayback
-    case rebuildPlayback
-}
-
-enum WatchAudioSystemEvent: Equatable {
-    case outputRouteUnavailable
-    case playbackConfigurationChanged
-    case interruptionBegan
-    case mediaServicesReset
-}
-
 @MainActor
-protocol WatchAudioSessionControlling: AnyObject {
-    func activate(for intent: WatchAudioSessionIntent) throws
-    func deactivate()
-}
-
-@MainActor
-final class WatchAudioSessionController: WatchAudioSessionControlling {
+final class WatchAudioSessionController: AudioSessionControlling {
     private let session: AVAudioSession
 
     init(session: AVAudioSession = .sharedInstance()) {
         self.session = session
     }
 
-    func activate(for intent: WatchAudioSessionIntent) throws {
+    func activate(for intent: AudioSessionIntent) throws {
         if intent == .rebuildPlayback {
             try? session.setActive(false, options: .notifyOthersOnDeactivation)
         }
@@ -60,8 +40,8 @@ final class WatchAudioSessionController: WatchAudioSessionControlling {
 final class WatchAudioCoordinator: ObservableObject {
     private static let maximumReplySamples = 24_000 * 60 * 3
 
-    private let recorder: any WatchAudioCapturing
-    private let session: any WatchAudioSessionControlling
+    private let recorder: any AudioCapturing
+    private let session: any AudioSessionControlling
     private let player: PCMStreamingPlayer
     private let recordingInventoryDidChange: @MainActor () -> Void
     private var activeHoldID: UUID?
@@ -70,12 +50,12 @@ final class WatchAudioCoordinator: ObservableObject {
     private var routeRebuildTask: Task<Void, Never>?
     private var lifecycleEpoch = UUID()
     private var cancellables: Set<AnyCancellable> = []
-    private var notificationTokens: [NSObjectProtocol] = []
+    private var systemObserver: AudioSystemObserver?
     @Published private(set) var automaticPlaybackSuspended = false
 
     init(
-        recorder: (any WatchAudioCapturing)? = nil,
-        session: (any WatchAudioSessionControlling)? = nil,
+        recorder: (any AudioCapturing)? = nil,
+        session: (any AudioSessionControlling)? = nil,
         player: PCMStreamingPlayer? = nil,
         observeNotifications: Bool = true,
         recordingInventoryDidChange: @escaping @MainActor () -> Void = {}
@@ -98,11 +78,12 @@ final class WatchAudioCoordinator: ObservableObject {
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
         self.player.didChange = { [weak self] in self?.handlePlayerChange() }
-        if observeNotifications { observeAudioSystem() }
+        if observeNotifications {
+            systemObserver = AudioSystemObserver { [weak self] event in self?.handleSystemEvent(event) }
+        }
     }
 
     deinit {
-        for token in notificationTokens { NotificationCenter.default.removeObserver(token) }
         recorderStartTask?.cancel()
         prepareTask?.cancel()
         routeRebuildTask?.cancel()
@@ -190,7 +171,7 @@ final class WatchAudioCoordinator: ObservableObject {
         }
     }
 
-    func endHold() -> WatchLocalRecording? {
+    func endHold() -> LocalRecording? {
         guard let holdID = activeHoldID else { return nil }
         activeHoldID = nil
         recorderStartTask?.cancel()
@@ -240,7 +221,7 @@ final class WatchAudioCoordinator: ObservableObject {
         session.deactivate()
     }
 
-    func handleSystemEvent(_ event: WatchAudioSystemEvent) {
+    func handleSystemEvent(_ event: AudioSystemEvent) {
         switch event {
         case .playbackConfigurationChanged:
             guard activeHoldID == nil else { return }
@@ -290,53 +271,5 @@ final class WatchAudioCoordinator: ObservableObject {
         if activeHoldID == nil, player.playingID == nil, player.loadingID == nil {
             session.deactivate()
         }
-    }
-
-    private func observeAudioSystem() {
-        let center = NotificationCenter.default
-        notificationTokens.append(center.addObserver(
-            forName: .AVAudioEngineConfigurationChange,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in self?.handleSystemEvent(.playbackConfigurationChanged) }
-        })
-        notificationTokens.append(center.addObserver(
-            forName: AVAudioSession.routeChangeNotification,
-            object: AVAudioSession.sharedInstance(),
-            queue: .main
-        ) { [weak self] note in
-            Task { @MainActor in self?.handleRouteChangeNotification(note) }
-        })
-        notificationTokens.append(center.addObserver(
-            forName: AVAudioSession.interruptionNotification,
-            object: AVAudioSession.sharedInstance(),
-            queue: .main
-        ) { [weak self] note in
-            Task { @MainActor in self?.handleInterruptionNotification(note) }
-        })
-        notificationTokens.append(center.addObserver(
-            forName: AVAudioSession.mediaServicesWereResetNotification,
-            object: AVAudioSession.sharedInstance(),
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in self?.handleSystemEvent(.mediaServicesReset) }
-        })
-    }
-
-    private func handleRouteChangeNotification(_ notification: Notification) {
-        let raw = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
-        let reason = raw.flatMap(AVAudioSession.RouteChangeReason.init(rawValue:))
-        if reason == .oldDeviceUnavailable {
-            handleSystemEvent(.outputRouteUnavailable)
-        } else if reason == .newDeviceAvailable || reason == .routeConfigurationChange {
-            handleSystemEvent(.playbackConfigurationChanged)
-        }
-    }
-
-    private func handleInterruptionNotification(_ notification: Notification) {
-        guard let raw = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
-              AVAudioSession.InterruptionType(rawValue: raw) == .began else { return }
-        handleSystemEvent(.interruptionBegan)
     }
 }

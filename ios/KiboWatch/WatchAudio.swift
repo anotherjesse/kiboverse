@@ -2,25 +2,8 @@
 import Combine
 import Foundation
 
-typealias WatchLocalRecording = LocalRecording
-
 @MainActor
-protocol WatchAudioCapturing: AnyObject {
-    var objectWillChange: ObservableObjectPublisher { get }
-    var isRecording: Bool { get }
-    var isStarting: Bool { get }
-    var level: CGFloat { get }
-    var errorMessage: String? { get set }
-    func prepare() async
-    func start(holdID: UUID) async -> Bool
-    func stop(holdID: UUID) -> WatchLocalRecording?
-    func cancel(holdID: UUID?)
-    func preserveForRecovery(holdID: UUID?)
-    func resetAudioObjects()
-}
-
-@MainActor
-final class WatchAudioRecorder: NSObject, ObservableObject, WatchAudioCapturing,
+final class WatchAudioRecorder: NSObject, ObservableObject, AudioCapturing,
     @preconcurrency AVAudioRecorderDelegate {
     @Published private(set) var isRecording = false
     @Published private(set) var isStarting = false
@@ -120,7 +103,7 @@ final class WatchAudioRecorder: NSObject, ObservableObject, WatchAudioCapturing,
         }
     }
 
-    func stop(holdID: UUID) -> WatchLocalRecording? {
+    func stop(holdID: UUID) -> LocalRecording? {
         guard activeHoldID == holdID else { return nil }
         activeHoldID = nil
         guard let recorder else { return nil }
@@ -146,7 +129,7 @@ final class WatchAudioRecorder: NSObject, ObservableObject, WatchAudioCapturing,
         do {
             try FileManager.default.moveItem(at: workingURL, to: finalURL)
             lease?.relinquish()
-            return WatchLocalRecording(
+            return LocalRecording(
                 id: id,
                 url: finalURL,
                 durationMs: durationMs,

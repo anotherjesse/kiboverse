@@ -443,7 +443,7 @@ final class WatchAudioTests: XCTestCase {
     }
 
     func testRouteLossAndInterruptionTearDownWithoutStaleResume() async {
-        for event in [WatchAudioSystemEvent.outputRouteUnavailable, .interruptionBegan] {
+        for event in [AudioSystemEvent.outputRouteUnavailable, .interruptionBegan] {
             let log = WatchEventLog()
             let session = WatchFakeSession(log: log)
             let capture = WatchFakeCapture(log: log)
@@ -471,7 +471,7 @@ final class WatchAudioTests: XCTestCase {
     }
 
     func testSystemEventsPreserveActiveCaptureForRecovery() async {
-        for event in [WatchAudioSystemEvent.outputRouteUnavailable, .interruptionBegan] {
+        for event in [AudioSystemEvent.outputRouteUnavailable, .interruptionBegan] {
             let log = WatchEventLog()
             var inventoryRefreshes = 0
             let session = WatchFakeSession(log: log)
@@ -677,13 +677,13 @@ private final class WatchEventLog {
 }
 
 @MainActor
-private final class WatchFakeSession: WatchAudioSessionControlling {
+private final class WatchFakeSession: AudioSessionControlling {
     private let log: WatchEventLog
-    var failingIntent: WatchAudioSessionIntent?
+    var failingIntent: AudioSessionIntent?
 
     init(log: WatchEventLog) { self.log = log }
 
-    func activate(for intent: WatchAudioSessionIntent) throws {
+    func activate(for intent: AudioSessionIntent) throws {
         log.events.append("session.activate:\(intent)")
         if failingIntent == intent { throw WatchTestError.failed }
     }
@@ -692,7 +692,7 @@ private final class WatchFakeSession: WatchAudioSessionControlling {
 }
 
 @MainActor
-private final class WatchFakeCapture: WatchAudioCapturing {
+private final class WatchFakeCapture: AudioCapturing {
     let objectWillChange = ObservableObjectPublisher()
     private let log: WatchEventLog
     var isRecording = false
@@ -728,7 +728,7 @@ private final class WatchFakeCapture: WatchAudioCapturing {
         isRecording = startSucceeds
         return startSucceeds
     }
-    func stop(holdID: UUID) -> WatchLocalRecording? {
+    func stop(holdID: UUID) -> LocalRecording? {
         log.events.append("capture.stop")
         isRecording = false
         return nil

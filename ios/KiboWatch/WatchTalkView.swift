@@ -168,10 +168,14 @@ struct WatchTalkView: View {
         // edge instead of clipping the bunny's chin.
         VStack(spacing: 2) {
             statusLabel
-            if let target = store.events.retryableFailure {
-                retryButton(target)
-            } else if store.recoveryItemCount > 0 {
+            // Driven off the rendered `centerState`, not raw store fields —
+            // needsReview outranks attention exactly as the CenterState
+            // priority chain already encodes, and both stay hidden during
+            // every live/error state.
+            if centerState == .needsReview {
                 reviewButton
+            } else if centerState == .attention, let target = store.events.retryableFailure {
+                retryButton(target)
             }
         }
     }
@@ -232,53 +236,46 @@ struct WatchTalkView: View {
     }
 
     private var talkButton: some View {
-        // The sprite is a cut-out bunny on transparency — it sits directly
-        // on the OLED black inside the state ring, no backing disc. Sprite
-        // swaps are instant; a crossfade reads as a glitch at watch size.
-        Image(centerState.faceAssetName)
-            .resizable()
-            .scaledToFit()
-            .frame(width: micDiameter * 0.92, height: micDiameter * 0.92)
-            .scaleEffect(audio.isRecording ? 1 + audio.level * 0.10 : 1)
-            .animation(.easeOut(duration: 0.08), value: audio.level)
-            .frame(width: micDiameter, height: micDiameter)
+        // Sprite, inset, and recording pulse all live in the shared
+        // `KiboFace` now — same organism the phone uses.
+        KiboFace(state: centerState, level: audio.level, diameter: micDiameter)
+            .opacity(store.selectedConversationID != nil ? 1 : 0.4)
             .contentShape(Circle())
-        .opacity(store.selectedConversationID != nil ? 1 : 0.4)
-        .accessibilityElement(children: .ignore)
-        .accessibilityIdentifier("watch-talk-button")
-        .accessibilityLabel("Hold to talk")
-        .accessibilityValue(audio.isRecording ? "Recording" : "Ready")
-        .accessibilityAddTraits(.isButton)
-        .accessibilityAction {
-            if audio.isHolding { endHold() } else { beginHold() }
-        }
-        // With no separate Ask button, the swipe gesture needs an
-        // accessibility equivalent.
-        .accessibilityAction(named: "Ask Kibo") { askKibo() }
-        // Shared hold-to-talk semantics; watch haptics and the askable-count
-        // guard stay here — the release just ended by our own hand, so the ask
-        // path skips the capture-state guards whose published values may not
-        // have settled on this exact tick.
-        .holdToTalkGesture(swipeThreshold: Self.swipeThreshold) { event in
-            switch event {
-            case .began:
-                beginHold()
-            case let .armedChanged(armed):
-                swipeArmed = armed
-                if armed { WKInterfaceDevice.current().play(.directionUp) }
-            case .canceled:
-                audio.cancelHold()
-            case .saved:
-                endHold()
-            case .askRequested:
-                if askableClipCount > 0 {
-                    performAsk()
-                } else {
-                    WKInterfaceDevice.current().play(.failure)
+            .accessibilityElement(children: .ignore)
+            .accessibilityIdentifier("watch-talk-button")
+            .accessibilityLabel("Hold to talk")
+            .accessibilityValue(audio.isRecording ? "Recording" : "Ready")
+            .accessibilityAddTraits(.isButton)
+            .accessibilityAction {
+                if audio.isHolding { endHold() } else { beginHold() }
+            }
+            // With no separate Ask button, the swipe gesture needs an
+            // accessibility equivalent.
+            .accessibilityAction(named: "Ask Kibo") { askKibo() }
+            // Shared hold-to-talk semantics; watch haptics and the askable-count
+            // guard stay here — the release just ended by our own hand, so the ask
+            // path skips the capture-state guards whose published values may not
+            // have settled on this exact tick.
+            .holdToTalkGesture(swipeThreshold: Self.swipeThreshold) { event in
+                switch event {
+                case .began:
+                    beginHold()
+                case let .armedChanged(armed):
+                    swipeArmed = armed
+                    if armed { WKInterfaceDevice.current().play(.directionUp) }
+                case .canceled:
+                    audio.cancelHold()
+                case .saved:
+                    endHold()
+                case .askRequested:
+                    if askableClipCount > 0 {
+                        performAsk()
+                    } else {
+                        WKInterfaceDevice.current().play(.failure)
+                    }
                 }
             }
-        }
-        .allowsHitTesting(store.selectedConversationID != nil)
+            .allowsHitTesting(store.selectedConversationID != nil)
     }
 
     private var errorText: String? {
